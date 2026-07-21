@@ -59,6 +59,8 @@ class SessionIngestStatus:
     streaming_active: bool
     streaming_destination_type: str | None
     streaming_destination_url: str | None
+    video_backend: str | None
+    requested_video_backend: str
     participants: list[ParticipantIngestStatus] = field(default_factory=list)
     rtmp_sources: list[RtmpSourceIngestStatus] = field(default_factory=list)
 
@@ -104,6 +106,8 @@ class SessionIngestManager:
             height=settings.CANVAS_HEIGHT,
             fps=settings.CANVAS_FPS,
             layout=session.layout,
+            video_backend=settings.COMPOSITOR_VIDEO_BACKEND,
+            cuda_device_id=settings.COMPOSITOR_CUDA_DEVICE_ID,
         )
         compositor_pipeline.set_stream_failure_handler(
             lambda reason, session_id=str(session.id): _handle_stream_failure(session_id, reason)
@@ -313,6 +317,8 @@ class SessionIngestManager:
                 streaming_active=pipeline_status.streaming_active,
                 streaming_destination_type=pipeline_status.streaming_destination_type,
                 streaming_destination_url=pipeline_status.streaming_destination_url,
+                video_backend=pipeline_status.video_backend,
+                requested_video_backend=pipeline_status.requested_video_backend,
                 participants=participants,
                 rtmp_sources=rtmp_sources,
             )

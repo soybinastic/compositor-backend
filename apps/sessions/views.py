@@ -216,6 +216,8 @@ class SessionIngestView(APIView):
                     'streaming_active': ingest_status.streaming_active,
                     'streaming_destination_type': ingest_status.streaming_destination_type,
                     'streaming_destination_url': ingest_status.streaming_destination_url,
+                    'video_backend': ingest_status.video_backend,
+                    'requested_video_backend': ingest_status.requested_video_backend,
                     'participants': [
                         {
                             'participant_peer_id': p.participant_peer_id,

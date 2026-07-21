@@ -172,6 +172,16 @@ CANVAS_WIDTH = int(os.getenv('CANVAS_WIDTH', '1920'))
 CANVAS_HEIGHT = int(os.getenv('CANVAS_HEIGHT', '1080'))
 CANVAS_FPS = int(os.getenv('CANVAS_FPS', '30'))
 
+# Video mix backend: cpu | gl | cuda | auto (cuda → gl → cpu)
+_COMPOSITOR_VIDEO_BACKEND = os.getenv('COMPOSITOR_VIDEO_BACKEND', 'auto').strip().lower()
+if _COMPOSITOR_VIDEO_BACKEND not in ('cpu', 'gl', 'cuda', 'auto'):
+    raise ValueError(
+        f'Invalid COMPOSITOR_VIDEO_BACKEND={_COMPOSITOR_VIDEO_BACKEND!r}; '
+        "expected 'cpu', 'gl', 'cuda', or 'auto'"
+    )
+COMPOSITOR_VIDEO_BACKEND = _COMPOSITOR_VIDEO_BACKEND
+COMPOSITOR_CUDA_DEVICE_ID = int(os.getenv('COMPOSITOR_CUDA_DEVICE_ID', '-1'))
+
 RECORDINGS_DIR = Path(os.getenv('RECORDINGS_DIR', str(BASE_DIR / 'recordings')))
 RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 RECORDING_VIDEO_BITRATE = int(os.getenv('RECORDING_VIDEO_BITRATE', '4000000'))

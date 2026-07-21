@@ -100,5 +100,7 @@ class SessionIngestStatusSerializer(serializers.Serializer):
     streaming_active = serializers.BooleanField()
     streaming_destination_type = serializers.CharField(allow_null=True)
     streaming_destination_url = serializers.CharField(allow_null=True)
+    video_backend = serializers.CharField(allow_null=True)
+    requested_video_backend = serializers.CharField()
     participants = ParticipantIngestStatusSerializer(many=True)
     rtmp_sources = RtmpSourceIngestStatusSerializer(many=True)

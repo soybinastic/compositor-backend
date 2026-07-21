@@ -18,6 +18,11 @@ from gi.repository import Gst  # noqa: E402
 
 from apps.compositor.ingest_branch import IngestStats
 from apps.compositor.pipeline_bus_monitor import PipelineBusMonitor
+from apps.compositor.video_mix_backend import (
+    VideoMixBackend,
+    get_video_mix_backend,
+    resolve_video_backend,
+)
 from apps.layouts.manager import LayoutManager
 from apps.layouts.strategies.base import Size, TileConfig
 from apps.layouts.types import ScaleMode
@@ -90,6 +95,8 @@ class CompositorPipelineStatus:
     streaming_active: bool
     streaming_destination_type: str | None
     streaming_destination_url: str | None
+    video_backend: str | None
+    requested_video_backend: str
 
 
 class CompositorPipeline:
@@ -107,12 +114,26 @@ class CompositorPipeline:
         height: int,
         fps: int,
         layout: str = LayoutType.CONTAIN,
+        video_backend: str | None = None,
+        cuda_device_id: int | None = None,
     ) -> None:
         self.session_id = session_id
         self.width = width
         self.height = height
         self.fps = fps
         self._layout = layout
+        self._requested_video_backend = (
+            video_backend
+            if video_backend is not None
+            else settings.COMPOSITOR_VIDEO_BACKEND
+        )
+        self._cuda_device_id = (
+            cuda_device_id
+            if cuda_device_id is not None
+            else settings.COMPOSITOR_CUDA_DEVICE_ID
+        )
+        self._resolved_video_backend: str | None = None
+        self._video_mix_backend: VideoMixBackend | None = None
         self._host_peer_id: str | None = None
         self._layout_manager = LayoutManager.for_layout(
             layout,
@@ -205,14 +226,23 @@ class CompositorPipeline:
             if self._pipeline is not None:
                 return
 
-            pipeline = Gst.Pipeline.new(f'compositor-{self.session_id}')
-            # force-live is construct-only on GstAggregator subclasses.
-            compositor = Gst.ElementFactory.find('compositor').create_with_properties(
-                ['name', 'force-live'],
-                ['mix', True],
+            resolved = resolve_video_backend(
+                self._requested_video_backend,
+                cuda_device_id=self._cuda_device_id,
             )
-            capsfilter = Gst.ElementFactory.make('capsfilter', 'out_caps')
-            convert = Gst.ElementFactory.make('videoconvert', 'out_convert')
+            video_backend = get_video_mix_backend(
+                resolved,
+                cuda_device_id=self._cuda_device_id,
+            )
+            self._resolved_video_backend = resolved
+            self._video_mix_backend = video_backend
+
+            pipeline = Gst.Pipeline.new(f'compositor-{self.session_id}')
+            compositor = video_backend.create_mixer('mix')
+            post_mixer = video_backend.build_post_mixer_chain(
+                width=self.width,
+                height=self.height,
+            )
             video_tee = Gst.ElementFactory.make('tee', 'video_tee')
             video_queue = Gst.ElementFactory.make('queue', 'video_monitor_queue')
             sink = Gst.ElementFactory.make('fakesink', 'video_out')
@@ -231,8 +261,7 @@ class CompositorPipeline:
                 [
                     pipeline,
                     compositor,
-                    capsfilter,
-                    convert,
+                    *post_mixer,
                     video_tee,
                     video_queue,
                     sink,
@@ -247,19 +276,6 @@ class CompositorPipeline:
             ):
                 raise RuntimeError('Failed to create compositor pipeline elements')
 
-            compositor.set_property('background', 1)  # black — output frames even before first input
-            compositor.set_property('start-time-selection', 0)  # first
-            compositor.set_property('latency', 40 * Gst.MSECOND)
-            # Guest pads often link before first decoded frame (or host audio never arrives).
-            # Without this, aggregator waits forever and composited_frames stalls at ~1.
-            compositor.set_property('ignore-inactive-pads', True)
-
-            capsfilter.set_property(
-                'caps',
-                Gst.Caps.from_string(
-                    f'video/x-raw,width={self.width},height={self.height}'
-                ),
-            )
             audio_capsfilter.set_property(
                 'caps',
                 Gst.Caps.from_string('audio/x-raw,rate=48000,channels=2'),
@@ -277,8 +293,7 @@ class CompositorPipeline:
 
             for element in (
                 compositor,
-                capsfilter,
-                convert,
+                *post_mixer,
                 video_tee,
                 video_queue,
                 sink,
@@ -292,12 +307,8 @@ class CompositorPipeline:
             ):
                 pipeline.add(element)
 
-            if not compositor.link(capsfilter):
-                raise RuntimeError('Failed to link compositor -> capsfilter')
-            if not capsfilter.link(convert):
-                raise RuntimeError('Failed to link capsfilter -> videoconvert')
-            if not convert.link(video_tee):
-                raise RuntimeError('Failed to link videoconvert -> video tee')
+            video_chain = [compositor, *post_mixer, video_tee]
+            self._link_sequential(video_chain, label='video-mix-output')
 
             video_tee_src = video_tee.get_request_pad('src_%u')
             if video_tee_src is None:
@@ -338,12 +349,14 @@ class CompositorPipeline:
             self._start_bus_logger(pipeline)
 
             logger.info(
-                'Compositor pipeline started for session %s (%sx%s @ %sfps, layout=%s)',
+                'Compositor pipeline started for session %s '
+                '(%sx%s @ %sfps, layout=%s, video_backend=%s)',
                 self.session_id,
                 self.width,
                 self.height,
                 self.fps,
                 self._layout,
+                resolved,
             )
 
     def stop(self) -> None:
@@ -398,6 +411,8 @@ class CompositorPipeline:
                 self._audiomixer = None
                 self._video_tee = None
                 self._audio_tee = None
+                self._video_mix_backend = None
+                self._resolved_video_backend = None
 
     def start_recording(self, file_path: Path) -> None:
         with self._lock:
@@ -611,6 +626,8 @@ class CompositorPipeline:
                 streaming_destination_url=(
                     self._streaming.destination_url if self._streaming else None
                 ),
+                video_backend=self._resolved_video_backend,
+                requested_video_backend=self._requested_video_backend,
             )
 
     def _stop_streaming_unlocked(self) -> None:
@@ -1052,13 +1069,20 @@ class CompositorPipeline:
         mediasoup_transport: MediasoupTransportTuple,
         rtcp_mux: bool,
     ) -> IngestChainResult:
-        scale = Gst.ElementFactory.make('videoscale', f'video_scale_{participant_peer_id}')
-        queue = Gst.ElementFactory.make('queue', f'video_queue_{participant_peer_id}')
-        if scale is None or queue is None:
-            raise RuntimeError(f'Failed to create video scale/queue for {participant_peer_id}')
-        scale.set_property('add-borders', True)
-        queue.set_property('leaky', 2)
-        queue.set_property('max-size-time', 2 * Gst.SECOND)
+        if self._video_mix_backend is None:
+            raise RuntimeError('Video mix backend is not initialized')
+
+        convert = Gst.ElementFactory.make(
+            'videoconvert',
+            f'video_convert_{participant_peer_id}',
+        )
+        if convert is None:
+            raise RuntimeError(f'Failed to create videoconvert for {participant_peer_id}')
+
+        tail_elements = [
+            convert,
+            *self._video_mix_backend.build_ingest_tail(participant_peer_id),
+        ]
 
         return self._build_rtp_ingest_chain(
             participant_peer_id=participant_peer_id,
@@ -1073,11 +1097,7 @@ class CompositorPipeline:
             ),
             depay='rtpvp8depay',
             decoder='vp8dec',
-            tail_elements=[
-                Gst.ElementFactory.make('videoconvert', f'video_convert_{participant_peer_id}'),
-                scale,
-                queue,
-            ],
+            tail_elements=tail_elements,
         )
 
     def _build_audio_ingest_chain(
@@ -1242,31 +1262,43 @@ class CompositorPipeline:
         assert self._pipeline is not None
         assert self._compositor is not None
         assert self._audiomixer is not None
+        if self._video_mix_backend is None:
+            raise RuntimeError('Video mix backend is not initialized')
 
         _ = display_name
         src = Gst.ElementFactory.make('uridecodebin', f'rtmp_src_{source_id}')
         video_convert = Gst.ElementFactory.make('videoconvert', f'rtmp_v_convert_{source_id}')
-        video_scale = Gst.ElementFactory.make('videoscale', f'rtmp_v_scale_{source_id}')
+        ingest_tail = self._video_mix_backend.build_ingest_tail(source_id)
         audio_convert = Gst.ElementFactory.make('audioconvert', f'rtmp_a_convert_{source_id}')
         audio_resample = Gst.ElementFactory.make('audioresample', f'rtmp_a_resample_{source_id}')
         audio_queue = Gst.ElementFactory.make('queue', f'rtmp_a_queue_{source_id}')
 
-        if not all([src, video_convert, video_scale, audio_convert, audio_resample, audio_queue]):
+        if not all([src, video_convert, *ingest_tail, audio_convert, audio_resample, audio_queue]):
             raise RuntimeError(f'Failed to create RTMP ingest elements for {source_id}')
 
         src.set_property('uri', url)
-        video_scale.set_property('add-borders', True)
+        video_scale = next(
+            (
+                element
+                for element in ingest_tail
+                if element.get_factory() is not None
+                and element.get_factory().get_name() == 'videoscale'
+            ),
+            None,
+        )
+        if video_scale is not None:
+            video_scale.set_property('add-borders', True)
 
+        video_chain = [video_convert, *ingest_tail]
         elements = [
             src,
-            video_convert,
-            video_scale,
+            *video_chain,
             audio_convert,
             audio_resample,
             audio_queue,
         ]
         self._link_sequential(
-            [video_convert, video_scale],
+            video_chain,
             label=f'rtmp-video-{source_id}',
         )
         self._link_sequential(
@@ -1281,7 +1313,7 @@ class CompositorPipeline:
         if compositor_sink_pad is None:
             raise RuntimeError(f'Failed to request compositor sink pad for {source_id}')
 
-        video_src_pad = video_scale.get_static_pad('src')
+        video_src_pad = ingest_tail[-1].get_static_pad('src')
         if video_src_pad is None or video_src_pad.link(compositor_sink_pad) != Gst.PadLinkReturn.OK:
             raise RuntimeError(f'Failed to link RTMP video branch to compositor for {source_id}')
 
@@ -1369,23 +1401,28 @@ class CompositorPipeline:
             self._apply_tile_to_pad(branch, tile)
 
     @staticmethod
+    def _set_pad_property_if_present(pad: Gst.Pad, name: str, value) -> None:
+        if pad.find_property(name) is not None:
+            pad.set_property(name, value)
+
+    @staticmethod
     def _hide_pad(pad: Gst.Pad) -> None:
-        pad.set_property('xpos', 0)
-        pad.set_property('ypos', 0)
-        pad.set_property('width', 1)
-        pad.set_property('height', 1)
-        pad.set_property('zorder', 0)
-        pad.set_property('alpha', 0.0)
+        CompositorPipeline._set_pad_property_if_present(pad, 'xpos', 0)
+        CompositorPipeline._set_pad_property_if_present(pad, 'ypos', 0)
+        CompositorPipeline._set_pad_property_if_present(pad, 'width', 1)
+        CompositorPipeline._set_pad_property_if_present(pad, 'height', 1)
+        CompositorPipeline._set_pad_property_if_present(pad, 'zorder', 0)
+        CompositorPipeline._set_pad_property_if_present(pad, 'alpha', 0.0)
 
     @staticmethod
     def _apply_tile_to_pad(branch: ParticipantBranch, tile: TileConfig) -> None:
         pad = branch.compositor_sink_pad
-        pad.set_property('xpos', tile.x)
-        pad.set_property('ypos', tile.y)
-        pad.set_property('width', tile.width)
-        pad.set_property('height', tile.height)
-        pad.set_property('zorder', tile.zorder)
-        pad.set_property('alpha', 1.0)
+        CompositorPipeline._set_pad_property_if_present(pad, 'xpos', tile.x)
+        CompositorPipeline._set_pad_property_if_present(pad, 'ypos', tile.y)
+        CompositorPipeline._set_pad_property_if_present(pad, 'width', tile.width)
+        CompositorPipeline._set_pad_property_if_present(pad, 'height', tile.height)
+        CompositorPipeline._set_pad_property_if_present(pad, 'zorder', tile.zorder)
+        CompositorPipeline._set_pad_property_if_present(pad, 'alpha', 1.0)
 
         # Prefer compositor sizing-policy when available (GStreamer ≥ 1.20).
         # keep-aspect-ratio ≈ contain; none ≈ fill/stretch (cover approximation).

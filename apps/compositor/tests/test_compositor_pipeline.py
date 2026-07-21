@@ -18,12 +18,15 @@ class CompositorPipelineTests(TestCase):
             height=360,
             fps=30,
             layout=LayoutType.CONTAIN,
+            video_backend='cpu',
         )
         pipeline.start()
 
         status = pipeline.get_status()
         self.assertEqual(status.layout, LayoutType.CONTAIN)
         self.assertEqual(status.canvas_width, 640)
+        self.assertEqual(status.video_backend, 'cpu')
+        self.assertEqual(status.requested_video_backend, 'cpu')
 
         pipeline.set_layout(LayoutType.THUMBNAIL)
         self.assertEqual(pipeline.get_status().layout, LayoutType.THUMBNAIL)

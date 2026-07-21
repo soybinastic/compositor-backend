@@ -24,6 +24,29 @@ sudo apt install \
   gstreamer1.0-libav
 ```
 
+## Video mix backends (CPU / OpenGL / CUDA)
+
+Set `COMPOSITOR_VIDEO_BACKEND` in `.env`:
+
+| Value | Mixer | Notes |
+|-------|--------|--------|
+| `cpu` (safe default for laptops) | `compositor` | Always available with base plugins |
+| `gl` | `glcompositor` | Portable GPU path (macOS / Linux / Windows). Needs GL plugins (`glupload`, `glcolorconvert`, `gldownload`). |
+| `cuda` | `cudacompositor` | NVIDIA only (e.g. production A16). Needs GStreamer **≥ 1.26** nvcodec plugins (`cudaupload`, `cudadownload`) + NVIDIA driver/CUDA. |
+| `auto` (default) | first available of cuda → gl → cpu | Falls back quietly when GPU plugins are missing |
+
+Optional: `COMPOSITOR_CUDA_DEVICE_ID=-1` (auto) or a device index for `cudacompositor`.
+
+Verify plugins:
+
+```bash
+gst-inspect-1.0 compositor
+gst-inspect-1.0 glcompositor
+gst-inspect-1.0 cudacompositor
+```
+
+Health (`GET /api/v1/health/`) reports `requested_backend`, `resolved_backend`, and element availability.
+
 ## Python packages
 
 ```bash
