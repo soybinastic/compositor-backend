@@ -20,6 +20,7 @@ from apps.compositor.ingest_branch import IngestStats
 from apps.compositor.pipeline_bus_monitor import PipelineBusMonitor
 from apps.layouts.manager import LayoutManager
 from apps.layouts.strategies.base import Size, TileConfig
+from apps.layouts.types import ScaleMode
 from apps.recording.gstreamer_recorder import (
     RecordingBranch,
     build_recording_branch,
@@ -73,6 +74,7 @@ class ParticipantBranch:
     stats: IngestStats = field(default_factory=IngestStats)
     signal_handlers: list[tuple[Gst.Element, int]] = field(default_factory=list)
     source_url: str | None = None
+    video_scale: Gst.Element | None = None
 
 
 @dataclass
@@ -910,6 +912,15 @@ class CompositorPipeline:
                 f'Failed to link audio branch to audiomixer for {participant_peer_id}'
             )
 
+        video_scale = next(
+            (
+                element
+                for element in video_chain.media_elements
+                if element.get_factory() is not None
+                and element.get_factory().get_name() == 'videoscale'
+            ),
+            None,
+        )
         branch = ParticipantBranch(
             participant_peer_id=participant_peer_id,
             compositor_sink_pad=compositor_sink_pad,
@@ -917,6 +928,7 @@ class CompositorPipeline:
             elements=all_elements,
             stats=IngestStats(),
             signal_handlers=video_chain.signal_handlers + audio_chain.signal_handlers,
+            video_scale=video_scale,
         )
 
         if video_chain.rtp_probe_pad is not None:
@@ -1280,6 +1292,7 @@ class CompositorPipeline:
             elements=elements,
             stats=IngestStats(),
             source_url=url,
+            video_scale=video_scale,
         )
         video_src_pad.add_probe(
             Gst.PadProbeType.BUFFER,
@@ -1350,17 +1363,43 @@ class CompositorPipeline:
         for participant_id, branch in self._participants.items():
             tile = tile_map.get(participant_id)
             if tile is None:
+                # Hide sources not included in this layout (e.g. FULLSCREEN guests).
+                self._hide_pad(branch.compositor_sink_pad)
                 continue
-            self._apply_tile_to_pad(branch.compositor_sink_pad, tile)
+            self._apply_tile_to_pad(branch, tile)
 
     @staticmethod
-    def _apply_tile_to_pad(pad: Gst.Pad, tile: TileConfig) -> None:
+    def _hide_pad(pad: Gst.Pad) -> None:
+        pad.set_property('xpos', 0)
+        pad.set_property('ypos', 0)
+        pad.set_property('width', 1)
+        pad.set_property('height', 1)
+        pad.set_property('zorder', 0)
+        pad.set_property('alpha', 0.0)
+
+    @staticmethod
+    def _apply_tile_to_pad(branch: ParticipantBranch, tile: TileConfig) -> None:
+        pad = branch.compositor_sink_pad
         pad.set_property('xpos', tile.x)
         pad.set_property('ypos', tile.y)
         pad.set_property('width', tile.width)
         pad.set_property('height', tile.height)
         pad.set_property('zorder', tile.zorder)
         pad.set_property('alpha', 1.0)
+
+        # Prefer compositor sizing-policy when available (GStreamer ≥ 1.20).
+        # keep-aspect-ratio ≈ contain; none ≈ fill/stretch (cover approximation).
+        if pad.find_property('sizing-policy') is not None:
+            pad.set_property(
+                'sizing-policy',
+                'keep-aspect-ratio' if tile.scale_mode == ScaleMode.CONTAIN else 'none',
+            )
+
+        if branch.video_scale is not None:
+            branch.video_scale.set_property(
+                'add-borders',
+                tile.scale_mode == ScaleMode.CONTAIN,
+            )
 
     @staticmethod
     def _link_sequential(elements: list[Gst.Element], *, label: str) -> None:

@@ -1,4 +1,4 @@
-"""THUMBNAIL layout — host main view with smaller participant tiles along the bottom."""
+"""SPOTLIGHT — host large on the left; others stacked in a right strip."""
 
 from __future__ import annotations
 
@@ -6,10 +6,10 @@ from apps.layouts.strategies.base import LayoutStrategy, Size, TileConfig, resol
 from apps.layouts.types import LayoutType, ScaleMode
 
 
-class ThumbnailLayout(LayoutStrategy):
-    layout_type = LayoutType.THUMBNAIL
+class SpotlightLayout(LayoutStrategy):
+    layout_type = LayoutType.SPOTLIGHT
 
-    THUMBNAIL_HEIGHT_RATIO = 0.2
+    HOST_WIDTH_RATIO = 0.7
 
     def compute_tiles(
         self,
@@ -23,36 +23,44 @@ class ThumbnailLayout(LayoutStrategy):
         host_id = resolve_host_id(source_ids, host_source_id)
         others = [source_id for source_id in source_ids if source_id != host_id]
 
-        thumbnail_height = max(int(canvas.height * self.THUMBNAIL_HEIGHT_RATIO), 1)
-        main_height = canvas.height - thumbnail_height
+        if not others:
+            return [
+                TileConfig(
+                    source_id=host_id,
+                    x=0,
+                    y=0,
+                    width=canvas.width,
+                    height=canvas.height,
+                    zorder=1,
+                    scale_mode=ScaleMode.CONTAIN,
+                )
+            ]
 
+        host_width = max(int(canvas.width * self.HOST_WIDTH_RATIO), 1)
+        strip_width = canvas.width - host_width
         tiles = [
             TileConfig(
                 source_id=host_id,
                 x=0,
                 y=0,
-                width=canvas.width,
-                height=main_height if others else canvas.height,
+                width=host_width,
+                height=canvas.height,
                 zorder=1,
                 scale_mode=ScaleMode.CONTAIN,
             )
         ]
 
-        if not others:
-            return tiles
-
-        thumbnail_width = max(canvas.width // len(others), 1)
+        tile_height = max(canvas.height // len(others), 1)
         for index, source_id in enumerate(others):
             tiles.append(
                 TileConfig(
                     source_id=source_id,
-                    x=index * thumbnail_width,
-                    y=main_height,
-                    width=thumbnail_width,
-                    height=thumbnail_height,
+                    x=host_width,
+                    y=index * tile_height,
+                    width=strip_width,
+                    height=tile_height if index < len(others) - 1 else canvas.height - index * tile_height,
                     zorder=2,
                     scale_mode=ScaleMode.CONTAIN,
                 )
             )
-
         return tiles

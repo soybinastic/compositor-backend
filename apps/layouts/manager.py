@@ -3,18 +3,37 @@
 from __future__ import annotations
 
 from apps.layouts.strategies.base import LayoutStrategy, Size, TileConfig
+from apps.layouts.strategies.cinema import CinemaLayout
 from apps.layouts.strategies.contain import ContainLayout
+from apps.layouts.strategies.cover import CoverLayout
+from apps.layouts.strategies.fullscreen import FullscreenLayout
+from apps.layouts.strategies.grid import GridLayout
+from apps.layouts.strategies.picture_in_picture import PictureInPictureLayout
+from apps.layouts.strategies.side_by_side import SideBySideLayout
+from apps.layouts.strategies.spotlight import SpotlightLayout
 from apps.layouts.strategies.thumbnail import ThumbnailLayout
 from apps.layouts.types import LayoutType
-from apps.sessions.models import LayoutType as SessionLayoutType
+
+_LAYOUT_FACTORIES: dict[str, type[LayoutStrategy]] = {
+    LayoutType.CONTAIN.value: ContainLayout,
+    LayoutType.COVER.value: CoverLayout,
+    LayoutType.THUMBNAIL.value: ThumbnailLayout,
+    LayoutType.GRID.value: GridLayout,
+    LayoutType.SIDE_BY_SIDE.value: SideBySideLayout,
+    LayoutType.HALFSCREEN.value: SideBySideLayout,
+    LayoutType.SPOTLIGHT.value: SpotlightLayout,
+    LayoutType.CINEMA.value: CinemaLayout,
+    LayoutType.PICTURE_IN_PICTURE.value: PictureInPictureLayout,
+    LayoutType.OVERLAY.value: PictureInPictureLayout,
+    LayoutType.FULLSCREEN.value: FullscreenLayout,
+}
 
 
 def get_layout_strategy(layout: str) -> LayoutStrategy:
-    if layout == LayoutType.CONTAIN or layout == SessionLayoutType.CONTAIN:
-        return ContainLayout()
-    if layout == LayoutType.THUMBNAIL or layout == SessionLayoutType.THUMBNAIL:
-        return ThumbnailLayout()
-    raise ValueError(f'Unsupported layout: {layout}')
+    factory = _LAYOUT_FACTORIES.get(layout)
+    if factory is None:
+        raise ValueError(f'Unsupported layout: {layout}')
+    return factory()
 
 
 class LayoutManager:

@@ -1,15 +1,13 @@
-"""CONTAIN layout — equal grid tiles with aspect-ratio preservation."""
+"""GRID layout — fixed 2×2 (≤4 sources) or 3×3 (≤9 sources)."""
 
 from __future__ import annotations
-
-import math
 
 from apps.layouts.strategies.base import LayoutStrategy, Size, TileConfig
 from apps.layouts.types import LayoutType, ScaleMode
 
 
-class ContainLayout(LayoutStrategy):
-    layout_type = LayoutType.CONTAIN
+class GridLayout(LayoutStrategy):
+    layout_type = LayoutType.GRID
 
     def compute_tiles(
         self,
@@ -22,13 +20,18 @@ class ContainLayout(LayoutStrategy):
             return []
 
         count = len(source_ids)
-        columns = math.ceil(math.sqrt(count))
-        rows = math.ceil(count / columns)
+        if count <= 4:
+            columns, rows = 2, 2
+        else:
+            columns, rows = 3, 3
+
+        # Cap visible sources to the fixed grid capacity.
+        visible = source_ids[: columns * rows]
         tile_width = canvas.width // columns
         tile_height = canvas.height // rows
 
         tiles: list[TileConfig] = []
-        for index, source_id in enumerate(source_ids):
+        for index, source_id in enumerate(visible):
             row = index // columns
             column = index % columns
             tiles.append(
@@ -42,5 +45,4 @@ class ContainLayout(LayoutStrategy):
                     scale_mode=ScaleMode.CONTAIN,
                 )
             )
-
         return tiles

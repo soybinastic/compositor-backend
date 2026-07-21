@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-from apps.layouts.types import LayoutType
+from apps.layouts.types import LayoutType, ScaleMode
 
 
 @dataclass(frozen=True)
@@ -18,6 +18,7 @@ class TileConfig:
     width: int
     height: int
     zorder: int = 0
+    scale_mode: ScaleMode = ScaleMode.CONTAIN
 
 
 class LayoutStrategy(ABC):
@@ -33,3 +34,9 @@ class LayoutStrategy(ABC):
         host_source_id: str | None = None,
     ) -> list[TileConfig]:
         """Return tile geometry for each video source on the canvas."""
+
+
+def resolve_host_id(source_ids: list[str], host_source_id: str | None) -> str:
+    if host_source_id is not None and host_source_id in source_ids:
+        return host_source_id
+    return source_ids[0]
