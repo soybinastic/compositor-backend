@@ -14,3 +14,7 @@ STREAM_STOPPED = 'stream.stopped'
 STREAM_FAILED = 'stream.failed'
 STREAM_RECONNECTING = 'stream.reconnecting'
 STREAM_RECONNECTED = 'stream.reconnected'
+
+RTMP_SOURCE_STARTED = 'rtmp_source.started'
+RTMP_SOURCE_STOPPED = 'rtmp_source.stopped'
+RTMP_SOURCE_FAILED = 'rtmp_source.failed'

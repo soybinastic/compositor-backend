@@ -10,6 +10,11 @@ from apps.streaming.views import (
     SessionStreamStartView,
     SessionStreamStopView,
 )
+from apps.sources.views import (
+    SessionRtmpSourceCreateView,
+    SessionRtmpSourceDeleteView,
+    SessionRtmpSourceListView,
+)
 from apps.sessions.views import (
     HealthView,
     MetricsView,
@@ -69,5 +74,20 @@ urlpatterns = [
         'sessions/<uuid:session_id>/streams/stop/',
         SessionStreamStopView.as_view(),
         name='session-stream-stop',
+    ),
+    path(
+        'sessions/<uuid:session_id>/rtmp-sources/',
+        SessionRtmpSourceListView.as_view(),
+        name='session-rtmp-source-list',
+    ),
+    path(
+        'sessions/<uuid:session_id>/rtmp-sources/add/',
+        SessionRtmpSourceCreateView.as_view(),
+        name='session-rtmp-source-add',
+    ),
+    path(
+        'sessions/<uuid:session_id>/rtmp-sources/<str:source_id>/',
+        SessionRtmpSourceDeleteView.as_view(),
+        name='session-rtmp-source-delete',
     ),
 ]

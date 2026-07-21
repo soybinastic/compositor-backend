@@ -22,16 +22,16 @@ from apps.layouts.manager import LayoutManager
 from apps.layouts.strategies.base import Size, TileConfig
 from apps.recording.gstreamer_recorder import (
     RecordingBranch,
-    attach_to_tees,
     build_recording_branch,
     finalize_recording,
+    start_recording_on_pipeline,
     teardown_recording_branch,
 )
 from apps.streaming.gstreamer_streamer import (
     StreamingBranch,
-    attach_stream_to_tees,
     build_streaming_branch,
     finalize_hls_stream,
+    start_streaming_on_pipeline,
     teardown_streaming_branch,
 )
 from apps.streaming.models import DestinationType
@@ -44,13 +44,35 @@ logger = logging.getLogger(__name__)
 Gst.init(None)
 
 
+@dataclass(frozen=True)
+class MediasoupTransportTuple:
+    """PlainTransport tuple returned by mediasoup (RTCP feedback target)."""
+
+    ip: str
+    port: int
+    rtcp_port: int | None = None
+
+
+@dataclass
+class IngestChainResult:
+    elements: list[Gst.Element]
+    output: Gst.Element
+    media_elements: list[Gst.Element] = field(default_factory=list)
+    rtcp_links: list[tuple[Gst.Element, Gst.Element]] = field(default_factory=list)
+    rtp_probe_pad: Gst.Pad | None = None
+    rtcp_probe_pad: Gst.Pad | None = None
+    signal_handlers: list[tuple[Gst.Element, int]] = field(default_factory=list)
+
+
 @dataclass
 class ParticipantBranch:
     participant_peer_id: str
     compositor_sink_pad: Gst.Pad
-    mixer_sink_pad: Gst.Pad
+    mixer_sink_pad: Gst.Pad | None
     elements: list[Gst.Element] = field(default_factory=list)
     stats: IngestStats = field(default_factory=IngestStats)
+    signal_handlers: list[tuple[Gst.Element, int]] = field(default_factory=list)
+    source_url: str | None = None
 
 
 @dataclass
@@ -108,6 +130,70 @@ class CompositorPipeline:
         self._on_stream_permanent_failure: Callable[[str], None] | None = None
         self._composited_frames = 0
         self._lock = threading.Lock()
+        self._bus_stop = threading.Event()
+        self._bus_thread: threading.Thread | None = None
+
+    def _start_bus_logger(self, pipeline: Gst.Pipeline) -> None:
+        self._stop_bus_logger()
+        self._bus_stop.clear()
+
+        def _run() -> None:
+            bus = pipeline.get_bus()
+            while not self._bus_stop.is_set():
+                message = bus.timed_pop_filtered(
+                    200 * Gst.MSECOND,
+                    Gst.MessageType.ERROR | Gst.MessageType.WARNING | Gst.MessageType.EOS,
+                )
+                if message is None:
+                    continue
+                src_name = message.src.get_name() if message.src else '?'
+                if message.type == Gst.MessageType.ERROR:
+                    err, debug = message.parse_error()
+                    combined = f'{err} {debug or ""}'.lower()
+                    # Expected when recording/streaming branches are torn down.
+                    if 'not-linked' in combined:
+                        logger.info(
+                            'GStreamer not-linked during teardown session=%s src=%s: %s',
+                            self.session_id,
+                            src_name,
+                            err,
+                        )
+                    else:
+                        logger.error(
+                            'GStreamer ERROR session=%s src=%s: %s (%s)',
+                            self.session_id,
+                            src_name,
+                            err,
+                            debug,
+                        )
+                elif message.type == Gst.MessageType.WARNING:
+                    err, debug = message.parse_warning()
+                    logger.warning(
+                        'GStreamer WARNING session=%s src=%s: %s (%s)',
+                        self.session_id,
+                        src_name,
+                        err,
+                        debug,
+                    )
+                elif message.type == Gst.MessageType.EOS:
+                    logger.info(
+                        'GStreamer EOS session=%s src=%s',
+                        self.session_id,
+                        src_name,
+                    )
+
+        self._bus_thread = threading.Thread(
+            target=_run,
+            name=f'gst-bus-{self.session_id[:8]}',
+            daemon=True,
+        )
+        self._bus_thread.start()
+
+    def _stop_bus_logger(self) -> None:
+        self._bus_stop.set()
+        if self._bus_thread is not None:
+            self._bus_thread.join(timeout=2)
+            self._bus_thread = None
 
     def set_stream_failure_handler(self, handler: Callable[[str], None] | None) -> None:
         self._on_stream_permanent_failure = handler
@@ -118,13 +204,20 @@ class CompositorPipeline:
                 return
 
             pipeline = Gst.Pipeline.new(f'compositor-{self.session_id}')
-            compositor = Gst.ElementFactory.make('compositor', 'mix')
+            # force-live is construct-only on GstAggregator subclasses.
+            compositor = Gst.ElementFactory.find('compositor').create_with_properties(
+                ['name', 'force-live'],
+                ['mix', True],
+            )
             capsfilter = Gst.ElementFactory.make('capsfilter', 'out_caps')
             convert = Gst.ElementFactory.make('videoconvert', 'out_convert')
             video_tee = Gst.ElementFactory.make('tee', 'video_tee')
             video_queue = Gst.ElementFactory.make('queue', 'video_monitor_queue')
             sink = Gst.ElementFactory.make('fakesink', 'video_out')
-            audiomixer = Gst.ElementFactory.make('audiomixer', 'amix')
+            audiomixer = Gst.ElementFactory.find('audiomixer').create_with_properties(
+                ['name', 'force-live'],
+                ['amix', True],
+            )
             audio_convert = Gst.ElementFactory.make('audioconvert', 'audio_convert')
             audio_resample = Gst.ElementFactory.make('audioresample', 'audio_resample')
             audio_capsfilter = Gst.ElementFactory.make('capsfilter', 'audio_out_caps')
@@ -152,11 +245,17 @@ class CompositorPipeline:
             ):
                 raise RuntimeError('Failed to create compositor pipeline elements')
 
+            compositor.set_property('background', 1)  # black — output frames even before first input
+            compositor.set_property('start-time-selection', 0)  # first
+            compositor.set_property('latency', 40 * Gst.MSECOND)
+            # Guest pads often link before first decoded frame (or host audio never arrives).
+            # Without this, aggregator waits forever and composited_frames stalls at ~1.
+            compositor.set_property('ignore-inactive-pads', True)
+
             capsfilter.set_property(
                 'caps',
                 Gst.Caps.from_string(
-                    f'video/x-raw,width={self.width},height={self.height},'
-                    f'framerate={self.fps}/1'
+                    f'video/x-raw,width={self.width},height={self.height}'
                 ),
             )
             audio_capsfilter.set_property(
@@ -165,6 +264,14 @@ class CompositorPipeline:
             )
             sink.set_property('sync', False)
             audio_sink.set_property('sync', False)
+            audiomixer.set_property('latency', 40 * Gst.MSECOND)
+            audiomixer.set_property('ignore-inactive-pads', True)
+            video_tee.set_property('allow-not-linked', True)
+            audio_tee.set_property('allow-not-linked', True)
+            video_queue.set_property('leaky', 2)
+            video_queue.set_property('max-size-time', 2 * Gst.SECOND)
+            audio_queue.set_property('leaky', 2)
+            audio_queue.set_property('max-size-time', 2 * Gst.SECOND)
 
             for element in (
                 compositor,
@@ -226,6 +333,7 @@ class CompositorPipeline:
             self._audiomixer = audiomixer
             self._video_tee = video_tee
             self._audio_tee = audio_tee
+            self._start_bus_logger(pipeline)
 
             logger.info(
                 'Compositor pipeline started for session %s (%sx%s @ %sfps, layout=%s)',
@@ -279,6 +387,8 @@ class CompositorPipeline:
             for participant_id in list(self._participants.keys()):
                 self._remove_participant_unlocked(participant_id)
 
+            self._stop_bus_logger()
+
             if self._pipeline is not None:
                 self._pipeline.set_state(Gst.State.NULL)
                 self._pipeline = None
@@ -299,22 +409,23 @@ class CompositorPipeline:
                 file_path=file_path,
                 video_bitrate=settings.RECORDING_VIDEO_BITRATE,
                 audio_bitrate=settings.RECORDING_AUDIO_BITRATE,
+                fps=self.fps,
             )
 
-            for element in branch.elements:
-                self._pipeline.add(element)
-
-            attach_to_tees(
+            start_recording_on_pipeline(
+                self._pipeline,
                 branch,
                 video_tee=self._video_tee,
                 audio_tee=self._audio_tee,
             )
 
-            for element in branch.elements:
-                element.sync_state_with_parent()
-
             self._recording = branch
-            logger.info('Recording started for session %s -> %s', self.session_id, file_path)
+            logger.info(
+                'Recording started for session %s -> %s (composited_frames=%s)',
+                self.session_id,
+                file_path,
+                self._composited_frames,
+            )
 
     def stop_recording(self) -> Path:
         with self._lock:
@@ -338,6 +449,8 @@ class CompositorPipeline:
             if self._streaming is not None:
                 raise RuntimeError('Streaming is already active')
 
+            # Create → add → link → tee attach → sync (same order as recording).
+            # Linking before pipeline.add left RTMP with no media on Twitch.
             branch = build_streaming_branch(
                 destination_type=destination_type,
                 destination_url=destination_url,
@@ -345,18 +458,12 @@ class CompositorPipeline:
                 video_bitrate=settings.STREAMING_VIDEO_BITRATE,
                 audio_bitrate=settings.STREAMING_AUDIO_BITRATE,
             )
-
-            for element in branch.elements:
-                self._pipeline.add(element)
-
-            attach_stream_to_tees(
+            start_streaming_on_pipeline(
+                self._pipeline,
                 branch,
                 video_tee=self._video_tee,
                 audio_tee=self._audio_tee,
             )
-
-            for element in branch.elements:
-                element.sync_state_with_parent()
 
             self._streaming = branch
             self._streaming_config = (destination_type, destination_url, output_dir)
@@ -386,8 +493,13 @@ class CompositorPipeline:
         *,
         audio_port: int,
         video_port: int,
+        audio_rtcp_port: int,
+        video_rtcp_port: int,
         audio_payload_type: int,
         video_payload_type: int,
+        audio_mediasoup_transport: MediasoupTransportTuple,
+        video_mediasoup_transport: MediasoupTransportTuple,
+        rtcp_mux: bool = False,
     ) -> IngestStats:
         with self._lock:
             if self._pipeline is None:
@@ -400,12 +512,17 @@ class CompositorPipeline:
                 participant_peer_id=participant_peer_id,
                 audio_port=audio_port,
                 video_port=video_port,
+                audio_rtcp_port=audio_rtcp_port,
+                video_rtcp_port=video_rtcp_port,
                 audio_payload_type=audio_payload_type,
                 video_payload_type=video_payload_type,
+                audio_mediasoup_transport=audio_mediasoup_transport,
+                video_mediasoup_transport=video_mediasoup_transport,
+                rtcp_mux=rtcp_mux,
             )
             self._participants[participant_peer_id] = branch
 
-            if self._host_peer_id is None:
+            if self._host_peer_id is None and not participant_peer_id.startswith('rtmp-'):
                 self._host_peer_id = participant_peer_id
 
             self._apply_layout_unlocked()
@@ -416,9 +533,50 @@ class CompositorPipeline:
             self._remove_participant_unlocked(participant_peer_id)
 
             if self._host_peer_id == participant_peer_id:
-                self._host_peer_id = next(iter(self._participants), None)
+                self._host_peer_id = next(
+                    (
+                        pid
+                        for pid in self._participants
+                        if not pid.startswith('rtmp-')
+                    ),
+                    next(iter(self._participants), None),
+                )
 
             self._apply_layout_unlocked()
+
+    def add_rtmp_source(self, source_id: str, *, url: str, display_name: str = '') -> IngestStats:
+        with self._lock:
+            if self._pipeline is None:
+                raise RuntimeError('Compositor pipeline is not started')
+
+            if source_id in self._participants:
+                return self._participants[source_id].stats
+
+            branch = self._build_rtmp_source_branch(
+                source_id=source_id,
+                url=url,
+                display_name=display_name,
+            )
+            self._participants[source_id] = branch
+            self._apply_layout_unlocked()
+            logger.info(
+                'RTMP source added for session %s (source=%s url=%s)',
+                self.session_id,
+                source_id,
+                url,
+            )
+            return branch.stats
+
+    def remove_rtmp_source(self, source_id: str) -> None:
+        with self._lock:
+            self._remove_participant_unlocked(source_id)
+            self._apply_layout_unlocked()
+
+    def get_rtmp_source_stats(self, source_id: str) -> IngestStats | None:
+        branch = self._participants.get(source_id)
+        if branch is None or not source_id.startswith('rtmp-'):
+            return None
+        return branch.stats
 
     def set_layout(self, layout: str) -> None:
         with self._lock:
@@ -601,15 +759,12 @@ class CompositorPipeline:
                 video_bitrate=settings.STREAMING_VIDEO_BITRATE,
                 audio_bitrate=settings.STREAMING_AUDIO_BITRATE,
             )
-            for element in new_branch.elements:
-                self._pipeline.add(element)
-            attach_stream_to_tees(
+            start_streaming_on_pipeline(
+                self._pipeline,
                 new_branch,
                 video_tee=self._video_tee,
                 audio_tee=self._audio_tee,
             )
-            for element in new_branch.elements:
-                element.sync_state_with_parent()
             self._streaming = new_branch
             self._start_stream_monitor()
             return True
@@ -644,10 +799,14 @@ class CompositorPipeline:
         file_path = branch.file_path
 
         try:
+            assert self._video_tee is not None
+            assert self._audio_tee is not None
             finalize_recording(
                 branch,
                 self._pipeline,
                 timeout_sec=settings.RECORDING_EOS_TIMEOUT_SEC,
+                composited_frames=self._composited_frames,
+                participant_ingest=self._participant_ingest_summary_unlocked(),
             )
         finally:
             assert self._video_tee is not None
@@ -663,32 +822,73 @@ class CompositorPipeline:
         logger.info('Recording stopped for session %s -> %s', self.session_id, file_path)
         return file_path
 
+    def _participant_ingest_summary_unlocked(self) -> str:
+        if not self._participants:
+            return 'no participants attached'
+
+        parts = []
+        for peer_id, branch in self._participants.items():
+            stats = branch.stats
+            parts.append(
+                f'{peer_id}: rtp(v={stats.rtp_video_packets},a={stats.rtp_audio_packets}) '
+                f'rtcp(v={stats.rtcp_video_packets},a={stats.rtcp_audio_packets}) '
+                f'decoded(v={stats.video_buffers},a={stats.audio_buffers})'
+            )
+        return '; '.join(parts)
+
     def _build_participant_branch(
         self,
         *,
         participant_peer_id: str,
         audio_port: int,
         video_port: int,
+        audio_rtcp_port: int,
+        video_rtcp_port: int,
         audio_payload_type: int,
         video_payload_type: int,
+        audio_mediasoup_transport: MediasoupTransportTuple,
+        video_mediasoup_transport: MediasoupTransportTuple,
+        rtcp_mux: bool,
     ) -> ParticipantBranch:
         assert self._pipeline is not None
         assert self._compositor is not None
         assert self._audiomixer is not None
 
-        video_elements = self._build_video_ingest_chain(
+        video_chain = self._build_video_ingest_chain(
             participant_peer_id=participant_peer_id,
-            port=video_port,
+            rtp_port=video_port,
+            rtcp_port=video_rtcp_port,
             payload_type=video_payload_type,
+            mediasoup_transport=video_mediasoup_transport,
+            rtcp_mux=rtcp_mux,
         )
-        audio_elements = self._build_audio_ingest_chain(
+        audio_chain = self._build_audio_ingest_chain(
             participant_peer_id=participant_peer_id,
-            port=audio_port,
+            rtp_port=audio_port,
+            rtcp_port=audio_rtcp_port,
             payload_type=audio_payload_type,
+            mediasoup_transport=audio_mediasoup_transport,
+            rtcp_mux=rtcp_mux,
         )
+        all_elements = video_chain.elements + audio_chain.elements
 
-        for element in video_elements + audio_elements:
+        for element in all_elements:
             self._pipeline.add(element)
+
+        # Link only after elements are in the pipeline.
+        self._link_sequential(
+            video_chain.media_elements,
+            label=f'video-{participant_peer_id}',
+        )
+        self._link_sequential(
+            audio_chain.media_elements,
+            label=f'audio-{participant_peer_id}',
+        )
+        for upstream, downstream in video_chain.rtcp_links + audio_chain.rtcp_links:
+            if not upstream.link(downstream):
+                raise RuntimeError(
+                    f'Failed to link RTCP drain for {participant_peer_id}'
+                )
 
         compositor_sink_pad = self._compositor.get_request_pad('sink_%u')
         if compositor_sink_pad is None:
@@ -698,13 +898,13 @@ class CompositorPipeline:
         if mixer_pad is None:
             raise RuntimeError(f'Failed to request audiomixer sink pad for {participant_peer_id}')
 
-        video_src_pad = video_elements[-1].get_static_pad('src')
+        video_src_pad = video_chain.output.get_static_pad('src')
         if video_src_pad is None or video_src_pad.link(compositor_sink_pad) != Gst.PadLinkReturn.OK:
             raise RuntimeError(
                 f'Failed to link video branch to compositor for {participant_peer_id}'
             )
 
-        audio_src_pad = audio_elements[-1].get_static_pad('src')
+        audio_src_pad = audio_chain.output.get_static_pad('src')
         if audio_src_pad is None or audio_src_pad.link(mixer_pad) != Gst.PadLinkReturn.OK:
             raise RuntimeError(
                 f'Failed to link audio branch to audiomixer for {participant_peer_id}'
@@ -714,10 +914,83 @@ class CompositorPipeline:
             participant_peer_id=participant_peer_id,
             compositor_sink_pad=compositor_sink_pad,
             mixer_sink_pad=mixer_pad,
-            elements=video_elements + audio_elements,
+            elements=all_elements,
             stats=IngestStats(),
+            signal_handlers=video_chain.signal_handlers + audio_chain.signal_handlers,
         )
 
+        if video_chain.rtp_probe_pad is not None:
+            video_chain.rtp_probe_pad.add_probe(
+                Gst.PadProbeType.BUFFER,
+                self._make_rtp_video_probe(branch),
+                None,
+            )
+        if audio_chain.rtp_probe_pad is not None:
+            audio_chain.rtp_probe_pad.add_probe(
+                Gst.PadProbeType.BUFFER,
+                self._make_rtp_audio_probe(branch),
+                None,
+            )
+        if video_chain.rtcp_probe_pad is not None:
+            video_chain.rtcp_probe_pad.add_probe(
+                Gst.PadProbeType.BUFFER,
+                self._make_rtcp_video_probe(branch),
+                None,
+            )
+        if audio_chain.rtcp_probe_pad is not None:
+            audio_chain.rtcp_probe_pad.add_probe(
+                Gst.PadProbeType.BUFFER,
+                self._make_rtcp_audio_probe(branch),
+                None,
+            )
+
+        # Stage probes: jb → depay → decoder (pinpoint where video stalls).
+        video_jb_src = video_chain.media_elements[1].get_static_pad('src')
+        audio_jb_src = audio_chain.media_elements[1].get_static_pad('src')
+        video_depay_src = video_chain.media_elements[2].get_static_pad('src')
+        video_dec_src = video_chain.media_elements[3].get_static_pad('src')
+        audio_dec_src = audio_chain.media_elements[3].get_static_pad('src')
+        if video_jb_src is not None:
+            video_jb_src.add_probe(
+                Gst.PadProbeType.BUFFER,
+                self._make_count_probe(branch, 'video_jb'),
+                None,
+            )
+        if audio_jb_src is not None:
+            audio_jb_src.add_probe(
+                Gst.PadProbeType.BUFFER,
+                self._make_count_probe(branch, 'audio_jb'),
+                None,
+            )
+        if video_depay_src is not None:
+            video_depay_src.add_probe(
+                Gst.PadProbeType.BUFFER,
+                self._make_count_probe(branch, 'video_depay'),
+                None,
+            )
+        if video_dec_src is not None:
+            video_dec_src.add_probe(
+                Gst.PadProbeType.BUFFER,
+                self._make_count_probe(branch, 'video_dec'),
+                None,
+            )
+        if audio_dec_src is not None:
+            audio_dec_src.add_probe(
+                Gst.PadProbeType.BUFFER,
+                self._make_count_probe(branch, 'audio_dec'),
+                None,
+            )
+
+        video_src_pad.add_probe(
+            Gst.PadProbeType.BUFFER,
+            self._make_running_time_offset_probe(),
+            None,
+        )
+        audio_src_pad.add_probe(
+            Gst.PadProbeType.BUFFER,
+            self._make_running_time_offset_probe(),
+            None,
+        )
         video_src_pad.add_probe(
             Gst.PadProbeType.BUFFER,
             self._make_video_probe(branch),
@@ -729,89 +1002,340 @@ class CompositorPipeline:
             None,
         )
 
-        for element in video_elements + audio_elements:
+        # Downstream → upstream so udpsrc never goes PLAYING against a NULL peer.
+        for element in reversed(all_elements):
             element.sync_state_with_parent()
 
         return branch
+
+    def _build_rtcp_drain_chain(
+        self,
+        *,
+        participant_peer_id: str,
+        port: int,
+        label: str,
+    ) -> tuple[list[Gst.Element], tuple[Gst.Element, Gst.Element]]:
+        """Create RTCP udpsrc → fakesink (link after pipeline.add)."""
+        src = Gst.ElementFactory.make('udpsrc', f'{label}_rtcp_{participant_peer_id}')
+        sink = Gst.ElementFactory.make('fakesink', f'{label}_rtcp_sink_{participant_peer_id}')
+        if not src or not sink:
+            raise RuntimeError(
+                f'Failed to create RTCP drain elements for {participant_peer_id} ({label})'
+            )
+
+        src.set_property('port', port)
+        src.set_property('address', '0.0.0.0')
+        sink.set_property('sync', False)
+        sink.set_property('async', False)
+
+        return [src, sink], (src, sink)
 
     def _build_video_ingest_chain(
         self,
         *,
         participant_peer_id: str,
-        port: int,
+        rtp_port: int,
+        rtcp_port: int,
         payload_type: int,
-    ) -> list[Gst.Element]:
-        src = Gst.ElementFactory.make('udpsrc', f'video_src_{participant_peer_id}')
-        jitter = Gst.ElementFactory.make('rtpjitterbuffer', f'video_jitter_{participant_peer_id}')
-        depay = Gst.ElementFactory.make('rtpvp8depay', f'video_depay_{participant_peer_id}')
-        decoder = Gst.ElementFactory.make('vp8dec', f'video_dec_{participant_peer_id}')
-        convert = Gst.ElementFactory.make('videoconvert', f'video_convert_{participant_peer_id}')
+        mediasoup_transport: MediasoupTransportTuple,
+        rtcp_mux: bool,
+    ) -> IngestChainResult:
         scale = Gst.ElementFactory.make('videoscale', f'video_scale_{participant_peer_id}')
+        queue = Gst.ElementFactory.make('queue', f'video_queue_{participant_peer_id}')
+        if scale is None or queue is None:
+            raise RuntimeError(f'Failed to create video scale/queue for {participant_peer_id}')
+        scale.set_property('add-borders', True)
+        queue.set_property('leaky', 2)
+        queue.set_property('max-size-time', 2 * Gst.SECOND)
 
-        if not all([src, jitter, depay, decoder, convert, scale]):
-            raise RuntimeError(f'Failed to create video ingest elements for {participant_peer_id}')
-
-        src.set_property('port', port)
-        src.set_property(
-            'caps',
-            Gst.Caps.from_string(
+        return self._build_rtp_ingest_chain(
+            participant_peer_id=participant_peer_id,
+            label='video',
+            rtp_port=rtp_port,
+            rtcp_port=rtcp_port,
+            mediasoup_transport=mediasoup_transport,
+            rtcp_mux=rtcp_mux,
+            rtp_caps=(
                 f'application/x-rtp,media=video,clock-rate=90000,encoding-name=VP8,'
                 f'payload={payload_type}'
             ),
+            depay='rtpvp8depay',
+            decoder='vp8dec',
+            tail_elements=[
+                Gst.ElementFactory.make('videoconvert', f'video_convert_{participant_peer_id}'),
+                scale,
+                queue,
+            ],
         )
-        jitter.set_property('latency', 50)
-        scale.set_property('add-borders', True)
-
-        elements = [src, jitter, depay, decoder, convert, scale]
-        self._link_sequential(elements, label=f'video-{participant_peer_id}')
-        return elements
 
     def _build_audio_ingest_chain(
         self,
         *,
         participant_peer_id: str,
-        port: int,
+        rtp_port: int,
+        rtcp_port: int,
         payload_type: int,
-    ) -> list[Gst.Element]:
-        src = Gst.ElementFactory.make('udpsrc', f'audio_src_{participant_peer_id}')
-        jitter = Gst.ElementFactory.make('rtpjitterbuffer', f'audio_jitter_{participant_peer_id}')
-        depay = Gst.ElementFactory.make('rtpopusdepay', f'audio_depay_{participant_peer_id}')
-        decoder = Gst.ElementFactory.make('opusdec', f'audio_dec_{participant_peer_id}')
-        convert = Gst.ElementFactory.make('audioconvert', f'audio_convert_{participant_peer_id}')
-        resample = Gst.ElementFactory.make('audioresample', f'audio_resample_{participant_peer_id}')
-        queue = Gst.ElementFactory.make('queue', f'audio_queue_{participant_peer_id}')
-
-        if not all([src, jitter, depay, decoder, convert, resample, queue]):
-            raise RuntimeError(f'Failed to create audio ingest elements for {participant_peer_id}')
-
-        src.set_property('port', port)
-        src.set_property(
-            'caps',
-            Gst.Caps.from_string(
+        mediasoup_transport: MediasoupTransportTuple,
+        rtcp_mux: bool,
+    ) -> IngestChainResult:
+        audio_queue = Gst.ElementFactory.make('queue', f'audio_queue_{participant_peer_id}')
+        if audio_queue is not None:
+            audio_queue.set_property('leaky', 2)
+            audio_queue.set_property('max-size-time', 2 * Gst.SECOND)
+        tail_elements = [
+            Gst.ElementFactory.make('audioconvert', f'audio_convert_{participant_peer_id}'),
+            Gst.ElementFactory.make('audioresample', f'audio_resample_{participant_peer_id}'),
+            audio_queue,
+        ]
+        return self._build_rtp_ingest_chain(
+            participant_peer_id=participant_peer_id,
+            label='audio',
+            rtp_port=rtp_port,
+            rtcp_port=rtcp_port,
+            mediasoup_transport=mediasoup_transport,
+            rtcp_mux=rtcp_mux,
+            rtp_caps=(
                 f'application/x-rtp,media=audio,clock-rate=48000,encoding-name=OPUS,'
                 f'payload={payload_type}'
             ),
+            depay='rtpopusdepay',
+            decoder='opusdec',
+            tail_elements=tail_elements,
         )
-        jitter.set_property('latency', 50)
 
-        elements = [src, jitter, depay, decoder, convert, resample, queue]
-        self._link_sequential(elements, label=f'audio-{participant_peer_id}')
-        return elements
+    def _build_rtp_ingest_chain(
+        self,
+        *,
+        participant_peer_id: str,
+        label: str,
+        rtp_port: int,
+        rtcp_port: int,
+        mediasoup_transport: MediasoupTransportTuple,
+        rtcp_mux: bool,
+        rtp_caps: str,
+        depay: str,
+        decoder: str,
+        tail_elements: list[Gst.Element | None],
+    ) -> IngestChainResult:
+        # Static jitterbuffer path — avoids rtpbin dynamic-pad + Python GIL stalls.
+        # Elements are created here; linking happens after pipeline.add().
+        _ = mediasoup_transport
+        rtp_src = Gst.ElementFactory.make('udpsrc', f'{label}_rtp_src_{participant_peer_id}')
+        jitter = Gst.ElementFactory.make('rtpjitterbuffer', f'{label}_jitter_{participant_peer_id}')
+        depay_el = Gst.ElementFactory.make(depay, f'{label}_depay_{participant_peer_id}')
+        decoder_el = Gst.ElementFactory.make(decoder, f'{label}_dec_{participant_peer_id}')
+
+        if not all([rtp_src, jitter, depay_el, decoder_el, *tail_elements]):
+            raise RuntimeError(
+                f'Failed to create {label} ingest elements for {participant_peer_id}'
+            )
+
+        rtp_src.set_property('port', rtp_port)
+        rtp_src.set_property('address', '0.0.0.0')
+        rtp_src.set_property('caps', Gst.Caps.from_string(rtp_caps))
+        # Arrival-time stamps help downstream aggregators; mediasoup RTP clocks
+        # are not synchronized to this pipeline, so slave jitterbuffer mode
+        # holds forever when the branch is hot-added into an already-PLAYING
+        # compositor (percent stays 0, decoded stays 0).
+        rtp_src.set_property('do-timestamp', True)
+        jitter.set_property('mode', 0)  # none — reorder only, no clock skew
+        # VP8 keyframes are large/multi-packet. drop-on-latency with a short
+        # window discards late keyframe fragments → rtpvp8depay never emits →
+        # decoded(v=0) forever while video_jb still climbs. Audio Opus is
+        # typically 1 packet/frame so it survived the aggressive setting.
+        if label == 'video':
+            jitter.set_property('latency', 200)
+            jitter.set_property('drop-on-latency', False)
+        else:
+            jitter.set_property('latency', 100)
+            jitter.set_property('drop-on-latency', True)
+
+        logger.info(
+            'Built %s RTP ingest for peer %s (rtp_port=%s rtcp_port=%s caps=%s)',
+            label,
+            participant_peer_id,
+            rtp_port,
+            rtcp_port,
+            rtp_caps,
+        )
+
+        media_elements: list[Gst.Element] = [
+            rtp_src,
+            jitter,
+            depay_el,
+            decoder_el,
+            *tail_elements,  # type: ignore[list-item]
+        ]
+        elements: list[Gst.Element] = list(media_elements)
+        rtp_probe_pad = rtp_src.get_static_pad('src')
+        rtcp_probe_pad: Gst.Pad | None = None
+        rtcp_links: list[tuple[Gst.Element, Gst.Element]] = []
+        signal_handlers: list[tuple[Gst.Element, int]] = []
+
+        if not rtcp_mux:
+            rtcp_elements, rtcp_pair = self._build_rtcp_drain_chain(
+                participant_peer_id=participant_peer_id,
+                port=rtcp_port,
+                label=label,
+            )
+            elements.extend(rtcp_elements)
+            rtcp_links.append(rtcp_pair)
+            rtcp_probe_pad = rtcp_elements[0].get_static_pad('src')
+
+        return IngestChainResult(
+            elements=elements,
+            output=tail_elements[-1],  # type: ignore[arg-type]
+            media_elements=media_elements,
+            rtcp_links=rtcp_links,
+            rtp_probe_pad=rtp_probe_pad,
+            rtcp_probe_pad=rtcp_probe_pad,
+            signal_handlers=signal_handlers,
+        )
 
     def _remove_participant_unlocked(self, participant_peer_id: str) -> None:
         branch = self._participants.pop(participant_peer_id, None)
         if branch is None or self._pipeline is None:
             return
 
+        compositor_peer = branch.compositor_sink_pad.get_peer()
+        if compositor_peer is not None:
+            compositor_peer.unlink(branch.compositor_sink_pad)
+
+        mixer_peer = None
+        if branch.mixer_sink_pad is not None:
+            mixer_peer = branch.mixer_sink_pad.get_peer()
+            if mixer_peer is not None:
+                mixer_peer.unlink(branch.mixer_sink_pad)
+
         for element in branch.elements:
             element.set_state(Gst.State.NULL)
             self._pipeline.remove(element)
 
+        for element, handler_id in branch.signal_handlers:
+            element.disconnect(handler_id)
+
         if self._compositor is not None:
             self._compositor.release_request_pad(branch.compositor_sink_pad)
 
-        if self._audiomixer is not None:
+        if self._audiomixer is not None and branch.mixer_sink_pad is not None:
             self._audiomixer.release_request_pad(branch.mixer_sink_pad)
+
+    def _build_rtmp_source_branch(
+        self,
+        *,
+        source_id: str,
+        url: str,
+        display_name: str,
+    ) -> ParticipantBranch:
+        assert self._pipeline is not None
+        assert self._compositor is not None
+        assert self._audiomixer is not None
+
+        _ = display_name
+        src = Gst.ElementFactory.make('uridecodebin', f'rtmp_src_{source_id}')
+        video_convert = Gst.ElementFactory.make('videoconvert', f'rtmp_v_convert_{source_id}')
+        video_scale = Gst.ElementFactory.make('videoscale', f'rtmp_v_scale_{source_id}')
+        audio_convert = Gst.ElementFactory.make('audioconvert', f'rtmp_a_convert_{source_id}')
+        audio_resample = Gst.ElementFactory.make('audioresample', f'rtmp_a_resample_{source_id}')
+        audio_queue = Gst.ElementFactory.make('queue', f'rtmp_a_queue_{source_id}')
+
+        if not all([src, video_convert, video_scale, audio_convert, audio_resample, audio_queue]):
+            raise RuntimeError(f'Failed to create RTMP ingest elements for {source_id}')
+
+        src.set_property('uri', url)
+        video_scale.set_property('add-borders', True)
+
+        elements = [
+            src,
+            video_convert,
+            video_scale,
+            audio_convert,
+            audio_resample,
+            audio_queue,
+        ]
+        self._link_sequential(
+            [video_convert, video_scale],
+            label=f'rtmp-video-{source_id}',
+        )
+        self._link_sequential(
+            [audio_convert, audio_resample, audio_queue],
+            label=f'rtmp-audio-{source_id}',
+        )
+
+        for element in elements:
+            self._pipeline.add(element)
+
+        compositor_sink_pad = self._compositor.get_request_pad('sink_%u')
+        if compositor_sink_pad is None:
+            raise RuntimeError(f'Failed to request compositor sink pad for {source_id}')
+
+        video_src_pad = video_scale.get_static_pad('src')
+        if video_src_pad is None or video_src_pad.link(compositor_sink_pad) != Gst.PadLinkReturn.OK:
+            raise RuntimeError(f'Failed to link RTMP video branch to compositor for {source_id}')
+
+        branch = ParticipantBranch(
+            participant_peer_id=source_id,
+            compositor_sink_pad=compositor_sink_pad,
+            mixer_sink_pad=None,
+            elements=elements,
+            stats=IngestStats(),
+            source_url=url,
+        )
+        video_src_pad.add_probe(
+            Gst.PadProbeType.BUFFER,
+            self._make_video_probe(branch),
+            None,
+        )
+        link_state = {'audio': False}
+
+        def on_pad_added(_element: Gst.Element, pad: Gst.Pad, _user_data) -> None:
+            caps = pad.get_current_caps()
+            if caps is None:
+                caps = pad.query_caps(None)
+            if caps is None:
+                return
+
+            structure = caps.get_structure(0)
+            if structure is None:
+                return
+
+            media_name = structure.get_name()
+            if media_name.startswith('video/'):
+                sink_pad = video_convert.get_static_pad('sink')
+                if sink_pad is None or sink_pad.is_linked():
+                    return
+                if pad.link(sink_pad) != Gst.PadLinkReturn.OK:
+                    raise RuntimeError(f'Failed to link RTMP video pad for {source_id}')
+            elif media_name.startswith('audio/') and not link_state['audio']:
+                mixer_pad = self._audiomixer.get_request_pad('sink_%u')
+                if mixer_pad is None:
+                    raise RuntimeError(f'Failed to request audiomixer sink pad for {source_id}')
+
+                sink_pad = audio_convert.get_static_pad('sink')
+                if sink_pad is None or sink_pad.is_linked():
+                    return
+                if pad.link(sink_pad) != Gst.PadLinkReturn.OK:
+                    raise RuntimeError(f'Failed to link RTMP audio pad for {source_id}')
+
+                audio_src_pad = audio_queue.get_static_pad('src')
+                if audio_src_pad is None or audio_src_pad.link(mixer_pad) != Gst.PadLinkReturn.OK:
+                    raise RuntimeError(f'Failed to link RTMP audio branch to audiomixer for {source_id}')
+
+                branch.mixer_sink_pad = mixer_pad
+                link_state['audio'] = True
+                audio_src_pad.add_probe(
+                    Gst.PadProbeType.BUFFER,
+                    self._make_audio_probe(branch),
+                    None,
+                )
+
+        handler_id = src.connect('pad-added', on_pad_added, None)
+        branch.signal_handlers.append((src, handler_id))
+
+        for element in elements:
+            element.sync_state_with_parent()
+
+        return branch
 
     def _apply_layout_unlocked(self) -> None:
         if self._compositor is None:
@@ -856,9 +1380,176 @@ class CompositorPipeline:
         return Gst.PadProbeReturn.OK
 
     @staticmethod
+    def _should_log_ingest_count(count: int) -> bool:
+        """Log first packet, then 10/50/100, then every 100 thereafter."""
+        return count in (1, 10, 50, 100) or (count > 100 and count % 100 == 0)
+
+    @staticmethod
+    def _make_count_probe(branch: ParticipantBranch, stage: str):
+        """Log buffers at intermediate pads (jitterbuffer / decoder)."""
+
+        def _probe(_pad: Gst.Pad, _info: Gst.PadProbeInfo, _user_data) -> Gst.PadProbeReturn:
+            key = f'_stage_{stage}'
+            count = getattr(branch.stats, key, 0) + 1
+            setattr(branch.stats, key, count)
+            if CompositorPipeline._should_log_ingest_count(count):
+                logger.info(
+                    'Ingest stage=%s packets=%s peer=%s',
+                    stage,
+                    count,
+                    branch.participant_peer_id,
+                )
+            return Gst.PadProbeReturn.OK
+
+        return _probe
+
+    def _make_running_time_offset_probe(self):
+        """
+        Keep buffer PTS aligned to pipeline running time.
+
+        Mediasoup RTP timestamps are an arbitrary offset from this pipeline's
+        clock. A one-shot offset drifts; compositor/audiomixer then hold or
+        drop buffers even while the decoder keeps producing frames.
+        """
+        state = {'logged': False}
+
+        def _probe(pad: Gst.Pad, info: Gst.PadProbeInfo, _user_data) -> Gst.PadProbeReturn:
+            if self._pipeline is None:
+                return Gst.PadProbeReturn.OK
+
+            buffer = info.get_buffer()
+            if buffer is None or buffer.pts == Gst.CLOCK_TIME_NONE:
+                return Gst.PadProbeReturn.OK
+
+            clock = self._pipeline.get_clock()
+            if clock is None:
+                return Gst.PadProbeReturn.OK
+
+            running_time = clock.get_time() - self._pipeline.get_base_time()
+            if running_time < 0:
+                return Gst.PadProbeReturn.OK
+
+            pad.set_offset(int(running_time) - int(buffer.pts))
+            if not state['logged']:
+                state['logged'] = True
+                logger.info(
+                    'Applied running-time pad offset=%s on %s',
+                    pad.get_offset(),
+                    pad.get_path_string(),
+                )
+            return Gst.PadProbeReturn.OK
+
+        return _probe
+
+    @staticmethod
+    def _make_rtcp_video_probe(branch: ParticipantBranch):
+        def _probe(_pad: Gst.Pad, _info: Gst.PadProbeInfo, _user_data) -> Gst.PadProbeReturn:
+            branch.stats.rtcp_video_packets += 1
+            count = branch.stats.rtcp_video_packets
+            if CompositorPipeline._should_log_ingest_count(count):
+                logger.info(
+                    'Ingest RTCP video packets=%s peer=%s',
+                    count,
+                    branch.participant_peer_id,
+                )
+            return Gst.PadProbeReturn.OK
+
+        return _probe
+
+    @staticmethod
+    def _make_rtcp_audio_probe(branch: ParticipantBranch):
+        def _probe(_pad: Gst.Pad, _info: Gst.PadProbeInfo, _user_data) -> Gst.PadProbeReturn:
+            branch.stats.rtcp_audio_packets += 1
+            count = branch.stats.rtcp_audio_packets
+            if CompositorPipeline._should_log_ingest_count(count):
+                logger.info(
+                    'Ingest RTCP audio packets=%s peer=%s',
+                    count,
+                    branch.participant_peer_id,
+                )
+            return Gst.PadProbeReturn.OK
+
+        return _probe
+
+    @staticmethod
+    def _rtp_payload_type_from_buffer(info: Gst.PadProbeInfo) -> int | None:
+        buffer = info.get_buffer()
+        if buffer is None or buffer.get_size() < 2:
+            return None
+        success, map_info = buffer.map(Gst.MapFlags.READ)
+        if not success:
+            return None
+        try:
+            return map_info.data[1] & 0x7F
+        finally:
+            buffer.unmap(map_info)
+
+    @staticmethod
+    def _make_rtp_video_probe(branch: ParticipantBranch):
+        logged_wire_pt = {'done': False}
+
+        def _probe(_pad: Gst.Pad, info: Gst.PadProbeInfo, _user_data) -> Gst.PadProbeReturn:
+            branch.stats.rtp_video_packets += 1
+            count = branch.stats.rtp_video_packets
+            if not logged_wire_pt['done']:
+                wire_pt = CompositorPipeline._rtp_payload_type_from_buffer(info)
+                if wire_pt is not None:
+                    logged_wire_pt['done'] = True
+                    logger.info(
+                        'First video RTP wire payload type=%s peer=%s',
+                        wire_pt,
+                        branch.participant_peer_id,
+                    )
+            if CompositorPipeline._should_log_ingest_count(count):
+                logger.info(
+                    'Ingest RTP video packets=%s decoded=%s peer=%s',
+                    count,
+                    branch.stats.video_buffers,
+                    branch.participant_peer_id,
+                )
+            return Gst.PadProbeReturn.OK
+
+        return _probe
+
+    @staticmethod
+    def _make_rtp_audio_probe(branch: ParticipantBranch):
+        logged_wire_pt = {'done': False}
+
+        def _probe(_pad: Gst.Pad, info: Gst.PadProbeInfo, _user_data) -> Gst.PadProbeReturn:
+            branch.stats.rtp_audio_packets += 1
+            count = branch.stats.rtp_audio_packets
+            if not logged_wire_pt['done']:
+                wire_pt = CompositorPipeline._rtp_payload_type_from_buffer(info)
+                if wire_pt is not None:
+                    logged_wire_pt['done'] = True
+                    logger.info(
+                        'First audio RTP wire payload type=%s peer=%s',
+                        wire_pt,
+                        branch.participant_peer_id,
+                    )
+            if CompositorPipeline._should_log_ingest_count(count):
+                logger.info(
+                    'Ingest RTP audio packets=%s decoded=%s peer=%s',
+                    count,
+                    branch.stats.audio_buffers,
+                    branch.participant_peer_id,
+                )
+            return Gst.PadProbeReturn.OK
+
+        return _probe
+
+    @staticmethod
     def _make_video_probe(branch: ParticipantBranch):
         def _probe(pad: Gst.Pad, info: Gst.PadProbeInfo, _user_data) -> Gst.PadProbeReturn:
             branch.stats.video_buffers += 1
+            count = branch.stats.video_buffers
+            if CompositorPipeline._should_log_ingest_count(count):
+                logger.info(
+                    'Ingest decoded video frames=%s rtp=%s peer=%s',
+                    count,
+                    branch.stats.rtp_video_packets,
+                    branch.participant_peer_id,
+                )
             return Gst.PadProbeReturn.OK
 
         return _probe
@@ -867,6 +1558,14 @@ class CompositorPipeline:
     def _make_audio_probe(branch: ParticipantBranch):
         def _probe(pad: Gst.Pad, info: Gst.PadProbeInfo, _user_data) -> Gst.PadProbeReturn:
             branch.stats.audio_buffers += 1
+            count = branch.stats.audio_buffers
+            if CompositorPipeline._should_log_ingest_count(count):
+                logger.info(
+                    'Ingest decoded audio buffers=%s rtp=%s peer=%s',
+                    count,
+                    branch.stats.rtp_audio_packets,
+                    branch.participant_peer_id,
+                )
             return Gst.PadProbeReturn.OK
 
         return _probe

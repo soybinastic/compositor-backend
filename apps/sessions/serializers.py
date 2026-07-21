@@ -71,6 +71,18 @@ class ParticipantIngestStatusSerializer(serializers.Serializer):
     video_port = serializers.IntegerField()
     audio_buffers = serializers.IntegerField()
     video_buffers = serializers.IntegerField()
+    rtp_audio_packets = serializers.IntegerField()
+    rtp_video_packets = serializers.IntegerField()
+    rtcp_audio_packets = serializers.IntegerField()
+    rtcp_video_packets = serializers.IntegerField()
+
+
+class RtmpSourceIngestStatusSerializer(serializers.Serializer):
+    source_id = serializers.CharField()
+    url = serializers.CharField()
+    display_name = serializers.CharField()
+    video_buffers = serializers.IntegerField()
+    audio_buffers = serializers.IntegerField()
 
 
 class SessionIngestStatusSerializer(serializers.Serializer):
@@ -89,3 +101,4 @@ class SessionIngestStatusSerializer(serializers.Serializer):
     streaming_destination_type = serializers.CharField(allow_null=True)
     streaming_destination_url = serializers.CharField(allow_null=True)
     participants = ParticipantIngestStatusSerializer(many=True)
+    rtmp_sources = RtmpSourceIngestStatusSerializer(many=True)

@@ -20,6 +20,10 @@ Gst.init(None)
 class IngestStats:
     audio_buffers: int = 0
     video_buffers: int = 0
+    rtp_audio_packets: int = 0
+    rtp_video_packets: int = 0
+    rtcp_audio_packets: int = 0
+    rtcp_video_packets: int = 0
 
 
 @dataclass
@@ -125,7 +129,10 @@ class IngestBranch:
 
         src.set_property('port', port)
         src.set_property('caps', Gst.Caps.from_string(caps))
-        jitter.set_property('latency', 50)
+        src.set_property('do-timestamp', True)
+        jitter.set_property('latency', 100)
+        jitter.set_property('mode', 0)
+        jitter.set_property('drop-on-latency', True)
         sink.set_property('sync', False)
 
         for element in (src, jitter, depay_el, decoder_el, convert_el, sink):

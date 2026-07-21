@@ -28,6 +28,19 @@ class ParticipantIngestStatus:
     video_port: int
     audio_buffers: int
     video_buffers: int
+    rtp_audio_packets: int
+    rtp_video_packets: int
+    rtcp_audio_packets: int
+    rtcp_video_packets: int
+
+
+@dataclass
+class RtmpSourceIngestStatus:
+    source_id: str
+    url: str
+    display_name: str
+    video_buffers: int
+    audio_buffers: int
 
 
 @dataclass
@@ -47,6 +60,7 @@ class SessionIngestStatus:
     streaming_destination_type: str | None
     streaming_destination_url: str | None
     participants: list[ParticipantIngestStatus] = field(default_factory=list)
+    rtmp_sources: list[RtmpSourceIngestStatus] = field(default_factory=list)
 
 
 class SessionIngestManager:
@@ -68,6 +82,7 @@ class SessionIngestManager:
         self._consumer_service = consumer_service
         self._compositor_pipeline = compositor_pipeline
         self._participants: dict[str, ParticipantIngest] = {}
+        self._rtmp_sources: dict[str, dict[str, str]] = {}
         self._lock = threading.Lock()
         self._stopped = False
 
@@ -141,6 +156,23 @@ class SessionIngestManager:
                 desired[participant_peer_id] = (audio_id, video_id)
 
         with self._lock:
+            for participant_peer_id in list(self._participants.keys()):
+                if participant_peer_id not in desired:
+                    continue
+
+                audio_id, video_id = desired[participant_peer_id]
+                current = self._participants[participant_peer_id]
+                if (
+                    current.audio_producer_id != audio_id
+                    or current.video_producer_id != video_id
+                ):
+                    logger.info(
+                        'Re-attaching ingest for %s (producer ids changed)',
+                        participant_peer_id,
+                    )
+                    self._consumer_service.detach_participant(current)
+                    del self._participants[participant_peer_id]
+
             current_ids = set(self._participants.keys())
             desired_ids = set(desired.keys())
 
@@ -163,9 +195,38 @@ class SessionIngestManager:
                 participant = self._participants.pop(participant_peer_id)
                 self._consumer_service.detach_participant(participant)
 
+    def add_rtmp_source(
+        self,
+        *,
+        source_id: str,
+        url: str,
+        display_name: str = '',
+    ) -> None:
+        self._compositor_pipeline.add_rtmp_source(
+            source_id,
+            url=url,
+            display_name=display_name,
+        )
+        with self._lock:
+            self._rtmp_sources[source_id] = {
+                'url': url,
+                'display_name': display_name,
+            }
+
+    def remove_rtmp_source(self, source_id: str) -> None:
+        self._compositor_pipeline.remove_rtmp_source(source_id)
+        with self._lock:
+            self._rtmp_sources.pop(source_id, None)
+
+    def get_rtmp_source_stats(self, source_id: str):
+        return self._compositor_pipeline.get_rtmp_source_stats(source_id)
+
     def stop(self) -> None:
         with self._lock:
             self._stopped = True
+            for source_id in list(self._rtmp_sources.keys()):
+                self._compositor_pipeline.remove_rtmp_source(source_id)
+            self._rtmp_sources.clear()
             for participant in list(self._participants.values()):
                 self._consumer_service.detach_participant(participant)
             self._participants.clear()
@@ -217,6 +278,23 @@ class SessionIngestManager:
                         video_port=participant.ports.video.rtp_port,
                         audio_buffers=stats.audio_buffers if stats else 0,
                         video_buffers=stats.video_buffers if stats else 0,
+                        rtp_audio_packets=stats.rtp_audio_packets if stats else 0,
+                        rtp_video_packets=stats.rtp_video_packets if stats else 0,
+                        rtcp_audio_packets=stats.rtcp_audio_packets if stats else 0,
+                        rtcp_video_packets=stats.rtcp_video_packets if stats else 0,
+                    )
+                )
+
+            rtmp_sources = []
+            for source_id, meta in self._rtmp_sources.items():
+                stats = self._compositor_pipeline.get_rtmp_source_stats(source_id)
+                rtmp_sources.append(
+                    RtmpSourceIngestStatus(
+                        source_id=source_id,
+                        url=meta['url'],
+                        display_name=meta['display_name'],
+                        video_buffers=stats.video_buffers if stats else 0,
+                        audio_buffers=stats.audio_buffers if stats else 0,
                     )
                 )
 
@@ -236,6 +314,7 @@ class SessionIngestManager:
                 streaming_destination_type=pipeline_status.streaming_destination_type,
                 streaming_destination_url=pipeline_status.streaming_destination_url,
                 participants=participants,
+                rtmp_sources=rtmp_sources,
             )
 
     @staticmethod

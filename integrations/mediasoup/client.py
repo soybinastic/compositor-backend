@@ -108,17 +108,20 @@ class MediasoupHttpClient:
         *,
         ip: str,
         port: int,
-        rtcp_port: int,
+        rtcp_port: int | None = None,
+        rtcp_mux: bool = False,
     ) -> None:
         """Tell mediasoup where to send RTP packets."""
+        body: dict[str, Any] = {'ip': ip, 'port': port}
+        if not rtcp_mux:
+            if rtcp_port is None:
+                raise ValueError('rtcp_port is required when rtcp_mux is disabled')
+            body['rtcpPort'] = rtcp_port
+
         self._request(
             'POST',
             f'/rooms/{room_id}/broadcasters/{peer_id}/transports/{transport_id}/connect',
-            {
-                'ip': ip,
-                'port': port,
-                'rtcpPort': rtcp_port,
-            },
+            body,
         )
 
     def create_consumer(

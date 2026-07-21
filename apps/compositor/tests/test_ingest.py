@@ -64,6 +64,16 @@ class RtpCapabilitiesTests(TestCase):
         audio_caps = build_audio_rtp_capabilities(100)
         self.assertEqual(audio_caps['codecs'][0]['preferredPayloadType'], 100)
 
+    def test_payload_type_from_consumer_rtp_parameters(self):
+        from integrations.mediasoup.rtp import get_payload_type_from_rtp_parameters
+
+        self.assertEqual(
+            get_payload_type_from_rtp_parameters(
+                {'codecs': [{'mimeType': 'audio/opus', 'payloadType': 111}]}
+            ),
+            111,
+        )
+
 
 class SessionIngestManagerTests(TestCase):
     def test_sync_producers_attaches_and_detaches(self):
@@ -116,6 +126,48 @@ class SessionIngestManagerTests(TestCase):
 
         manager.sync_producers([])
         mock_consumer_service.detach_participant.assert_called_once_with(mock_participant)
+
+    def test_sync_producers_reattaches_when_producer_ids_change(self):
+        mock_consumer_service = MagicMock(spec=ConsumerService)
+        mock_consumer_service.joined = True
+        first = MagicMock()
+        first.participant_peer_id = 'guest-1'
+        first.audio_producer_id = 'audio-1'
+        first.video_producer_id = 'video-1'
+        second = MagicMock()
+        second.participant_peer_id = 'guest-1'
+        second.audio_producer_id = 'audio-2'
+        second.video_producer_id = 'video-2'
+        mock_consumer_service.attach_participant.return_value = second
+        mock_compositor_pipeline = MagicMock()
+
+        manager = SessionIngestManager(
+            session_id='session-1',
+            room_id='session-1',
+            compositor_peer_id='compositor-session-1',
+            layout='CONTAIN',
+            consumer_service=mock_consumer_service,
+            compositor_pipeline=mock_compositor_pipeline,
+        )
+        manager._participants['guest-1'] = first
+
+        peer_producers = {
+            'peerId': 'guest-1',
+            'producers': [
+                {'producerId': 'audio-2', 'kind': 'audio', 'source': 'audio'},
+                {'producerId': 'video-2', 'kind': 'video', 'source': 'video'},
+            ],
+        }
+
+        manager.sync_producers([peer_producers])
+
+        mock_consumer_service.detach_participant.assert_called_once_with(first)
+        mock_consumer_service.attach_participant.assert_called_once_with(
+            'guest-1',
+            'audio-2',
+            'video-2',
+        )
+        self.assertIs(manager._participants['guest-1'], second)
 
     def test_set_layout_updates_compositor_pipeline(self):
         mock_consumer_service = MagicMock(spec=ConsumerService)

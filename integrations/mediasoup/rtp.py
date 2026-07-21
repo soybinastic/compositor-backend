@@ -16,6 +16,19 @@ def get_codec_payload_type(router_caps: dict[str, Any], mime_type: str) -> int:
     raise ValueError(f'Codec not found in router capabilities: {mime_type}')
 
 
+def get_payload_type_from_rtp_parameters(rtp_parameters: dict[str, Any]) -> int:
+    """Return the wire payload type from a mediasoup Consumer rtpParameters."""
+    codecs = rtp_parameters.get('codecs') or []
+    if not codecs:
+        raise ValueError('rtpParameters has no codecs')
+
+    payload = codecs[0].get('payloadType')
+    if payload is None:
+        raise ValueError('rtpParameters codec is missing payloadType')
+
+    return int(payload)
+
+
 def build_audio_rtp_capabilities(payload_type: int) -> dict[str, Any]:
     return {
         'codecs': [

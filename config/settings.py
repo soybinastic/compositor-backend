@@ -38,6 +38,7 @@ INSTALLED_APPS = [
     'apps.layouts.apps.LayoutsConfig',
     'apps.recording.apps.RecordingConfig',
     'apps.streaming.apps.StreamingConfig',
+    'apps.sources.apps.SourcesConfig',
 ]
 
 MIDDLEWARE = [
@@ -101,6 +102,45 @@ USE_TZ = True
 STATIC_URL = 'static/'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'verbose': {
+            'format': '[{asctime}] {levelname} {name}: {message}',
+            'style': '{',
+            'datefmt': '%Y-%m-%d %H:%M:%S',
+        },
+    },
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'verbose',
+        },
+    },
+    'root': {
+        'handlers': ['console'],
+        'level': 'WARNING',
+    },
+    'loggers': {
+        'apps.compositor': {
+            'handlers': ['console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+        'apps.recording': {
+            'handlers': ['console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+        'django.request': {
+            'handlers': ['console'],
+            'level': 'ERROR',
+            'propagate': False,
+        },
+    },
+}
+
 # --- REST Framework ---
 REST_FRAMEWORK = {
     'DEFAULT_RENDERER_CLASSES': [
@@ -136,7 +176,7 @@ RECORDINGS_DIR = Path(os.getenv('RECORDINGS_DIR', str(BASE_DIR / 'recordings')))
 RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 RECORDING_VIDEO_BITRATE = int(os.getenv('RECORDING_VIDEO_BITRATE', '4000000'))
 RECORDING_AUDIO_BITRATE = int(os.getenv('RECORDING_AUDIO_BITRATE', '128000'))
-RECORDING_EOS_TIMEOUT_SEC = float(os.getenv('RECORDING_EOS_TIMEOUT_SEC', '5'))
+RECORDING_EOS_TIMEOUT_SEC = float(os.getenv('RECORDING_EOS_TIMEOUT_SEC', '15'))
 
 STREAMING_HLS_DIR = Path(os.getenv('STREAMING_HLS_DIR', str(BASE_DIR / 'streams' / 'hls')))
 STREAMING_HLS_DIR.mkdir(parents=True, exist_ok=True)

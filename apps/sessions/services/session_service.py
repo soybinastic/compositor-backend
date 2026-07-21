@@ -114,10 +114,12 @@ class SessionService:
             return session
 
         from apps.recording.service import RecordingService
+        from apps.sources.service import RtmpSourceService
         from apps.streaming.service import StreamingService
 
         StreamingService().stop_active_stream_if_any(session_id)
         RecordingService().stop_active_recording_if_any(session_id)
+        RtmpSourceService().stop_active_sources_if_any(session_id)
         self._media_plane_bootstrap.teardown(session)
         session.end()
         session = self._repository.save(session)

@@ -225,8 +225,22 @@ class SessionIngestView(APIView):
                             'video_port': p.video_port,
                             'audio_buffers': p.audio_buffers,
                             'video_buffers': p.video_buffers,
+                            'rtp_audio_packets': p.rtp_audio_packets,
+                            'rtp_video_packets': p.rtp_video_packets,
+                            'rtcp_audio_packets': p.rtcp_audio_packets,
+                            'rtcp_video_packets': p.rtcp_video_packets,
                         }
                         for p in ingest_status.participants
+                    ],
+                    'rtmp_sources': [
+                        {
+                            'source_id': source.source_id,
+                            'url': source.url,
+                            'display_name': source.display_name,
+                            'video_buffers': source.video_buffers,
+                            'audio_buffers': source.audio_buffers,
+                        }
+                        for source in ingest_status.rtmp_sources
                     ],
                 }
             ).data
