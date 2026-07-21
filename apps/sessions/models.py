@@ -47,6 +47,7 @@ class StudioSession(models.Model):
         blank=True,
         null=True,
     )
+    graphics_config = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     ended_at = models.DateTimeField(blank=True, null=True)
 

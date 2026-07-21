@@ -39,6 +39,7 @@ INSTALLED_APPS = [
     'apps.recording.apps.RecordingConfig',
     'apps.streaming.apps.StreamingConfig',
     'apps.sources.apps.SourcesConfig',
+    'apps.graphics.apps.GraphicsConfig',
 ]
 
 MIDDLEWARE = [
@@ -133,6 +134,11 @@ LOGGING = {
             'level': 'INFO',
             'propagate': False,
         },
+        'apps.graphics': {
+            'handlers': ['console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
         'django.request': {
             'handlers': ['console'],
             'level': 'ERROR',
@@ -181,6 +187,10 @@ if _COMPOSITOR_VIDEO_BACKEND not in ('cpu', 'gl', 'cuda', 'auto'):
     )
 COMPOSITOR_VIDEO_BACKEND = _COMPOSITOR_VIDEO_BACKEND
 COMPOSITOR_CUDA_DEVICE_ID = int(os.getenv('COMPOSITOR_CUDA_DEVICE_ID', '-1'))
+COMPOSITOR_DISABLE_BACKGROUND = os.getenv(
+    'COMPOSITOR_DISABLE_BACKGROUND',
+    'false',
+).lower() in ('true', '1', 'yes')
 
 RECORDINGS_DIR = Path(os.getenv('RECORDINGS_DIR', str(BASE_DIR / 'recordings')))
 RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)

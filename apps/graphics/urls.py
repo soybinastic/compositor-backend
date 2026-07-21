@@ -1,0 +1,67 @@
+from django.urls import path
+
+from apps.graphics.views import (
+    SessionGraphicsBackgroundView,
+    SessionGraphicsBannerTickerView,
+    SessionGraphicsBannerView,
+    SessionGraphicsBulkView,
+    SessionGraphicsChatView,
+    SessionGraphicsLogoView,
+    SessionGraphicsOverlayView,
+    SessionGraphicsQrView,
+    SessionGraphicsTickerView,
+    SessionGraphicsView,
+)
+
+urlpatterns = [
+    path(
+        'sessions/<uuid:session_id>/graphics/',
+        SessionGraphicsView.as_view(),
+        name='session-graphics',
+    ),
+    path(
+        'sessions/<uuid:session_id>/graphics/bulk/',
+        SessionGraphicsBulkView.as_view(),
+        name='session-graphics-bulk',
+    ),
+    path(
+        'sessions/<uuid:session_id>/graphics/background/',
+        SessionGraphicsBackgroundView.as_view(),
+        name='session-graphics-background',
+    ),
+    path(
+        'sessions/<uuid:session_id>/graphics/overlay/',
+        SessionGraphicsOverlayView.as_view(),
+        name='session-graphics-overlay',
+    ),
+    path(
+        'sessions/<uuid:session_id>/graphics/logo/',
+        SessionGraphicsLogoView.as_view(),
+        name='session-graphics-logo',
+    ),
+    path(
+        'sessions/<uuid:session_id>/graphics/qr/',
+        SessionGraphicsQrView.as_view(),
+        name='session-graphics-qr',
+    ),
+    path(
+        'sessions/<uuid:session_id>/graphics/banner/',
+        SessionGraphicsBannerView.as_view(),
+        name='session-graphics-banner',
+    ),
+    path(
+        'sessions/<uuid:session_id>/graphics/ticker/',
+        SessionGraphicsTickerView.as_view(),
+        name='session-graphics-ticker',
+    ),
+    path(
+        'sessions/<uuid:session_id>/graphics/banner-ticker/',
+        SessionGraphicsBannerTickerView.as_view(),
+        name='session-graphics-banner-ticker',
+    ),
+    path(
+        'sessions/<uuid:session_id>/graphics/chat/',
+        SessionGraphicsChatView.as_view(),
+        name='session-graphics-chat',
+    ),
+]

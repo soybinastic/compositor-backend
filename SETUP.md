@@ -37,6 +37,27 @@ Set `COMPOSITOR_VIDEO_BACKEND` in `.env`:
 
 Optional: `COMPOSITOR_CUDA_DEVICE_ID=-1` (auto) or a device index for `cudacompositor`.
 
+Optional: `COMPOSITOR_DISABLE_BACKGROUND=true` disables background image/video graphics even when configured.
+
+## Graphics and overlays
+
+Session-scoped APIs under `/api/v1/sessions/{sessionId}/graphics/`:
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/graphics/` | Current graphics state |
+| POST | `/graphics/bulk/` | Upsert any subset of layers |
+| POST | `/graphics/background/` | Background image/video |
+| POST | `/graphics/overlay/` | Full-frame / positioned overlay |
+| POST | `/graphics/logo/` | Corner logo |
+| POST | `/graphics/qr/` | QR code |
+| POST | `/graphics/banner/` | Lower-third banner |
+| POST | `/graphics/ticker/` | Scrolling ticker |
+| POST | `/graphics/banner-ticker/` | Banner + ticker together |
+| POST | `/graphics/chat/` | Chat overlay panel |
+
+Graphics are mixed onto the same GStreamer canvas as live video (and therefore appear in recording/streaming). Layers use dedicated mixer pads with fixed z-order; updates hot-swap content without rebuilding participant ingest.
+
 Verify plugins:
 
 ```bash
@@ -51,7 +72,10 @@ Health (`GET /api/v1/health/`) reports `requested_backend`, `resolved_backend`, 
 
 ```bash
 pip install -r requirements.txt
+pip install Pillow   # required for banner / ticker / chat rendering
 ```
+
+> **Note:** Add `Pillow` to `requirements.txt` if it is not already listed (banner, ticker, and chat overlays render via PIL).
 
 > **Note:** `PyGObject` requires system GObject/GStreamer libraries. If `pip install PyGObject` fails on macOS, use `brew install pygobject3` and ensure `GI_TYPELIB_PATH` includes Homebrew typelibs.
 

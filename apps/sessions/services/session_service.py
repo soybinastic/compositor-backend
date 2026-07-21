@@ -105,6 +105,10 @@ class SessionService:
         ingest_manager = get_ingest_manager(str(session_id))
         if ingest_manager is not None:
             ingest_manager.set_layout(layout)
+            # Layout-only graphics sync: background visibility without rebuild.
+            from apps.graphics.service import GraphicsService
+
+            GraphicsService().apply_layout_only(session)
 
         return session
 

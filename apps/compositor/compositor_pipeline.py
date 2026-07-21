@@ -23,6 +23,7 @@ from apps.compositor.video_mix_backend import (
     get_video_mix_backend,
     resolve_video_backend,
 )
+from apps.graphics.controller import GraphicsController
 from apps.layouts.manager import LayoutManager
 from apps.layouts.strategies.base import Size, TileConfig
 from apps.layouts.types import ScaleMode
@@ -155,6 +156,7 @@ class CompositorPipeline:
         self._lock = threading.Lock()
         self._bus_stop = threading.Event()
         self._bus_thread: threading.Thread | None = None
+        self._graphics = GraphicsController(self)
 
     def _start_bus_logger(self, pipeline: Gst.Pipeline) -> None:
         self._stop_bus_logger()
@@ -402,6 +404,7 @@ class CompositorPipeline:
             for participant_id in list(self._participants.keys()):
                 self._remove_participant_unlocked(participant_id)
 
+            self._graphics.stop()
             self._stop_bus_logger()
 
             if self._pipeline is not None:
@@ -600,6 +603,26 @@ class CompositorPipeline:
             self._layout = layout
             self._layout_manager.set_strategy(layout)
             self._apply_layout_unlocked()
+
+    def apply_graphics(
+        self,
+        state: dict,
+        *,
+        layout_only: bool = False,
+    ) -> None:
+        """Apply full graphics state to mixer pads (hot-swap; does not touch participants)."""
+        with self._lock:
+            if self._pipeline is None:
+                raise RuntimeError('Compositor pipeline is not started')
+            self._graphics.apply_state(
+                state,
+                layout=self._layout,
+                layout_only=layout_only,
+            )
+
+    def clear_graphics(self) -> None:
+        with self._lock:
+            self._graphics.stop()
 
     def get_participant_stats(self, participant_peer_id: str) -> IngestStats | None:
         branch = self._participants.get(participant_peer_id)
@@ -1399,6 +1422,9 @@ class CompositorPipeline:
                 self._hide_pad(branch.compositor_sink_pad)
                 continue
             self._apply_tile_to_pad(branch, tile)
+
+        # Layout-only: re-evaluate background visibility without rebuilding overlays.
+        self._graphics.sync_background_visibility(self._layout)
 
     @staticmethod
     def _set_pad_property_if_present(pad: Gst.Pad, name: str, value) -> None:

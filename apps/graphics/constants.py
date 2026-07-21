@@ -1,0 +1,54 @@
+"""Z-order and geometry constants for canvas graphics layers."""
+
+from __future__ import annotations
+
+# Back → front
+ZORDER_BACKGROUND = 0
+ZORDER_LIVE_VIDEO_MIN = 1
+ZORDER_LIVE_VIDEO_MAX = 50
+ZORDER_TICKER = 300
+ZORDER_BANNER_PRIMARY = 400
+ZORDER_BANNER_SECONDARY = 401
+ZORDER_OVERLAY = 500
+ZORDER_LOGO = 1000
+ZORDER_CHAT = 1050
+ZORDER_QR = 1100
+
+LAYER_BACKGROUND = 'background'
+LAYER_OVERLAY = 'overlay'
+LAYER_LOGO = 'logo'
+LAYER_QR = 'qr'
+LAYER_BANNER = 'banner'
+LAYER_TICKER = 'ticker'
+LAYER_CHAT = 'chat'
+
+ALL_LAYERS = (
+    LAYER_BACKGROUND,
+    LAYER_OVERLAY,
+    LAYER_LOGO,
+    LAYER_QR,
+    LAYER_BANNER,
+    LAYER_TICKER,
+    LAYER_CHAT,
+)
+
+# Background only visible on these layouts (CONTAIN=0 / FULLSCREEN=6 in legacy enums).
+BACKGROUND_VISIBLE_LAYOUTS = frozenset({'CONTAIN', 'FULLSCREEN'})
+
+VIDEO_EXTENSIONS = frozenset({'.mp4', '.webm', '.mkv', '.avi', '.mov', '.flv', '.m4v'})
+
+LOGO_MAX_WIDTH = 350
+LOGO_MAX_HEIGHT = 100
+LOGO_EDGE_INSET = 20
+
+QR_CORNER_SIZE = 200
+QR_CENTER_WIDTH = 250
+QR_CENTER_HEIGHT = 200
+QR_EDGE_MARGIN = 20
+
+BANNER_X = 40
+TICKER_CHAT_Y_NUDGE = 25
+
+CHAT_PANEL_WIDTH = 550
+CHAT_PANEL_HEIGHT = 830
+CHAT_EDGE_MARGIN = 20

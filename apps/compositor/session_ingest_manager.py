@@ -114,6 +114,17 @@ class SessionIngestManager:
         )
         compositor_pipeline.start()
 
+        # Restore persisted graphics onto the live canvas when present.
+        graphics_config = getattr(session, 'graphics_config', None) or {}
+        if any(graphics_config.values() if isinstance(graphics_config, dict) else []):
+            try:
+                compositor_pipeline.apply_graphics(graphics_config, layout_only=False)
+            except Exception:
+                logger.exception(
+                    'Failed to restore graphics for session %s',
+                    session.id,
+                )
+
         router = client.get_router_rtp_capabilities(room_id)
         router_caps = router.get('routerRtpCapabilities', {})
 
@@ -139,6 +150,9 @@ class SessionIngestManager:
         with self._lock:
             self.layout = layout
             self._compositor_pipeline.set_layout(layout)
+
+    def apply_graphics(self, state: dict, *, layout_only: bool = False) -> None:
+        self._compositor_pipeline.apply_graphics(state, layout_only=layout_only)
 
     def sync_producers(self, peer_producers_infos: list[dict[str, Any]]) -> None:
         """Attach or detach participants based on mediasoup producer state."""
