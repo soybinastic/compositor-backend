@@ -88,3 +88,20 @@ class CpuVideoMixBackendStructureTests(SimpleTestCase):
         self.assertEqual(len(tail), 2)
         names = [call.args[0] for call in mock_gst.ElementFactory.make.call_args_list]
         self.assertEqual(names, ['videoscale', 'queue'])
+
+    @patch('apps.compositor.video_mix_backend.Gst')
+    def test_graphics_ingest_tail_uses_blocking_queue(self, mock_gst):
+        mock_gst.SECOND = 1_000_000_000
+        mock_gst.MSECOND = 1_000_000
+        queue = MagicMock(name='queue')
+
+        def make(factory_name, name):
+            element = queue if factory_name == 'queue' else MagicMock(name=name)
+            return element
+
+        mock_gst.ElementFactory.make.side_effect = make
+        backend = CpuVideoMixBackend()
+        tail = backend.build_graphics_ingest_tail('logo')
+        self.assertEqual(len(tail), 2)
+        queue.set_property.assert_any_call('leaky', 2)
+        queue.set_property.assert_any_call('max-size-buffers', 3)

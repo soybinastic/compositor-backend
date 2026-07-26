@@ -6,7 +6,7 @@ import hashlib
 import io
 import json
 import logging
-import tempfile
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -35,7 +35,6 @@ class GraphicBranch:
     compositor_sink_pad: Gst.Pad
     elements: list[Gst.Element] = field(default_factory=list)
     signature: str = ''
-    appsrc: Gst.Element | None = None
     temp_paths: list[Path] = field(default_factory=list)
     geometry: tuple[int, int, int, int] = (0, 0, 1, 1)
     zorder: int = 0
@@ -43,6 +42,58 @@ class GraphicBranch:
     ticker_width: int = 0
     ticker_direction: str = 'rtl'
     ticker_speed: float = 2.0
+    # Live still pusher (appsrc). Stop before tearing down elements.
+    appsrc: Gst.Element | None = None
+    still_rgba: bytes | None = None
+    still_width: int = 0
+    still_height: int = 0
+    still_fps: int = 30
+    # Persistent live background: videotestsrc → gdkpixbufoverlay.
+    bg_overlay: Gst.Element | None = None
+    _bg_pixel_bytes: bytes | None = field(default=None, repr=False)
+    _stop_push: threading.Event | None = field(default=None, repr=False)
+    _push_thread: threading.Thread | None = field(default=None, repr=False)
+
+
+def build_live_background_base(
+    *,
+    layer_key: str,
+    width: int,
+    height: int,
+    fps: int,
+) -> tuple[list[Gst.Element], Gst.Element, Gst.Element]:
+    """
+    videotestsrc (is-live, low-res) → videoscale → caps → gdkpixbufoverlay → videoconvert.
+
+    A continuous live source keeps the force-live compositor healthy. Background
+    images are applied by setting pixbuf on the overlay (alpha 0 when unused).
+    Low-res black generation stays cheap on CPU encode paths.
+    """
+    fps = max(1, int(fps))
+    src = Gst.ElementFactory.make('videotestsrc', f'{layer_key}_vtest')
+    caps_in = Gst.ElementFactory.make('capsfilter', f'{layer_key}_caps_in')
+    scale = Gst.ElementFactory.make('videoscale', f'{layer_key}_scale')
+    caps_out = Gst.ElementFactory.make('capsfilter', f'{layer_key}_caps_out')
+    overlay = Gst.ElementFactory.make('gdkpixbufoverlay', f'{layer_key}_pixbuf')
+    convert = Gst.ElementFactory.make('videoconvert', f'{layer_key}_convert')
+    if not all([src, caps_in, scale, caps_out, overlay, convert]):
+        raise RuntimeError(f'Failed to create live background base for {layer_key}')
+
+    src.set_property('is-live', True)
+    src.set_property('pattern', 2)  # black
+    # Tiny live source; compositor pad sizes to full canvas.
+    caps_in.set_property(
+        'caps',
+        Gst.Caps.from_string(f'video/x-raw,width=320,height=180,framerate={fps}/1'),
+    )
+    caps_out.set_property(
+        'caps',
+        Gst.Caps.from_string(
+            f'video/x-raw,width={width},height={height},framerate={fps}/1'
+        ),
+    )
+    overlay.set_property('alpha', 0.0)
+    return [src, caps_in, scale, caps_out, overlay, convert], convert, overlay
 
 
 def content_signature(payload: Any) -> str:
@@ -60,55 +111,30 @@ def load_image_from_url(url: str) -> Image.Image:
     return Image.open(io.BytesIO(data)).convert('RGBA')
 
 
-def write_temp_png(image: Image.Image) -> Path:
-    handle = tempfile.NamedTemporaryFile(prefix='gst-graphic-', suffix='.png', delete=False)
-    path = Path(handle.name)
-    handle.close()
-    image.save(path, format='PNG')
-    return path
-
-
-def build_still_chain_from_image(
+def build_live_still_chain_from_image(
     *,
     layer_key: str,
     image: Image.Image,
+    fps: int,
     target_w: int | None = None,
     target_h: int | None = None,
-) -> tuple[list[Gst.Element], Gst.Element, list[Path]]:
+) -> tuple[list[Gst.Element], Gst.Element, Gst.Element, bytes, int, int]:
     """
-    filesrc → pngdec → imagefreeze → videoconvert → (optional videoscale).
+    appsrc (live, timed) → videoconvert.
 
-    Returns (elements, last_element, temp_paths).
+    A pusher thread feeds the same RGBA frame at `fps`. This matches the
+    force-live compositor timing model used by cameras and avoids imagefreeze
+    / identity sync stalls that starve RTMP.
     """
     if target_w and target_h:
         image = image.resize((target_w, target_h), Image.Resampling.LANCZOS)
-    path = write_temp_png(image)
-    filesrc = Gst.ElementFactory.make('filesrc', f'{layer_key}_filesrc')
-    pngdec = Gst.ElementFactory.make('pngdec', f'{layer_key}_pngdec')
-    freeze = Gst.ElementFactory.make('imagefreeze', f'{layer_key}_freeze')
-    convert = Gst.ElementFactory.make('videoconvert', f'{layer_key}_convert')
-    if not all([filesrc, pngdec, freeze, convert]):
-        path.unlink(missing_ok=True)
-        raise RuntimeError(f'Failed to create still chain for {layer_key}')
-    filesrc.set_property('location', str(path))
-    elements = [filesrc, pngdec, freeze, convert]
-    return elements, convert, [path]
+    rgba, width, height = image_to_rgba_bytes(image)
+    fps = max(1, int(fps))
 
-
-def build_still_chain_from_rgba_appsrc(
-    *,
-    layer_key: str,
-    rgba: bytes,
-    width: int,
-    height: int,
-    fps: int,
-) -> tuple[list[Gst.Element], Gst.Element, Gst.Element]:
-    """appsrc (one-shot) → imagefreeze → videoconvert."""
     appsrc = Gst.ElementFactory.make('appsrc', f'{layer_key}_appsrc')
-    freeze = Gst.ElementFactory.make('imagefreeze', f'{layer_key}_freeze')
     convert = Gst.ElementFactory.make('videoconvert', f'{layer_key}_convert')
-    if not all([appsrc, freeze, convert]):
-        raise RuntimeError(f'Failed to create appsrc still chain for {layer_key}')
+    if not all([appsrc, convert]):
+        raise RuntimeError(f'Failed to create live still chain for {layer_key}')
 
     caps = Gst.Caps.from_string(
         f'video/x-raw,format=RGBA,width={width},height={height},framerate={fps}/1'
@@ -117,20 +143,90 @@ def build_still_chain_from_rgba_appsrc(
     appsrc.set_property('format', Gst.Format.TIME)
     appsrc.set_property('is-live', True)
     appsrc.set_property('do-timestamp', True)
+    # Never block the pusher thread on a stalled mixer — that deadlocks
+    # force-live aggregation. Bound queued bytes to a couple of frames.
     appsrc.set_property('block', False)
-    appsrc.set_property('max-bytes', 0)
+    appsrc.set_property('max-bytes', max(1, len(rgba) * 2))
 
-    return [appsrc, freeze, convert], convert, appsrc
+    return [appsrc, convert], convert, appsrc, rgba, width, height
 
 
-def push_rgba_buffer(appsrc: Gst.Element, rgba: bytes, width: int, height: int) -> None:
-    buf = Gst.Buffer.new_allocate(None, len(rgba), None)
-    buf.fill(0, rgba)
-    buf.pts = 0
-    buf.duration = Gst.SECOND
-    retval = appsrc.emit('push-buffer', buf)
-    if retval != Gst.FlowReturn.OK:
-        logger.warning('appsrc push-buffer returned %s for %s', retval, appsrc.get_name())
+def start_still_pusher(
+    branch: GraphicBranch,
+    *,
+    max_frames: int | None = None,
+) -> None:
+    """
+    Feed still RGBA into appsrc.
+
+    For backgrounds under a force-live compositor, pass max_frames (one-shot).
+    Pair with compositor pad max-last-buffer-repeat=CLOCK_TIME_NONE so the
+    mixer keeps reusing the last frame without a continuous RGBA push that
+    starves x264/RTMP.
+    """
+    stop_still_pusher(branch)
+    if (
+        branch.appsrc is None
+        or not branch.still_rgba
+        or branch.still_width <= 0
+        or branch.still_height <= 0
+    ):
+        return
+
+    stop = threading.Event()
+    appsrc = branch.appsrc
+    rgba = branch.still_rgba
+    fps = max(1, int(branch.still_fps))
+    frame_duration = Gst.SECOND // fps
+    # One-shot: burst a few frames quickly so negotiation + leaky queue fill.
+    interval = 0.0 if max_frames is not None else (1.0 / fps)
+
+    def _run() -> None:
+        frames = 0
+        while not stop.is_set():
+            buf = Gst.Buffer.new_allocate(None, len(rgba), None)
+            buf.fill(0, rgba)
+            # Let appsrc do-timestamp assign running-time PTS (valid 0 would stick).
+            buf.pts = Gst.CLOCK_TIME_NONE
+            buf.duration = frame_duration
+            retval = appsrc.emit('push-buffer', buf)
+            if retval != Gst.FlowReturn.OK:
+                if not stop.is_set():
+                    logger.warning(
+                        'still appsrc push-buffer returned %s for %s',
+                        retval,
+                        branch.layer_key,
+                    )
+                break
+            frames += 1
+            if max_frames is not None and frames >= max_frames:
+                break
+            if interval <= 0:
+                continue
+            if stop.wait(interval):
+                break
+        # Do not emit EOS — that races teardown and can end the live pipeline.
+
+    thread = threading.Thread(
+        target=_run,
+        name=f'graphic-still-{branch.layer_key}',
+        daemon=True,
+    )
+    branch._stop_push = stop
+    branch._push_thread = thread
+    thread.start()
+    if max_frames is not None:
+        # Ensure frames land before attach returns (mixer can latch last buffer).
+        thread.join(timeout=2.0)
+
+
+def stop_still_pusher(branch: GraphicBranch) -> None:
+    if branch._stop_push is not None:
+        branch._stop_push.set()
+    if branch._push_thread is not None:
+        branch._push_thread.join(timeout=1.0)
+    branch._stop_push = None
+    branch._push_thread = None
 
 
 def build_video_loop_chain(
@@ -140,32 +236,32 @@ def build_video_loop_chain(
     width: int,
     height: int,
     fit: str,
+    fps: int = 30,
 ) -> tuple[list[Gst.Element], Gst.Element, list[Any]]:
     """
     uridecodebin → videoconvert → videoscale → capsfilter.
 
     Dynamic pads are handled by the caller via signal_handlers.
+    Caller attaches a paced graphics ingest tail.
     """
     decode = Gst.ElementFactory.make('uridecodebin', f'{layer_key}_decode')
     convert = Gst.ElementFactory.make('videoconvert', f'{layer_key}_vconvert')
     scale = Gst.ElementFactory.make('videoscale', f'{layer_key}_vscale')
     capsfilter = Gst.ElementFactory.make('capsfilter', f'{layer_key}_vcaps')
-    queue = Gst.ElementFactory.make('queue', f'{layer_key}_vqueue')
-    if not all([decode, convert, scale, capsfilter, queue]):
+    if not all([decode, convert, scale, capsfilter]):
         raise RuntimeError(f'Failed to create video background chain for {layer_key}')
 
     decode.set_property('uri', url)
     scale.set_property('add-borders', fit != 'stretch')
     capsfilter.set_property(
         'caps',
-        Gst.Caps.from_string(f'video/x-raw,width={width},height={height}'),
+        Gst.Caps.from_string(
+            f'video/x-raw,width={width},height={height},framerate={max(1, int(fps))}/1'
+        ),
     )
-    queue.set_property('leaky', 2)
-    queue.set_property('max-size-time', 2 * Gst.SECOND)
 
-    # decode is linked dynamically; static chain starts at convert.
-    static = [convert, scale, capsfilter, queue]
-    return [decode, *static], queue, []
+    static = [convert, scale, capsfilter]
+    return [decode, *static], capsfilter, []
 
 
 def download_and_prepare_still(

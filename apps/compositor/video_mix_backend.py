@@ -38,6 +38,10 @@ class VideoMixBackend(Protocol):
         """Elements after decode/videoconvert; last links to the mixer sink."""
         ...
 
+    def build_graphics_ingest_tail(self, layer_key: str) -> list[Gst.Element]:
+        """Like build_ingest_tail, but sized for live still / video graphic layers."""
+        ...
+
     def build_post_mixer_chain(self, *, width: int, height: int) -> list[Gst.Element]:
         """Elements after mixer; last links to video_tee (system memory)."""
         ...
@@ -141,6 +145,20 @@ def _configure_leaky_queue(queue: Gst.Element) -> None:
     queue.set_property('max-size-time', 2 * Gst.SECOND)
 
 
+def _configure_graphics_queue(queue: Gst.Element) -> None:
+    """
+    Small leaky queue for graphics tails.
+
+    Still layers are paced by a live appsrc pusher (not imagefreeze). A blocking
+    queue can deadlock with force-live compositor (mixer waits on pad, pad
+    waits on full queue). Leaky avoids that deadlock under brief push bursts.
+    """
+    queue.set_property('leaky', 2)
+    queue.set_property('max-size-buffers', 3)
+    queue.set_property('max-size-bytes', 0)
+    queue.set_property('max-size-time', 0)
+
+
 def _configure_aggregator_mixer(mixer: Gst.Element) -> None:
     """Apply common compositor-like properties when present on the element."""
     if mixer.find_property('background') is not None:
@@ -181,6 +199,13 @@ class CpuVideoMixBackend:
         _configure_leaky_queue(queue)
         return [scale, queue]
 
+    def build_graphics_ingest_tail(self, layer_key: str) -> list[Gst.Element]:
+        scale = _make_element('videoscale', f'video_scale_{layer_key}')
+        queue = _make_element('queue', f'video_queue_{layer_key}')
+        scale.set_property('add-borders', True)
+        _configure_graphics_queue(queue)
+        return [scale, queue]
+
     def build_post_mixer_chain(self, *, width: int, height: int) -> list[Gst.Element]:
         capsfilter = _make_element('capsfilter', 'out_caps')
         convert = _make_element('videoconvert', 'out_convert')
@@ -202,6 +227,13 @@ class GlVideoMixBackend:
         color = _make_element('glcolorconvert', f'gl_color_{peer_id}')
         queue = _make_element('queue', f'video_queue_{peer_id}')
         _configure_leaky_queue(queue)
+        return [upload, color, queue]
+
+    def build_graphics_ingest_tail(self, layer_key: str) -> list[Gst.Element]:
+        upload = _make_element('glupload', f'gl_upload_{layer_key}')
+        color = _make_element('glcolorconvert', f'gl_color_{layer_key}')
+        queue = _make_element('queue', f'video_queue_{layer_key}')
+        _configure_graphics_queue(queue)
         return [upload, color, queue]
 
     def build_post_mixer_chain(self, *, width: int, height: int) -> list[Gst.Element]:
@@ -234,6 +266,14 @@ class CudaVideoMixBackend:
         if upload.find_property('cuda-device-id') is not None:
             upload.set_property('cuda-device-id', self._cuda_device_id)
         _configure_leaky_queue(queue)
+        return [upload, queue]
+
+    def build_graphics_ingest_tail(self, layer_key: str) -> list[Gst.Element]:
+        upload = _make_element('cudaupload', f'cuda_upload_{layer_key}')
+        queue = _make_element('queue', f'video_queue_{layer_key}')
+        if upload.find_property('cuda-device-id') is not None:
+            upload.set_property('cuda-device-id', self._cuda_device_id)
+        _configure_graphics_queue(queue)
         return [upload, queue]
 
     def build_post_mixer_chain(self, *, width: int, height: int) -> list[Gst.Element]:

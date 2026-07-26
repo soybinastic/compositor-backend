@@ -24,6 +24,10 @@ from apps.compositor.video_mix_backend import (
     resolve_video_backend,
 )
 from apps.graphics.controller import GraphicsController
+from apps.graphics.post_mixer_overlays import (
+    BACKGROUND_TILE_INSET,
+    create_post_mixer_overlay_elements,
+)
 from apps.layouts.manager import LayoutManager
 from apps.layouts.strategies.base import Size, TileConfig
 from apps.layouts.types import ScaleMode
@@ -156,6 +160,8 @@ class CompositorPipeline:
         self._lock = threading.Lock()
         self._bus_stop = threading.Event()
         self._bus_thread: threading.Thread | None = None
+        # Static/top graphics drawn after the mixer (not compositor sink pads).
+        self._post_mixer_overlays: dict[str, Gst.Element] = {}
         self._graphics = GraphicsController(self)
 
     def _start_bus_logger(self, pipeline: Gst.Pipeline) -> None:
@@ -245,6 +251,10 @@ class CompositorPipeline:
                 width=self.width,
                 height=self.height,
             )
+            # Top graphics after the mixer — avoids force-live compositor pads
+            # that starve RTMP when still overlays are attached mid-stream.
+            post_mixer_overlays = create_post_mixer_overlay_elements()
+            overlay_chain = list(post_mixer_overlays.values())
             video_tee = Gst.ElementFactory.make('tee', 'video_tee')
             video_queue = Gst.ElementFactory.make('queue', 'video_monitor_queue')
             sink = Gst.ElementFactory.make('fakesink', 'video_out')
@@ -264,6 +274,7 @@ class CompositorPipeline:
                     pipeline,
                     compositor,
                     *post_mixer,
+                    *overlay_chain,
                     video_tee,
                     video_queue,
                     sink,
@@ -296,6 +307,7 @@ class CompositorPipeline:
             for element in (
                 compositor,
                 *post_mixer,
+                *overlay_chain,
                 video_tee,
                 video_queue,
                 sink,
@@ -309,7 +321,7 @@ class CompositorPipeline:
             ):
                 pipeline.add(element)
 
-            video_chain = [compositor, *post_mixer, video_tee]
+            video_chain = [compositor, *post_mixer, *overlay_chain, video_tee]
             self._link_sequential(video_chain, label='video-mix-output')
 
             video_tee_src = video_tee.get_request_pad('src_%u')
@@ -339,15 +351,17 @@ class CompositorPipeline:
             sink_pad = sink.get_static_pad('sink')
             sink_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_composited_buffer, None)
 
-            ret = pipeline.set_state(Gst.State.PLAYING)
-            if ret == Gst.StateChangeReturn.FAILURE:
-                raise RuntimeError('Failed to start compositor pipeline')
-
             self._pipeline = pipeline
             self._compositor = compositor
             self._audiomixer = audiomixer
             self._video_tee = video_tee
             self._audio_tee = audio_tee
+            self._post_mixer_overlays = post_mixer_overlays
+
+            ret = pipeline.set_state(Gst.State.PLAYING)
+            if ret == Gst.StateChangeReturn.FAILURE:
+                raise RuntimeError('Failed to start compositor pipeline')
+
             self._start_bus_logger(pipeline)
 
             logger.info(
@@ -414,6 +428,7 @@ class CompositorPipeline:
                 self._audiomixer = None
                 self._video_tee = None
                 self._audio_tee = None
+                self._post_mixer_overlays = {}
                 self._video_mix_backend = None
                 self._resolved_video_backend = None
 
@@ -619,10 +634,13 @@ class CompositorPipeline:
                 layout=self._layout,
                 layout_only=layout_only,
             )
+            # Background show/hide changes camera gutters — refresh tiles.
+            self._apply_layout_unlocked()
 
     def clear_graphics(self) -> None:
         with self._lock:
-            self._graphics.stop()
+            self._graphics.clear_live()
+            self._apply_layout_unlocked()
 
     def get_participant_stats(self, participant_peer_id: str) -> IngestStats | None:
         branch = self._participants.get(participant_peer_id)
@@ -1409,11 +1427,30 @@ class CompositorPipeline:
         if self._compositor is None:
             return
 
+        # Resolve background for this layout before tiling so insets match visibility.
+        self._graphics.sync_background_visibility(self._layout)
+
         tiles = self._layout_manager.compute_tiles(
             list(self._participants.keys()),
             host_source_id=self._host_peer_id,
         )
+        # Inset cameras when a post-mixer background is active so margins show it.
+        if self._graphics.background_active:
+            inset = BACKGROUND_TILE_INSET
+            tiles = [
+                TileConfig(
+                    source_id=tile.source_id,
+                    x=tile.x + inset,
+                    y=tile.y + inset,
+                    width=max(1, tile.width - 2 * inset),
+                    height=max(1, tile.height - 2 * inset),
+                    zorder=tile.zorder,
+                    scale_mode=tile.scale_mode,
+                )
+                for tile in tiles
+            ]
         tile_map = {tile.source_id: tile for tile in tiles}
+        visible_cutouts: list[tuple[int, int, int, int]] = []
 
         for participant_id, branch in self._participants.items():
             tile = tile_map.get(participant_id)
@@ -1422,9 +1459,9 @@ class CompositorPipeline:
                 self._hide_pad(branch.compositor_sink_pad)
                 continue
             self._apply_tile_to_pad(branch, tile)
+            visible_cutouts.append((tile.x, tile.y, tile.width, tile.height))
 
-        # Layout-only: re-evaluate background visibility without rebuilding overlays.
-        self._graphics.sync_background_visibility(self._layout)
+        self._graphics.set_video_cutouts(visible_cutouts)
 
     @staticmethod
     def _set_pad_property_if_present(pad: Gst.Pad, name: str, value) -> None:
@@ -1505,18 +1542,25 @@ class CompositorPipeline:
 
         return _probe
 
-    def _make_running_time_offset_probe(self):
+    def _make_running_time_offset_probe(self, *, continuous: bool = True):
         """
         Keep buffer PTS aligned to pipeline running time.
 
         Mediasoup RTP timestamps are an arbitrary offset from this pipeline's
         clock. A one-shot offset drifts; compositor/audiomixer then hold or
         drop buffers even while the decoder keeps producing frames.
+
+        For live still graphics (appsrc do-timestamp), pass continuous=False —
+        timestamps are already near running time after the first alignment.
+        Continuous re-offset on a leaky still pad can jitter the mixer.
         """
-        state = {'logged': False}
+        state = {'logged': False, 'applied': False}
 
         def _probe(pad: Gst.Pad, info: Gst.PadProbeInfo, _user_data) -> Gst.PadProbeReturn:
             if self._pipeline is None:
+                return Gst.PadProbeReturn.OK
+
+            if not continuous and state['applied']:
                 return Gst.PadProbeReturn.OK
 
             buffer = info.get_buffer()
@@ -1532,12 +1576,14 @@ class CompositorPipeline:
                 return Gst.PadProbeReturn.OK
 
             pad.set_offset(int(running_time) - int(buffer.pts))
+            state['applied'] = True
             if not state['logged']:
                 state['logged'] = True
                 logger.info(
-                    'Applied running-time pad offset=%s on %s',
+                    'Applied running-time pad offset=%s on %s (continuous=%s)',
                     pad.get_offset(),
                     pad.get_path_string(),
+                    continuous,
                 )
             return Gst.PadProbeReturn.OK
 

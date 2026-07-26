@@ -3,10 +3,11 @@
 from unittest.mock import MagicMock, patch
 
 from django.test import SimpleTestCase
+from PIL import Image
 
-from apps.graphics.constants import LAYER_BACKGROUND, LAYER_LOGO, ZORDER_LOGO
+from apps.graphics.constants import LAYER_BACKGROUND, LAYER_LOGO
 from apps.graphics.controller import GraphicsController
-from apps.graphics.gst_branches import GraphicBranch
+from apps.graphics.post_mixer_overlays import LAYER_GRAPHICS_STACK, PixbufLayerState
 
 
 class GraphicsControllerTests(SimpleTestCase):
@@ -20,9 +21,16 @@ class GraphicsControllerTests(SimpleTestCase):
         owner._compositor = MagicMock()
         owner._video_mix_backend = MagicMock()
         owner._video_mix_backend.build_ingest_tail.return_value = [MagicMock(name='queue')]
+        owner._video_mix_backend.build_graphics_ingest_tail.return_value = [
+            MagicMock(name='gfx_queue')
+        ]
         owner._link_sequential = MagicMock()
         owner._set_pad_property_if_present = MagicMock()
         owner._hide_pad = MagicMock()
+        owner._make_running_time_offset_probe = MagicMock(return_value=MagicMock())
+        stack_el = MagicMock(name='graphics_stack')
+        stack_el.find_property.return_value = MagicMock()
+        owner._post_mixer_overlays = {LAYER_GRAPHICS_STACK: stack_el}
         return owner
 
     def test_layout_only_skips_overlay_rebuild(self):
@@ -42,10 +50,40 @@ class GraphicsControllerTests(SimpleTestCase):
             apply_bg.assert_not_called()
             apply_overlay.assert_not_called()
 
+    def test_set_video_cutouts_rebuilds_when_background_active(self):
+        owner = self._owner()
+        controller = GraphicsController(owner)
+        controller._pixbuf_layers[LAYER_BACKGROUND] = PixbufLayerState(
+            layer_key=LAYER_BACKGROUND,
+            geometry=(0, 0, 1920, 1080),
+            visible=True,
+            _image=Image.new('RGBA', (8, 8), (0, 0, 255, 255)),
+        )
+        with patch.object(controller, '_rebuild_graphics_stack') as rebuild:
+            controller.set_video_cutouts([(48, 48, 1824, 984)])
+            rebuild.assert_called_once()
+            self.assertEqual(controller._video_cutouts, [(48, 48, 1824, 984)])
+
+    def test_apply_background_on_contain_uses_post_mixer_stack(self):
+        owner = self._owner()
+        controller = GraphicsController(owner)
+        image = Image.new('RGBA', (64, 64), (10, 20, 30, 255))
+        with patch(
+            'apps.graphics.controller.download_and_prepare_still',
+            return_value=image,
+        ), patch.object(controller, '_rebuild_graphics_stack') as rebuild:
+            controller._apply_background(
+                {'url': 'https://cdn.example.com/bg.png', 'fit': 'cover'},
+                'CONTAIN',
+            )
+            rebuild.assert_called()
+            self.assertTrue(controller.background_active)
+            bg = controller._pixbuf_layers[LAYER_BACKGROUND]
+            self.assertEqual(bg.geometry, (0, 0, 1920, 1080))
+
     def test_signature_skips_rebuild_for_logo(self):
         owner = self._owner()
         controller = GraphicsController(owner)
-        pad = MagicMock()
         from apps.graphics.gst_branches import content_signature
 
         pre_sig = content_signature(
@@ -55,14 +93,13 @@ class GraphicsControllerTests(SimpleTestCase):
                 'layer': LAYER_LOGO,
             }
         )
-        branch = GraphicBranch(
+        controller._pixbuf_layers[LAYER_LOGO] = PixbufLayerState(
             layer_key=LAYER_LOGO,
-            compositor_sink_pad=pad,
             signature=pre_sig + 'extra',
             geometry=(1500, 20, 100, 40),
-            zorder=ZORDER_LOGO,
+            visible=True,
+            _image=Image.new('RGBA', (100, 40), (255, 0, 0, 255)),
         )
-        controller._branches[LAYER_LOGO] = branch
         config = {
             'url': 'https://cdn.example.com/logo.png',
             'is_active': True,
@@ -71,8 +108,7 @@ class GraphicsControllerTests(SimpleTestCase):
 
         with patch(
             'apps.graphics.controller.download_and_prepare_still'
-        ) as download, patch.object(controller, '_attach_still_image') as attach:
+        ) as download, patch.object(controller, '_rebuild_graphics_stack') as rebuild:
             controller._apply_logo(config)
             download.assert_not_called()
-            attach.assert_not_called()
-            owner._set_pad_property_if_present.assert_called()
+            rebuild.assert_called()
