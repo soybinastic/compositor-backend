@@ -146,10 +146,10 @@ class SessionIngestManager:
             compositor_pipeline=compositor_pipeline,
         )
 
-    def set_layout(self, layout: str) -> None:
+    def set_layout(self, layout: str, *, graphics_state: dict | None = None) -> None:
         with self._lock:
             self.layout = layout
-            self._compositor_pipeline.set_layout(layout)
+            self._compositor_pipeline.set_layout(layout, graphics_state=graphics_state)
 
     def apply_graphics(self, state: dict, *, layout_only: bool = False) -> None:
         self._compositor_pipeline.apply_graphics(state, layout_only=layout_only)

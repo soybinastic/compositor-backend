@@ -84,6 +84,7 @@ class GraphicsController:
         self._ticker_stop = threading.Event()
         self._ticker_thread: threading.Thread | None = None
         self._pending_state: dict[str, Any] = {}
+        self._stack_fingerprint: object | None = None
 
     @property
     def branches(self) -> dict[str, GraphicBranch]:
@@ -109,12 +110,27 @@ class GraphicsController:
             self._clear_pixbuf_layer(key)
         self._video_cutouts = []
         self._pending_state = {}
+        self._stack_fingerprint = None
 
-    def set_video_cutouts(self, cutouts: list[tuple[int, int, int, int]]) -> None:
-        """Camera tile rects used to punch transparent holes in the background layer."""
+    def set_pending_state(self, state: dict[str, Any]) -> None:
+        """Refresh persisted graphics config without applying layers."""
+        self._pending_state = state
+
+    def set_video_cutouts(
+        self,
+        cutouts: list[tuple[int, int, int, int]],
+        *,
+        rebuild: bool = True,
+    ) -> None:
+        """Camera tile rects — background is drawn only outside these areas."""
         self._video_cutouts = list(cutouts)
-        if self.background_active:
+        if rebuild and self.background_active:
             self._rebuild_graphics_stack()
+
+    def commit_layout_overlays(self, cutouts: list[tuple[int, int, int, int]]) -> None:
+        """Single stack rebuild after tiles + background visibility are settled."""
+        self._video_cutouts = list(cutouts)
+        self._rebuild_graphics_stack()
 
     def apply_state(
         self,
@@ -122,15 +138,24 @@ class GraphicsController:
         *,
         layout: str,
         layout_only: bool = False,
+        prepared_background=None,
     ) -> None:
         self._pending_state = state
         if layout_only:
-            self.sync_background_visibility(layout)
+            self.sync_background_visibility(
+                layout,
+                prepared_image=prepared_background,
+                rebuild=False,
+            )
             # Ticker Y may shift when chat presence changes, but chat itself is unchanged.
             self._reposition_ticker_if_present(layout)
             return
 
-        self._apply_background(state.get(LAYER_BACKGROUND), layout)
+        self._apply_background(
+            state.get(LAYER_BACKGROUND),
+            layout,
+            prepared_image=prepared_background,
+        )
         self._apply_overlay(state.get(LAYER_OVERLAY))
         self._apply_logo(state.get(LAYER_LOGO))
         self._apply_qr(state.get(LAYER_QR))
@@ -138,17 +163,60 @@ class GraphicsController:
         self._apply_ticker(state.get(LAYER_TICKER), chat_active=chat_should_show(state.get(LAYER_CHAT)))
         self._apply_chat(state.get(LAYER_CHAT))
 
-    def sync_background_visibility(self, layout: str) -> None:
+    def prefetch_background_still(self, state: dict[str, Any], layout: str):
+        """
+        Download + cover-resize background outside the pipeline lock.
+
+        Returns a PIL image, or None when background should not load.
+        """
+        config = state.get(LAYER_BACKGROUND) if state else None
+        if not background_should_show(config, layout):
+            return None
+        assert config is not None
+        url = resolve_url(config)
+        if not url or is_video_url(url):
+            return None
+        fit = str(config.get('fit') or 'cover')
+        sig = content_signature({'url': url, 'fit': fit, 'layer': LAYER_BACKGROUND})
+        existing = self._pixbuf_layers.get(LAYER_BACKGROUND)
+        if existing and existing.signature == sig and existing._image is not None:
+            return existing._image
+        return self._load_background_image(url, fit)
+
+    def sync_background_visibility(
+        self,
+        layout: str,
+        *,
+        prepared_image=None,
+        rebuild: bool = True,
+    ) -> None:
         config = self._pending_state.get(LAYER_BACKGROUND)
         if background_should_show(config, layout):
             existing = self._pixbuf_layers.get(LAYER_BACKGROUND)
             if existing and existing._image is not None:
                 existing.visible = True
-                self._rebuild_graphics_stack()
+                if rebuild:
+                    self._rebuild_graphics_stack()
             elif config:
-                self._apply_background(config, layout)
+                self._apply_background(
+                    config,
+                    layout,
+                    prepared_image=prepared_image,
+                    rebuild=rebuild,
+                )
             return
-        self._clear_pixbuf_layer(LAYER_BACKGROUND)
+        self._hide_background(rebuild=rebuild)
+
+    def _hide_background(self, *, rebuild: bool = True) -> None:
+        """Hide background but keep decoded image so layout flips are cheap."""
+        existing = self._pixbuf_layers.get(LAYER_BACKGROUND)
+        if existing is None:
+            return
+        if not existing.visible and existing._image is not None:
+            return
+        existing.visible = False
+        if rebuild:
+            self._rebuild_graphics_stack()
 
     def _reposition_ticker_if_present(self, _layout: str) -> None:
         state = self._pixbuf_layers.get(LAYER_TICKER)
@@ -172,15 +240,37 @@ class GraphicsController:
 
     # --- per-layer apply -------------------------------------------------
 
-    def _apply_background(self, config: dict[str, Any] | None, layout: str) -> None:
+    def _load_background_image(self, url: str, fit: str):
+        from PIL import Image
+
+        image = download_and_prepare_still(
+            url,
+            max_w=self._owner.width,
+            max_h=self._owner.height,
+        )
+        if fit == 'stretch':
+            return image.resize(
+                (self._owner.width, self._owner.height),
+                Image.Resampling.LANCZOS,
+            )
+        return _cover_resize(image, self._owner.width, self._owner.height)
+
+    def _apply_background(
+        self,
+        config: dict[str, Any] | None,
+        layout: str,
+        *,
+        prepared_image=None,
+        rebuild: bool = True,
+    ) -> None:
         """
         Draw background via post-mixer graphics_stack (same RTMP-safe path as logo).
 
-        Cameras are inset so a margin remains; the stack punches transparent
-        holes over those tiles so live video shows through.
+        Cameras are inset so a margin remains; the stack draws background only
+        outside those tiles so live video shows through.
         """
         if not background_should_show(config, layout):
-            self._clear_pixbuf_layer(LAYER_BACKGROUND)
+            self._hide_background(rebuild=rebuild)
             return
         assert config is not None
         url = resolve_url(config)
@@ -191,32 +281,34 @@ class GraphicsController:
                 'use a still image',
                 self._owner.session_id,
             )
-            self._clear_pixbuf_layer(LAYER_BACKGROUND)
+            self._hide_background(rebuild=rebuild)
             return
 
         fit = str(config.get('fit') or 'cover')
         sig = content_signature({'url': url, 'fit': fit, 'layer': LAYER_BACKGROUND})
         existing = self._pixbuf_layers.get(LAYER_BACKGROUND)
-        if existing and existing.signature == sig and existing.visible:
-            self._rebuild_graphics_stack()
+        if existing and existing.signature == sig and existing._image is not None:
+            existing.visible = True
+            if rebuild:
+                self._rebuild_graphics_stack()
             return
 
-        from PIL import Image
-
-        image = download_and_prepare_still(
-            url,
-            max_w=self._owner.width,
-            max_h=self._owner.height,
-        )
-        if fit == 'stretch':
-            image = image.resize(
-                (self._owner.width, self._owner.height),
-                Image.Resampling.LANCZOS,
+        image = prepared_image
+        if image is None:
+            logger.warning(
+                'Background download running under pipeline lock (session %s); '
+                'prefer prefetch_background_still',
+                self._owner.session_id,
             )
-        else:
-            image = _cover_resize(image, self._owner.width, self._owner.height)
+            image = self._load_background_image(url, fit)
         geom = (0, 0, self._owner.width, self._owner.height)
-        self._set_pixbuf_layer(LAYER_BACKGROUND, image, geometry=geom, signature=sig)
+        self._set_pixbuf_layer(
+            LAYER_BACKGROUND,
+            image,
+            geometry=geom,
+            signature=sig,
+            rebuild=rebuild,
+        )
         logger.info(
             'Applied post-mixer background for session %s (%sx%s, layout=%s)',
             self._owner.session_id,
@@ -468,6 +560,7 @@ class GraphicsController:
         *,
         geometry: tuple[int, int, int, int],
         signature: str,
+        rebuild: bool = True,
     ) -> PixbufLayerState:
         state = self._pixbuf_layers.get(layer_key) or PixbufLayerState(layer_key=layer_key)
         state.signature = signature
@@ -483,7 +576,10 @@ class GraphicsController:
             apply_pixbuf_to_overlay(element, state._image, geometry, state=state)
             return state
 
-        self._rebuild_graphics_stack()
+        if rebuild:
+            self._rebuild_graphics_stack()
+        else:
+            self._stack_fingerprint = None
         return state
 
     def _show_pixbuf_layer(
@@ -517,9 +613,22 @@ class GraphicsController:
         if state is not None or layer_key in STATIC_STACK_ORDER:
             self._rebuild_graphics_stack()
 
+    def _stack_content_fingerprint(self) -> object:
+        layer_parts = []
+        for key in STATIC_STACK_ORDER:
+            state = self._pixbuf_layers.get(key)
+            if state is None or not state.visible or state._image is None:
+                layer_parts.append((key, False, '', None))
+            else:
+                layer_parts.append((key, True, state.signature, state.geometry))
+        return (tuple(layer_parts), tuple(self._video_cutouts))
+
     def _rebuild_graphics_stack(self) -> None:
         element = self._owner._post_mixer_overlays.get(LAYER_GRAPHICS_STACK)
         if element is None:
+            return
+        fingerprint = self._stack_content_fingerprint()
+        if fingerprint == self._stack_fingerprint:
             return
         stack_state = self._pixbuf_layers.get(LAYER_GRAPHICS_STACK) or PixbufLayerState(
             layer_key=LAYER_GRAPHICS_STACK
@@ -533,11 +642,13 @@ class GraphicsController:
         if composed is None:
             clear_pixbuf_overlay(element, stack_state)
             self._pixbuf_layers.pop(LAYER_GRAPHICS_STACK, None)
+            self._stack_fingerprint = fingerprint
             return
         geom = (0, 0, self._owner.width, self._owner.height)
         apply_pixbuf_to_overlay(element, composed, geom, state=stack_state)
         stack_state.signature = 'composed'
         self._pixbuf_layers[LAYER_GRAPHICS_STACK] = stack_state
+        self._stack_fingerprint = fingerprint
 
     def _remove_branch(self, key: str) -> None:
         branch = self._branches.pop(key, None)

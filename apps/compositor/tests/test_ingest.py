@@ -184,7 +184,10 @@ class SessionIngestManagerTests(TestCase):
         manager.set_layout('THUMBNAIL')
 
         self.assertEqual(manager.layout, 'THUMBNAIL')
-        mock_compositor_pipeline.set_layout.assert_called_once_with('THUMBNAIL')
+        mock_compositor_pipeline.set_layout.assert_called_once_with(
+            'THUMBNAIL',
+            graphics_state=None,
+        )
 
     def test_skips_compositor_peer(self):
         mock_consumer_service = MagicMock(spec=ConsumerService)

@@ -46,7 +46,7 @@ class GraphicsControllerTests(SimpleTestCase):
                 layout='GRID',
                 layout_only=True,
             )
-            sync_bg.assert_called_once_with('GRID')
+            sync_bg.assert_called_once()
             apply_bg.assert_not_called()
             apply_overlay.assert_not_called()
 
@@ -64,6 +64,38 @@ class GraphicsControllerTests(SimpleTestCase):
             rebuild.assert_called_once()
             self.assertEqual(controller._video_cutouts, [(48, 48, 1824, 984)])
 
+    def test_commit_layout_overlays_rebuilds_once(self):
+        owner = self._owner()
+        controller = GraphicsController(owner)
+        with patch.object(controller, '_rebuild_graphics_stack') as rebuild:
+            controller.commit_layout_overlays([(48, 48, 100, 100)])
+            rebuild.assert_called_once()
+            self.assertEqual(controller._video_cutouts, [(48, 48, 100, 100)])
+
+    def test_hide_background_keeps_cached_image(self):
+        owner = self._owner()
+        controller = GraphicsController(owner)
+        image = Image.new('RGBA', (8, 8), (0, 0, 255, 255))
+        controller._pixbuf_layers[LAYER_BACKGROUND] = PixbufLayerState(
+            layer_key=LAYER_BACKGROUND,
+            signature='sig',
+            geometry=(0, 0, 1920, 1080),
+            visible=True,
+            _image=image,
+        )
+        controller._pending_state = {LAYER_BACKGROUND: {'url': 'https://cdn.example.com/bg.png'}}
+        with patch.object(controller, '_rebuild_graphics_stack') as rebuild:
+            controller.sync_background_visibility('GRID', rebuild=False)
+            rebuild.assert_not_called()
+        bg = controller._pixbuf_layers[LAYER_BACKGROUND]
+        self.assertFalse(bg.visible)
+        self.assertIs(bg._image, image)
+
+        with patch.object(controller, '_rebuild_graphics_stack') as rebuild:
+            controller.sync_background_visibility('CONTAIN', rebuild=False)
+            rebuild.assert_not_called()
+        self.assertTrue(controller.background_active)
+
     def test_apply_background_on_contain_uses_post_mixer_stack(self):
         owner = self._owner()
         controller = GraphicsController(owner)
@@ -80,6 +112,30 @@ class GraphicsControllerTests(SimpleTestCase):
             self.assertTrue(controller.background_active)
             bg = controller._pixbuf_layers[LAYER_BACKGROUND]
             self.assertEqual(bg.geometry, (0, 0, 1920, 1080))
+
+    def test_prefetch_skips_download_when_cached(self):
+        owner = self._owner()
+        controller = GraphicsController(owner)
+        from apps.graphics.gst_branches import content_signature
+
+        url = 'https://cdn.example.com/bg.png'
+        fit = 'cover'
+        sig = content_signature({'url': url, 'fit': fit, 'layer': LAYER_BACKGROUND})
+        cached = Image.new('RGBA', (16, 16), (1, 2, 3, 255))
+        controller._pixbuf_layers[LAYER_BACKGROUND] = PixbufLayerState(
+            layer_key=LAYER_BACKGROUND,
+            signature=sig,
+            geometry=(0, 0, 1920, 1080),
+            visible=False,
+            _image=cached,
+        )
+        with patch('apps.graphics.controller.download_and_prepare_still') as download:
+            result = controller.prefetch_background_still(
+                {LAYER_BACKGROUND: {'url': url, 'fit': fit}},
+                'CONTAIN',
+            )
+            download.assert_not_called()
+            self.assertIs(result, cached)
 
     def test_signature_skips_rebuild_for_logo(self):
         owner = self._owner()

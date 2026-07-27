@@ -77,12 +77,33 @@ class PostMixerOverlayTests(SimpleTestCase):
         )
         self.assertIsNotNone(composed)
         assert composed is not None
-        # Margin keeps background.
+        # Margin keeps background (margin-strip path for single cutout).
         self.assertEqual(composed.getpixel((0, 0)), (0, 0, 255, 255))
         # Camera cutout is transparent so live video shows through.
         self.assertEqual(composed.getpixel((3, 3))[3], 0)
         # Logo still draws on top of the margin.
         self.assertEqual(composed.getpixel((7, 0))[:3], (255, 0, 0))
+
+    def test_compose_background_multi_cutout_clears_tiles(self):
+        layers = {
+            LAYER_BACKGROUND: PixbufLayerState(
+                layer_key=LAYER_BACKGROUND,
+                geometry=(0, 0, 8, 8),
+                visible=True,
+                _image=Image.new('RGBA', (8, 8), (0, 255, 0, 255)),
+            ),
+        }
+        composed = compose_static_stack(
+            layers,
+            canvas_w=8,
+            canvas_h=8,
+            video_cutouts=[(0, 0, 3, 3), (5, 5, 3, 3)],
+        )
+        self.assertIsNotNone(composed)
+        assert composed is not None
+        self.assertEqual(composed.getpixel((1, 1))[3], 0)
+        self.assertEqual(composed.getpixel((6, 6))[3], 0)
+        self.assertEqual(composed.getpixel((4, 0)), (0, 255, 0, 255))
 
     def test_apply_and_clear_sets_alpha(self):
         element = MagicMock()

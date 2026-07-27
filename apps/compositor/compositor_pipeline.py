@@ -613,11 +613,15 @@ class CompositorPipeline:
             return None
         return branch.stats
 
-    def set_layout(self, layout: str) -> None:
+    def set_layout(self, layout: str, *, graphics_state: dict | None = None) -> None:
+        pending = graphics_state if graphics_state is not None else self._graphics._pending_state
+        prepared_bg = self._graphics.prefetch_background_still(pending or {}, layout)
         with self._lock:
+            if graphics_state is not None:
+                self._graphics.set_pending_state(graphics_state)
             self._layout = layout
             self._layout_manager.set_strategy(layout)
-            self._apply_layout_unlocked()
+            self._apply_layout_unlocked(prepared_background=prepared_bg)
 
     def apply_graphics(
         self,
@@ -626,6 +630,7 @@ class CompositorPipeline:
         layout_only: bool = False,
     ) -> None:
         """Apply full graphics state to mixer pads (hot-swap; does not touch participants)."""
+        prepared_bg = self._graphics.prefetch_background_still(state, self._layout)
         with self._lock:
             if self._pipeline is None:
                 raise RuntimeError('Compositor pipeline is not started')
@@ -633,9 +638,10 @@ class CompositorPipeline:
                 state,
                 layout=self._layout,
                 layout_only=layout_only,
+                prepared_background=prepared_bg,
             )
-            # Background show/hide changes camera gutters — refresh tiles.
-            self._apply_layout_unlocked()
+            # Background show/hide changes camera gutters — refresh tiles once.
+            self._apply_layout_unlocked(prepared_background=prepared_bg)
 
     def clear_graphics(self) -> None:
         with self._lock:
@@ -1423,12 +1429,16 @@ class CompositorPipeline:
 
         return branch
 
-    def _apply_layout_unlocked(self) -> None:
+    def _apply_layout_unlocked(self, *, prepared_background=None) -> None:
         if self._compositor is None:
             return
 
-        # Resolve background for this layout before tiling so insets match visibility.
-        self._graphics.sync_background_visibility(self._layout)
+        # Toggle/cache background without rebuilding — one commit at the end.
+        self._graphics.sync_background_visibility(
+            self._layout,
+            prepared_image=prepared_background,
+            rebuild=False,
+        )
 
         tiles = self._layout_manager.compute_tiles(
             list(self._participants.keys()),
@@ -1461,7 +1471,8 @@ class CompositorPipeline:
             self._apply_tile_to_pad(branch, tile)
             visible_cutouts.append((tile.x, tile.y, tile.width, tile.height))
 
-        self._graphics.set_video_cutouts(visible_cutouts)
+        # Pads first, then a single overlay rebuild (avoids mid-stream thrash).
+        self._graphics.commit_layout_overlays(visible_cutouts)
 
     @staticmethod
     def _set_pad_property_if_present(pad: Gst.Pad, name: str, value) -> None:

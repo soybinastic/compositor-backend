@@ -104,11 +104,13 @@ class SessionService:
 
         ingest_manager = get_ingest_manager(str(session_id))
         if ingest_manager is not None:
-            ingest_manager.set_layout(layout)
-            # Layout-only graphics sync: background visibility without rebuild.
-            from apps.graphics.service import GraphicsService
+            from apps.graphics.state import snapshot_graphics_state
 
-            GraphicsService().apply_layout_only(session)
+            # Single layout pass (background visibility + tiles + one stack rebuild).
+            ingest_manager.set_layout(
+                layout,
+                graphics_state=snapshot_graphics_state(session.graphics_config or {}),
+            )
 
         return session
 

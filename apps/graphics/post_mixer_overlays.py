@@ -42,8 +42,8 @@ POST_MIXER_OVERLAY_KEYS: tuple[str, ...] = (
 )
 
 # Bottom → top within the software-composited stack.
-# Background is first: full-canvas image with transparent holes over camera tiles
-# so it shows in the margins without an extra force-live compositor pad.
+# Background is first: margin frame only (not a full opaque canvas), so live
+# video shows through without an extra force-live compositor pad.
 STATIC_STACK_ORDER: tuple[str, ...] = (
     LAYER_BACKGROUND,
     'banner_primary',
@@ -98,11 +98,55 @@ def image_to_pixbuf(image: Image.Image) -> tuple[GdkPixbuf.Pixbuf, bytes]:
     return pixbuf, raw
 
 
-def _punch_video_cutouts(
+def _paste_bg_strip(
     canvas: Image.Image,
+    bg: Image.Image,
+    box: tuple[int, int, int, int],
+) -> None:
+    left, top, right, bottom = box
+    if right <= left or bottom <= top:
+        return
+    canvas.paste(bg.crop((left, top, right, bottom)), (left, top))
+
+
+def _composite_background_margins(
+    canvas: Image.Image,
+    background: Image.Image,
     cutouts: list[tuple[int, int, int, int]],
 ) -> None:
-    """Clear alpha inside camera tile rects so live video shows through."""
+    """
+    Draw background only outside camera tiles (opaque frame / gutters).
+
+    Avoids filling the full canvas then punching holes — less CPU on rebuild
+    and far fewer opaque pixels for gdkpixbufoverlay to blend each frame.
+    """
+    bg = background.convert('RGBA')
+    if bg.size != canvas.size:
+        bg = bg.resize(canvas.size, Image.Resampling.LANCZOS)
+
+    if not cutouts:
+        canvas.alpha_composite(bg, dest=(0, 0))
+        return
+
+    # Single cutout (CONTAIN / FULLSCREEN host): four margin strips.
+    if len(cutouts) == 1:
+        x, y, w, h = cutouts[0]
+        x = max(0, int(x))
+        y = max(0, int(y))
+        w = max(1, int(w))
+        h = max(1, int(h))
+        x2 = min(canvas.width, x + w)
+        y2 = min(canvas.height, y + h)
+        x = min(x, canvas.width)
+        y = min(y, canvas.height)
+        _paste_bg_strip(canvas, bg, (0, 0, canvas.width, y))
+        _paste_bg_strip(canvas, bg, (0, y2, canvas.width, canvas.height))
+        _paste_bg_strip(canvas, bg, (0, y, x, y2))
+        _paste_bg_strip(canvas, bg, (x2, y, canvas.width, y2))
+        return
+
+    # Multiple tiles: paste full then clear camera rects.
+    canvas.alpha_composite(bg, dest=(0, 0))
     for x, y, w, h in cutouts:
         x = max(0, int(x))
         y = max(0, int(y))
@@ -135,11 +179,12 @@ def compose_static_stack(
         w = max(1, int(w))
         h = max(1, int(h))
         img = state._image.convert('RGBA')
-        if img.size != (w, h):
-            img = img.resize((w, h), Image.Resampling.LANCZOS)
-        canvas.alpha_composite(img, dest=(max(0, int(x)), max(0, int(y))))
-        if key == LAYER_BACKGROUND and cutouts:
-            _punch_video_cutouts(canvas, cutouts)
+        if key == LAYER_BACKGROUND:
+            _composite_background_margins(canvas, img, cutouts)
+        else:
+            if img.size != (w, h):
+                img = img.resize((w, h), Image.Resampling.LANCZOS)
+            canvas.alpha_composite(img, dest=(max(0, int(x)), max(0, int(y))))
         any_visible = True
     return canvas if any_visible else None
 
