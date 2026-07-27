@@ -9,7 +9,9 @@ from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-load_dotenv(BASE_DIR / '.env')
+# Local: .env  |  Staging: DOTENV_FILE=.env.staging (or absolute path)
+_dotenv_file = os.getenv('DOTENV_FILE', '.env')
+load_dotenv(BASE_DIR / _dotenv_file if not os.path.isabs(_dotenv_file) else _dotenv_file)
 
 SECRET_KEY = os.getenv(
     'SECRET_KEY',

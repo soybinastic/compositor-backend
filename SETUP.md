@@ -85,6 +85,28 @@ pip install Pillow   # required for banner / ticker / chat rendering
 cp .env.example .env
 ```
 
+### Staging
+
+Keep local `.env` unchanged. On the staging host:
+
+```bash
+cp .env.staging.example .env.staging
+# edit hostnames, SECRET_KEY, paths
+export DOTENV_FILE=.env.staging
+# or: EnvironmentFile=/path/to/.env.staging in systemd
+```
+
+Staging offsets (paired with mediasoup `config.staging.mjs`):
+
+| Setting | Local | Staging |
+|---------|-------|---------|
+| mediasoup HTTP | `4443` | `5443` |
+| compositor RTP | `50000–50999` | `52000–52999` |
+| compositor API | `8000` | e.g. `18000` behind nginx |
+
+`MEDIASOUP_API_URL` may be `http://127.0.0.1:5443` (server-to-server).  
+`MEDIASOUP_WS_URL` / `MEDIASOUP_ORIGIN` must be the browser-reachable staging SFU URL.
+
 ## Run
 
 ```bash
