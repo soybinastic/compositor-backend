@@ -100,16 +100,18 @@ class SessionService:
         session.layout = layout
         session = self._repository.save(session)
 
-        from apps.compositor.registry import get as get_ingest_manager
+        from apps.compositor.commands import ChangeLayoutCommand
+        from apps.compositor.worker_manager import get_session_worker_manager
+        from apps.graphics.state import snapshot_graphics_state
 
-        ingest_manager = get_ingest_manager(str(session_id))
-        if ingest_manager is not None:
-            from apps.graphics.state import snapshot_graphics_state
-
-            # Single layout pass (background visibility + tiles + one stack rebuild).
-            ingest_manager.set_layout(
-                layout,
-                graphics_state=snapshot_graphics_state(session.graphics_config or {}),
+        worker_manager = get_session_worker_manager()
+        if worker_manager.is_running(str(session_id)):
+            worker_manager.send_command(
+                ChangeLayoutCommand(
+                    session_id=str(session_id),
+                    layout=layout,
+                    graphics_state=snapshot_graphics_state(session.graphics_config or {}),
+                )
             )
 
         return session

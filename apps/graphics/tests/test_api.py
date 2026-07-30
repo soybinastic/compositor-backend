@@ -34,9 +34,11 @@ class GraphicsApiTests(TestCase):
         self.assertIsNone(response.data['background'])
         self.assertIsNone(response.data['logo'])
 
-    @patch('apps.compositor.registry.get')
-    def test_update_background_persists(self, mock_get):
-        mock_get.return_value = None
+    @patch('apps.graphics.service.get_session_worker_manager')
+    def test_update_background_persists(self, mock_get_manager):
+        manager = MagicMock()
+        manager.is_running.return_value = False
+        mock_get_manager.return_value = manager
         response = self.client.post(
             f'{self.base}/background/',
             {'url': 'https://cdn.example.com/bg.png', 'fit': 'cover'},
@@ -50,9 +52,11 @@ class GraphicsApiTests(TestCase):
         )
         self.assertEqual(response.data['background']['url'], 'https://cdn.example.com/bg.png')
 
-    @patch('apps.compositor.registry.get')
-    def test_bulk_partial_merge(self, mock_get):
-        mock_get.return_value = None
+    @patch('apps.graphics.service.get_session_worker_manager')
+    def test_bulk_partial_merge(self, mock_get_manager):
+        manager = MagicMock()
+        manager.is_running.return_value = False
+        mock_get_manager.return_value = manager
         self.session.graphics_config = {
             'background': None,
             'overlay': None,
@@ -80,9 +84,11 @@ class GraphicsApiTests(TestCase):
         self.assertEqual(response.data['ticker']['tickerText'], 'Live now')
         self.assertTrue(response.data['qr']['is_shown'])
 
-    @patch('apps.compositor.registry.get')
-    def test_banner_ticker_endpoint(self, mock_get):
-        mock_get.return_value = None
+    @patch('apps.graphics.service.get_session_worker_manager')
+    def test_banner_ticker_endpoint(self, mock_get_manager):
+        manager = MagicMock()
+        manager.is_running.return_value = False
+        mock_get_manager.return_value = manager
         response = self.client.post(
             f'{self.base}/banner-ticker/',
             {
@@ -99,9 +105,11 @@ class GraphicsApiTests(TestCase):
         self.assertEqual(response.data['banner']['title'], 'Guest')
         self.assertEqual(response.data['ticker']['tickerText'], 'Welcome')
 
-    @patch('apps.compositor.registry.get')
-    def test_chat_endpoint(self, mock_get):
-        mock_get.return_value = None
+    @patch('apps.graphics.service.get_session_worker_manager')
+    def test_chat_endpoint(self, mock_get_manager):
+        manager = MagicMock()
+        manager.is_running.return_value = False
+        mock_get_manager.return_value = manager
         response = self.client.post(
             f'{self.base}/chat/',
             {
@@ -113,9 +121,11 @@ class GraphicsApiTests(TestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertTrue(response.data['chat']['enabled'])
 
-    @patch('apps.compositor.registry.get')
-    def test_ended_session_conflict(self, mock_get):
-        mock_get.return_value = None
+    @patch('apps.graphics.service.get_session_worker_manager')
+    def test_ended_session_conflict(self, mock_get_manager):
+        manager = MagicMock()
+        manager.is_running.return_value = False
+        mock_get_manager.return_value = manager
         self.session.status = SessionStatus.ENDED
         self.session.save(update_fields=['status'])
         response = self.client.post(
@@ -125,17 +135,18 @@ class GraphicsApiTests(TestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
 
-    @patch('apps.compositor.registry.get')
-    def test_apply_called_when_ingest_running(self, mock_get):
+    @patch('apps.graphics.service.get_session_worker_manager')
+    def test_apply_called_when_ingest_running(self, mock_get_manager):
         manager = MagicMock()
-        mock_get.return_value = manager
+        manager.is_running.return_value = True
+        mock_get_manager.return_value = manager
         response = self.client.post(
             f'{self.base}/overlay/',
             {'url': 'https://cdn.example.com/o.png', 'is_active': True},
             format='json',
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        manager.apply_graphics.assert_called_once()
-        args, kwargs = manager.apply_graphics.call_args
-        self.assertFalse(kwargs.get('layout_only'))
-        self.assertTrue(args[0]['overlay']['is_active'])
+        manager.send_command.assert_called_once()
+        command = manager.send_command.call_args.args[0]
+        self.assertFalse(command.layout_only)
+        self.assertTrue(command.graphics_state['overlay']['is_active'])

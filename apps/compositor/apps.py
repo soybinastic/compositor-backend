@@ -17,5 +17,9 @@ class CompositorConfig(AppConfig):
             return
 
         from apps.compositor.shutdown import register_shutdown_handlers
+        from apps.compositor.worker_manager.worker_event_consumer import (
+            ensure_worker_event_consumer_running,
+        )
 
         register_shutdown_handlers()
+        ensure_worker_event_consumer_running()

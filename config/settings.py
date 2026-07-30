@@ -78,7 +78,7 @@ ASGI_APPLICATION = 'config.asgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+        'NAME': os.getenv('DATABASE_NAME', str(BASE_DIR / 'db.sqlite3')),
     }
 }
 
@@ -218,3 +218,31 @@ STREAMING_RTMP_RECONNECT_DELAY_SEC = float(
     os.getenv('STREAMING_RTMP_RECONNECT_DELAY_SEC', '3')
 )
 GRACEFUL_SHUTDOWN_TIMEOUT_SEC = float(os.getenv('GRACEFUL_SHUTDOWN_TIMEOUT_SEC', '30'))
+SESSION_COMMAND_TIMEOUT_SEC = float(os.getenv('SESSION_COMMAND_TIMEOUT_SEC', '30'))
+SESSION_WORKER_SPAWN_TIMEOUT_SEC = float(os.getenv('SESSION_WORKER_SPAWN_TIMEOUT_SEC', '30'))
+
+_COMPOSITOR_WORKER_MODE = os.getenv('COMPOSITOR_WORKER_MODE', 'inprocess').strip().lower()
+if _COMPOSITOR_WORKER_MODE not in ('inprocess', 'supervisor'):
+    raise ValueError(
+        f'Invalid COMPOSITOR_WORKER_MODE={_COMPOSITOR_WORKER_MODE!r}; '
+        "expected 'inprocess' or 'supervisor'"
+    )
+COMPOSITOR_WORKER_MODE = _COMPOSITOR_WORKER_MODE
+COMPOSITOR_REDIS_URL = os.getenv('COMPOSITOR_REDIS_URL', 'redis://127.0.0.1:6379/0')
+
+COMPOSITOR_GPU_COUNT = int(os.getenv('COMPOSITOR_GPU_COUNT', '4'))
+COMPOSITOR_PORTS_PER_SESSION = int(os.getenv('COMPOSITOR_PORTS_PER_SESSION', '20'))
+
+SESSION_WORKER_HEARTBEAT_INTERVAL_SEC = float(
+    os.getenv('SESSION_WORKER_HEARTBEAT_INTERVAL_SEC', '5')
+)
+SESSION_WORKER_HEARTBEAT_TTL_SEC = float(
+    os.getenv('SESSION_WORKER_HEARTBEAT_TTL_SEC', '15')
+)
+SESSION_WORKER_MAX_RESTARTS = int(os.getenv('SESSION_WORKER_MAX_RESTARTS', '3'))
+SESSION_WORKER_RESTART_COOLDOWN_SEC = float(
+    os.getenv('SESSION_WORKER_RESTART_COOLDOWN_SEC', '2')
+)
+SESSION_WORKER_MONITOR_INTERVAL_SEC = float(
+    os.getenv('SESSION_WORKER_MONITOR_INTERVAL_SEC', '2')
+)

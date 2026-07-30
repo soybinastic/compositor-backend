@@ -48,7 +48,7 @@ from apps.streaming.gstreamer_streamer import (
 from apps.streaming.models import DestinationType
 from apps.sessions.models import LayoutType
 from core import events
-from core.webhooks import emit_event
+from core.worker_events import emit_worker_event
 
 logger = logging.getLogger(__name__)
 
@@ -762,10 +762,10 @@ class CompositorPipeline:
             attempt = self._stream_reconnect_attempts
             destination_url = self._streaming.destination_url
 
-        emit_event(
+        emit_worker_event(
             events.STREAM_RECONNECTING,
+            self.session_id,
             {
-                'session_id': self.session_id,
                 'destination_url': destination_url,
                 'attempt': attempt,
                 'max_attempts': max_attempts,
@@ -781,10 +781,10 @@ class CompositorPipeline:
                 self._fail_stream_permanently(error_message)
                 return
 
-        emit_event(
+        emit_worker_event(
             events.STREAM_RECONNECTED,
+            self.session_id,
             {
-                'session_id': self.session_id,
                 'destination_url': destination_url,
                 'attempt': attempt,
             },
@@ -845,10 +845,10 @@ class CompositorPipeline:
         destination_url = self._streaming.destination_url if self._streaming else ''
         self._teardown_streaming_unlocked()
 
-        emit_event(
+        emit_worker_event(
             events.STREAM_FAILED,
+            self.session_id,
             {
-                'session_id': self.session_id,
                 'destination_url': destination_url,
                 'error': error_message,
             },

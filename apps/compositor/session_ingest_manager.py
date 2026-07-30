@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import threading
-import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -108,9 +107,6 @@ class SessionIngestManager:
             layout=session.layout,
             video_backend=settings.COMPOSITOR_VIDEO_BACKEND,
             cuda_device_id=settings.COMPOSITOR_CUDA_DEVICE_ID,
-        )
-        compositor_pipeline.set_stream_failure_handler(
-            lambda reason, session_id=str(session.id): _handle_stream_failure(session_id, reason)
         )
         compositor_pipeline.start()
 
@@ -353,8 +349,3 @@ class SessionIngestManager:
 
         return audio_id, video_id
 
-
-def _handle_stream_failure(session_id: str, reason: str) -> None:
-    from apps.streaming.service import StreamingService
-
-    StreamingService().mark_active_stream_failed(uuid.UUID(session_id), reason)
