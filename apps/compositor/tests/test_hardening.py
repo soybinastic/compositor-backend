@@ -3,8 +3,6 @@ from unittest.mock import MagicMock, patch
 from django.test import TestCase, override_settings
 
 from apps.compositor.metrics import collect_metrics
-from apps.compositor.registry import clear_all, register
-from apps.compositor.session_ingest_manager import SessionIngestManager
 from apps.compositor.shutdown import graceful_shutdown
 from core import events
 from core.webhooks import emit_event
@@ -26,30 +24,38 @@ class WebhookTests(TestCase):
 
 
 class MetricsTests(TestCase):
-    def test_collect_metrics_empty(self):
-        clear_all()
+    @patch('apps.compositor.metrics.get_session_worker_manager')
+    def test_collect_metrics_empty(self, mock_get_manager):
+        mock_get_manager.return_value.list_running_session_ids.return_value = []
         metrics = collect_metrics()
         self.assertEqual(metrics['active_sessions'], 0)
+        self.assertIn('active_producer_pollers', metrics)
         self.assertIn('producer_watcher_running', metrics)
 
 
 class GracefulShutdownTests(TestCase):
-    @patch('apps.compositor.producer_watcher.ProducerWatcher')
+    @patch('apps.compositor.worker_manager.get_session_worker_manager')
+    @patch('apps.compositor.session_producer_poller.get_poller_registry')
     @patch('apps.streaming.service.StreamingService')
     @patch('apps.recording.service.RecordingService')
-    def test_graceful_shutdown_stops_managers(
+    def test_graceful_shutdown_stops_workers(
         self,
         mock_recording_cls,
         mock_streaming_cls,
-        mock_watcher_cls,
+        mock_poller_registry_getter,
+        mock_worker_manager_getter,
     ):
-        mock_manager = MagicMock(spec=SessionIngestManager)
-        mock_manager.session_id = '00000000-0000-0000-0000-000000000001'
-        register(mock_manager)
+        mock_worker_manager = MagicMock()
+        mock_worker_manager.list_running_session_ids.return_value = [
+            '00000000-0000-0000-0000-000000000001'
+        ]
+        mock_worker_manager_getter.return_value = mock_worker_manager
+        mock_poller_registry = MagicMock()
+        mock_poller_registry_getter.return_value = mock_poller_registry
 
         graceful_shutdown()
 
-        mock_manager.stop.assert_called_once()
-        mock_watcher_cls.instance.return_value.stop.assert_called_once()
-
-        clear_all()
+        mock_worker_manager.destroy_session.assert_called_once_with(
+            '00000000-0000-0000-0000-000000000001'
+        )
+        mock_poller_registry.shutdown_all.assert_called_once()

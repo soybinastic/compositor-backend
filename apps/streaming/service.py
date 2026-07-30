@@ -10,7 +10,8 @@ from pathlib import Path
 from django.conf import settings
 from django.utils import timezone
 
-from apps.compositor.registry import get as get_ingest_manager
+from apps.compositor.commands import StartStreamCommand, StopStreamCommand
+from apps.compositor.worker_manager import get_session_worker_manager
 from apps.sessions.exceptions import SessionEndedError, SessionNotFoundError
 from apps.sessions.models import SessionStatus, StudioSession
 from apps.sessions.repositories.session_repository import SessionRepository
@@ -54,8 +55,8 @@ class StreamingService:
         self._assert_no_active_stream(session)
         self._validate_destination(destination_type, destination_url)
 
-        ingest_manager = get_ingest_manager(str(session_id))
-        if ingest_manager is None:
+        worker_manager = get_session_worker_manager()
+        if not worker_manager.is_running(str(session_id)):
             raise IngestManagerNotRunningError(
                 'Compositor ingest is not running for this session'
             )
@@ -85,10 +86,13 @@ class StreamingService:
         )
 
         try:
-            ingest_manager.start_stream(
-                destination_type=destination_type,
-                destination_url=resolved_url,
-                output_dir=output_dir,
+            worker_manager.send_command(
+                StartStreamCommand(
+                    session_id=str(session_id),
+                    destination_type=destination_type,
+                    destination_url=resolved_url,
+                    output_dir=output_dir,
+                )
             )
         except Exception as exc:
             stream.mark_failed()
@@ -119,8 +123,8 @@ class StreamingService:
         session = self._get_active_session(session_id)
         stream = self._get_active_stream(session)
 
-        ingest_manager = get_ingest_manager(str(session_id))
-        if ingest_manager is None:
+        worker_manager = get_session_worker_manager()
+        if not worker_manager.is_running(str(session_id)):
             stream.mark_failed()
             stream.save(update_fields=['status', 'stopped_at'])
             raise IngestManagerNotRunningError(
@@ -128,7 +132,9 @@ class StreamingService:
             )
 
         try:
-            ingest_manager.stop_stream()
+            worker_manager.send_command(
+                StopStreamCommand(session_id=str(session_id))
+            )
             stream.mark_stopped()
             stream.save(update_fields=['status', 'stopped_at'])
         except Exception as exc:
@@ -167,10 +173,14 @@ class StreamingService:
         if stream is None:
             return None
 
-        ingest_manager = get_ingest_manager(str(session_id))
-        if ingest_manager is not None and ingest_manager.is_streaming():
+        worker_manager = get_session_worker_manager()
+        if worker_manager.is_running(str(session_id)) and worker_manager.is_streaming(
+            str(session_id)
+        ):
             try:
-                ingest_manager.stop_stream()
+                worker_manager.send_command(
+                    StopStreamCommand(session_id=str(session_id))
+                )
                 stream.mark_stopped()
             except Exception:
                 stream.mark_failed()

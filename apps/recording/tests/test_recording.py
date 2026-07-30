@@ -40,30 +40,33 @@ class RecordingServiceTests(TestCase):
         return manager, mock_pipeline
 
     @override_settings(RECORDINGS_DIR='/tmp/test-recordings')
-    @patch('apps.recording.service.get_ingest_manager')
+    @patch('apps.recording.service.get_session_worker_manager')
     def test_start_recording_creates_db_record(self, mock_get_manager):
-        mock_pipeline = MagicMock()
         mock_manager = MagicMock()
-        mock_manager.start_recording = MagicMock()
+        mock_manager.is_running.return_value = True
         mock_get_manager.return_value = mock_manager
 
         result = self.service.start_recording(self.session.id)
 
         self.assertEqual(result.status, RecordingStatus.RECORDING)
         self.assertTrue(result.file_path.endswith('.mp4'))
-        mock_manager.start_recording.assert_called_once()
+        mock_manager.send_command.assert_called_once()
         self.assertEqual(SessionRecording.objects.count(), 1)
 
-    @patch('apps.recording.service.get_ingest_manager')
+    @patch('apps.recording.service.get_session_worker_manager')
     def test_start_recording_requires_ingest_manager(self, mock_get_manager):
-        mock_get_manager.return_value = None
+        mock_manager = MagicMock()
+        mock_manager.is_running.return_value = False
+        mock_get_manager.return_value = mock_manager
 
         with self.assertRaises(IngestManagerNotRunningError):
             self.service.start_recording(self.session.id)
 
-    @patch('apps.recording.service.get_ingest_manager')
+    @patch('apps.recording.service.get_session_worker_manager')
     def test_start_recording_rejects_duplicate(self, mock_get_manager):
-        mock_get_manager.return_value = MagicMock()
+        mock_manager = MagicMock()
+        mock_manager.is_running.return_value = True
+        mock_get_manager.return_value = mock_manager
         SessionRecording.objects.create(
             session=self.session,
             status=RecordingStatus.RECORDING,
@@ -73,9 +76,10 @@ class RecordingServiceTests(TestCase):
         with self.assertRaises(RecordingAlreadyActiveError):
             self.service.start_recording(self.session.id)
 
-    @patch('apps.recording.service.get_ingest_manager')
+    @patch('apps.recording.service.get_session_worker_manager')
     def test_stop_recording_finalizes_db_record(self, mock_get_manager):
         mock_manager = MagicMock()
+        mock_manager.is_running.return_value = True
         mock_get_manager.return_value = mock_manager
         recording = SessionRecording.objects.create(
             session=self.session,
@@ -85,7 +89,7 @@ class RecordingServiceTests(TestCase):
 
         result = self.service.stop_recording(self.session.id)
 
-        mock_manager.stop_recording.assert_called_once()
+        mock_manager.send_command.assert_called_once()
         recording.refresh_from_db()
         self.assertEqual(recording.status, RecordingStatus.STOPPED)
         self.assertEqual(result.recording_id, recording.id)
@@ -94,9 +98,10 @@ class RecordingServiceTests(TestCase):
         with self.assertRaises(RecordingNotActiveError):
             self.service.stop_recording(self.session.id)
 
-    @patch('apps.recording.service.get_ingest_manager')
+    @patch('apps.recording.service.get_session_worker_manager')
     def test_stop_active_recording_if_any(self, mock_get_manager):
         mock_manager = MagicMock()
+        mock_manager.is_running.return_value = True
         mock_manager.is_recording.return_value = True
         mock_get_manager.return_value = mock_manager
         recording = SessionRecording.objects.create(
@@ -107,7 +112,7 @@ class RecordingServiceTests(TestCase):
 
         result = self.service.stop_active_recording_if_any(self.session.id)
 
-        mock_manager.stop_recording.assert_called_once()
+        mock_manager.send_command.assert_called_once()
         recording.refresh_from_db()
         self.assertEqual(recording.status, RecordingStatus.STOPPED)
         self.assertEqual(result.recording_id, recording.id)

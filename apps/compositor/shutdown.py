@@ -34,47 +34,49 @@ def _handle_signal(signum, _frame) -> None:
 
 
 def graceful_shutdown() -> None:
-    """Stop streams, recordings, ingest pipelines, and background workers."""
-    from apps.compositor.producer_watcher import ProducerWatcher
-    from apps.compositor.registry import all_managers, clear_all
+    """Stop streams, recordings, session workers, and background workers."""
+    from apps.compositor.session_producer_poller import get_poller_registry
+    from apps.compositor.worker_manager import get_session_worker_manager
     from apps.recording.service import RecordingService
     from apps.streaming.service import StreamingService
     from core.webhooks import flush_pending, stop_worker
 
     logger.info('Graceful shutdown started')
 
-    managers = all_managers()
+    worker_manager = get_session_worker_manager()
+    session_ids = worker_manager.list_running_session_ids()
     recording_service = RecordingService()
     streaming_service = StreamingService()
 
-    for manager in managers:
-        session_id = uuid.UUID(manager.session_id)
+    for session_id in session_ids:
         try:
-            streaming_service.stop_active_stream_if_any(session_id)
+            streaming_service.stop_active_stream_if_any(uuid.UUID(session_id))
         except Exception:
             logger.exception(
                 'Failed to stop active stream during shutdown for %s',
-                manager.session_id,
+                session_id,
             )
         try:
-            recording_service.stop_active_recording_if_any(session_id)
+            recording_service.stop_active_recording_if_any(uuid.UUID(session_id))
         except Exception:
             logger.exception(
                 'Failed to stop active recording during shutdown for %s',
-                manager.session_id,
+                session_id,
             )
 
-    for manager in managers:
+    for session_id in session_ids:
         try:
-            manager.stop()
+            worker_manager.destroy_session(session_id)
         except Exception:
             logger.exception(
-                'Failed to stop ingest manager for %s',
-                manager.session_id,
+                'Failed to destroy session worker for %s',
+                session_id,
             )
 
-    clear_all()
-    ProducerWatcher.instance().stop()
+    get_poller_registry().shutdown_all()
+    from apps.compositor.worker_manager.worker_event_consumer import WorkerEventConsumer
+
+    WorkerEventConsumer.instance().stop()
     flush_pending(timeout_sec=getattr(settings, 'GRACEFUL_SHUTDOWN_TIMEOUT_SEC', 30) / 2)
     stop_worker()
 

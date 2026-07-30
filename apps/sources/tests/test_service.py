@@ -22,9 +22,10 @@ class RtmpSourceServiceTests(TestCase):
         with self.assertRaises(InvalidRtmpUrlError):
             self.service._validate_url('https://example.com/live.m3u8')
 
-    @patch('apps.sources.service.get_ingest_manager')
+    @patch('apps.sources.service.get_session_worker_manager')
     def test_add_source_persists_record(self, mock_get_manager):
         manager = MagicMock()
+        manager.is_running.return_value = True
         mock_get_manager.return_value = manager
 
         result = self.service.add_source(
@@ -34,6 +35,6 @@ class RtmpSourceServiceTests(TestCase):
         )
 
         self.assertTrue(result.source_id.startswith('rtmp-'))
-        manager.add_rtmp_source.assert_called_once()
+        manager.send_command.assert_called_once()
         self.assertEqual(result.url, 'rtmp://live.example.com/app/key')
         self.assertEqual(result.display_name, 'Output monitor')

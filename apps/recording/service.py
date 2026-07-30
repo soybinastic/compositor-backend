@@ -10,7 +10,8 @@ from pathlib import Path
 from django.conf import settings
 from django.utils import timezone
 
-from apps.compositor.registry import get as get_ingest_manager
+from apps.compositor.commands import StartRecordingCommand, StopRecordingCommand
+from apps.compositor.worker_manager import get_session_worker_manager
 from apps.recording.exceptions import (
     IngestManagerNotRunningError,
     RecordingAlreadyActiveError,
@@ -44,8 +45,8 @@ class RecordingService:
         session = self._get_active_session(session_id)
         self._assert_no_active_recording(session)
 
-        ingest_manager = get_ingest_manager(str(session_id))
-        if ingest_manager is None:
+        worker_manager = get_session_worker_manager()
+        if not worker_manager.is_running(str(session_id)):
             raise IngestManagerNotRunningError(
                 'Compositor ingest is not running for this session'
             )
@@ -61,7 +62,12 @@ class RecordingService:
         )
 
         try:
-            ingest_manager.start_recording(file_path)
+            worker_manager.send_command(
+                StartRecordingCommand(
+                    session_id=str(session_id),
+                    file_path=file_path,
+                )
+            )
         except Exception as exc:
             recording.mark_failed()
             recording.save(update_fields=['status', 'stopped_at'])
@@ -91,8 +97,8 @@ class RecordingService:
         session = self._get_active_session(session_id)
         recording = self._get_active_recording(session)
 
-        ingest_manager = get_ingest_manager(str(session_id))
-        if ingest_manager is None:
+        worker_manager = get_session_worker_manager()
+        if not worker_manager.is_running(str(session_id)):
             recording.mark_failed()
             recording.save(update_fields=['status', 'stopped_at'])
             raise IngestManagerNotRunningError(
@@ -100,7 +106,9 @@ class RecordingService:
             )
 
         try:
-            ingest_manager.stop_recording()
+            worker_manager.send_command(
+                StopRecordingCommand(session_id=str(session_id))
+            )
             recording.mark_stopped()
             recording.save(update_fields=['status', 'stopped_at'])
         except Exception as exc:
@@ -139,10 +147,14 @@ class RecordingService:
         if recording is None:
             return None
 
-        ingest_manager = get_ingest_manager(str(session_id))
-        if ingest_manager is not None and ingest_manager.is_recording():
+        worker_manager = get_session_worker_manager()
+        if worker_manager.is_running(str(session_id)) and worker_manager.is_recording(
+            str(session_id)
+        ):
             try:
-                ingest_manager.stop_recording()
+                worker_manager.send_command(
+                    StopRecordingCommand(session_id=str(session_id))
+                )
                 recording.mark_stopped()
             except Exception:
                 recording.mark_failed()

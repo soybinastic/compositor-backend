@@ -9,20 +9,11 @@ from integrations.mediasoup.exceptions import MediasoupApiError
 
 
 class MediasoupMediaPlaneBootstrapTests(TestCase):
-    @patch('apps.sessions.services.mediasoup_bootstrap.ProducerWatcher')
-    @patch('apps.sessions.services.mediasoup_bootstrap.register')
-    @patch('apps.sessions.services.mediasoup_bootstrap.SessionIngestManager')
-    def test_bootstrap_starts_ingest_manager(
-        self,
-        mock_manager_cls,
-        mock_register,
-        mock_watcher_cls,
-    ):
+    @patch('apps.sessions.services.mediasoup_bootstrap.get_session_worker_manager')
+    def test_bootstrap_starts_session_worker(self, mock_get_worker_manager):
         client = MagicMock()
-        mock_manager = MagicMock()
-        mock_manager_cls.create.return_value = mock_manager
-        mock_watcher = MagicMock()
-        mock_watcher_cls.instance.return_value = mock_watcher
+        mock_worker_manager = MagicMock()
+        mock_get_worker_manager.return_value = mock_worker_manager
 
         session = StudioSession.objects.create(
             host_display_name='Host',
@@ -34,16 +25,14 @@ class MediasoupMediaPlaneBootstrapTests(TestCase):
 
         client.create_room.assert_called_once_with(str(session.id))
         client.create_broadcaster.assert_called_once()
-        mock_manager_cls.create.assert_called_once()
-        mock_register.assert_called_once_with(mock_manager)
-        mock_watcher.ensure_running.assert_called_once()
+        mock_worker_manager.create_session.assert_called_once()
         self.assertTrue(result.mediasoup_compositor_peer_id)
 
-    @patch('apps.sessions.services.mediasoup_bootstrap.unregister')
-    def test_teardown_stops_ingest_manager(self, mock_unregister):
+    @patch('apps.sessions.services.mediasoup_bootstrap.get_session_worker_manager')
+    def test_teardown_stops_session_worker(self, mock_get_worker_manager):
         client = MagicMock()
-        mock_manager = MagicMock()
-        mock_unregister.return_value = mock_manager
+        mock_worker_manager = MagicMock()
+        mock_get_worker_manager.return_value = mock_worker_manager
 
         session = StudioSession.objects.create(
             host_display_name='Host',
@@ -54,15 +43,16 @@ class MediasoupMediaPlaneBootstrapTests(TestCase):
         bootstrap = MediasoupMediaPlaneBootstrap(client=client)
         bootstrap.teardown(session)
 
-        mock_manager.stop.assert_called_once()
+        mock_worker_manager.destroy_session.assert_called_once_with(str(session.id))
         client.delete_broadcaster.assert_called_once()
         client.delete_room.assert_called_once_with(str(session.id))
 
-    @patch('apps.sessions.services.mediasoup_bootstrap.unregister')
-    def test_teardown_continues_if_room_already_deleted(self, mock_unregister):
+    @patch('apps.sessions.services.mediasoup_bootstrap.get_session_worker_manager')
+    def test_teardown_continues_if_room_already_deleted(self, mock_get_worker_manager):
         client = MagicMock()
         client.delete_room.side_effect = MediasoupApiError(404, 'not found')
-        mock_unregister.return_value = MagicMock()
+        mock_worker_manager = MagicMock()
+        mock_get_worker_manager.return_value = mock_worker_manager
 
         session = StudioSession.objects.create(
             host_display_name='Host',

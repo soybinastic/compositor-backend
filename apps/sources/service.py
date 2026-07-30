@@ -8,7 +8,8 @@ from datetime import datetime
 
 from django.utils import timezone
 
-from apps.compositor.registry import get as get_ingest_manager
+from apps.compositor.commands import AddRtmpSourceCommand, RemoveRtmpSourceCommand
+from apps.compositor.worker_manager import get_session_worker_manager
 from apps.sessions.exceptions import SessionEndedError, SessionNotFoundError
 from apps.sessions.models import SessionStatus, StudioSession
 from apps.sessions.repositories.session_repository import SessionRepository
@@ -51,8 +52,8 @@ class RtmpSourceService:
         session = self._get_active_session(session_id)
         normalized_url = self._validate_url(url)
 
-        ingest_manager = get_ingest_manager(str(session_id))
-        if ingest_manager is None:
+        worker_manager = get_session_worker_manager()
+        if not worker_manager.is_running(str(session_id)):
             raise IngestManagerNotRunningError(
                 'Compositor ingest is not running for this session'
             )
@@ -68,10 +69,13 @@ class RtmpSourceService:
         )
 
         try:
-            ingest_manager.add_rtmp_source(
-                source_id=source_id,
-                url=normalized_url,
-                display_name=record.display_name,
+            worker_manager.send_command(
+                AddRtmpSourceCommand(
+                    session_id=str(session_id),
+                    source_id=source_id,
+                    url=normalized_url,
+                    display_name=record.display_name,
+                )
             )
         except Exception as exc:
             record.mark_failed()
@@ -95,15 +99,20 @@ class RtmpSourceService:
                 'url': normalized_url,
             },
         )
-        return self._to_result(record, ingest_manager)
+        return self._to_result(record, worker_manager)
 
     def remove_source(self, session_id: uuid.UUID, source_id: str) -> RtmpSourceResult:
         session = self._get_active_session(session_id)
         record = self._get_active_record(session, source_id)
 
-        ingest_manager = get_ingest_manager(str(session_id))
-        if ingest_manager is not None:
-            ingest_manager.remove_rtmp_source(source_id)
+        worker_manager = get_session_worker_manager()
+        if worker_manager.is_running(str(session_id)):
+            worker_manager.send_command(
+                RemoveRtmpSourceCommand(
+                    session_id=str(session_id),
+                    source_id=source_id,
+                )
+            )
 
         record.mark_stopped()
         record.save(update_fields=['status', 'stopped_at'])
@@ -116,24 +125,29 @@ class RtmpSourceService:
                 'url': record.url,
             },
         )
-        return self._to_result(record, ingest_manager)
+        return self._to_result(record, worker_manager)
 
     def list_sources(self, session_id: uuid.UUID) -> list[RtmpSourceResult]:
         session = self._get_session(session_id)
-        ingest_manager = get_ingest_manager(str(session_id))
+        worker_manager = get_session_worker_manager()
         records = SessionRtmpSource.objects.filter(session=session)
-        return [self._to_result(record, ingest_manager) for record in records]
+        return [self._to_result(record, worker_manager) for record in records]
 
     def stop_active_sources_if_any(self, session_id: uuid.UUID) -> None:
-        ingest_manager = get_ingest_manager(str(session_id))
+        worker_manager = get_session_worker_manager()
         active_records = SessionRtmpSource.objects.filter(
             session_id=session_id,
             status=RtmpSourceStatus.ACTIVE,
         )
         for record in active_records:
-            if ingest_manager is not None:
+            if worker_manager.is_running(str(session_id)):
                 try:
-                    ingest_manager.remove_rtmp_source(record.source_id)
+                    worker_manager.send_command(
+                        RemoveRtmpSourceCommand(
+                            session_id=str(session_id),
+                            source_id=record.source_id,
+                        )
+                    )
                 except Exception:
                     record.mark_failed()
                     record.save(update_fields=['status', 'stopped_at'])
@@ -175,12 +189,15 @@ class RtmpSourceService:
     @staticmethod
     def _to_result(
         record: SessionRtmpSource,
-        ingest_manager,
+        worker_manager,
     ) -> RtmpSourceResult:
         video_buffers = 0
         audio_buffers = 0
-        if ingest_manager is not None:
-            stats = ingest_manager.get_rtmp_source_stats(record.source_id)
+        if worker_manager is not None and worker_manager.is_running(str(record.session_id)):
+            stats = worker_manager.get_rtmp_source_stats(
+                str(record.session_id),
+                record.source_id,
+            )
             if stats is not None:
                 video_buffers = stats.video_buffers
                 audio_buffers = stats.audio_buffers

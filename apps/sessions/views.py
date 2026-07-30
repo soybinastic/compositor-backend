@@ -5,7 +5,7 @@ from rest_framework.views import APIView
 from apps.compositor.gstreamer import check_gstreamer
 from apps.compositor.health import check_mediasoup
 from apps.compositor.metrics import collect_metrics
-from apps.compositor.registry import get as get_ingest_manager
+from apps.compositor.worker_manager import get_session_worker_manager
 from apps.sessions.exceptions import (
     InvalidInviteTokenError,
     SessionEndedError,
@@ -191,14 +191,13 @@ class SessionIngestView(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        manager = get_ingest_manager(str(session_id))
-        if manager is None:
+        worker_manager = get_session_worker_manager()
+        ingest_status = worker_manager.get_status(str(session_id))
+        if ingest_status is None:
             return Response(
                 {'detail': 'Ingest manager not running for this session'},
                 status=status.HTTP_404_NOT_FOUND,
             )
-
-        ingest_status = manager.get_status()
         return Response(
             SessionIngestStatusSerializer(
                 {

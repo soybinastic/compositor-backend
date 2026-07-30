@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import logging
 
-from apps.compositor.producer_watcher import ProducerWatcher
-from apps.compositor.registry import register, unregister
-from apps.compositor.session_ingest_manager import SessionIngestManager
+from apps.compositor.worker_manager import get_session_worker_manager
 from apps.sessions.models import StudioSession
 from apps.sessions.repositories.session_repository import SessionRepository
 from core.interfaces import IMediaPlaneBootstrap
@@ -19,7 +17,7 @@ class MediasoupMediaPlaneBootstrap(IMediaPlaneBootstrap):
     Bootstraps the mediasoup media plane for a studio session.
 
     Creates the mediasoup room, registers the compositor BroadcasterPeer,
-    and starts RTP ingest polling (Phase 3).
+    and starts the session worker via SessionWorkerManager.
     """
 
     def __init__(
@@ -29,6 +27,7 @@ class MediasoupMediaPlaneBootstrap(IMediaPlaneBootstrap):
     ) -> None:
         self._client = client or MediasoupHttpClient()
         self._repository = repository or SessionRepository()
+        self._worker_manager = get_session_worker_manager()
 
     def bootstrap(self, session: StudioSession) -> StudioSession:
         room_id = str(session.id)
@@ -41,9 +40,7 @@ class MediasoupMediaPlaneBootstrap(IMediaPlaneBootstrap):
         session.mediasoup_compositor_peer_id = peer_id
         session = self._repository.save(session)
 
-        ingest_manager = SessionIngestManager.create(session, client=self._client)
-        register(ingest_manager)
-        ProducerWatcher.instance().ensure_running()
+        self._worker_manager.create_session(session, client=self._client)
 
         return session
 
@@ -51,9 +48,7 @@ class MediasoupMediaPlaneBootstrap(IMediaPlaneBootstrap):
         room_id = str(session.id)
         session_id = str(session.id)
 
-        ingest_manager = unregister(session_id)
-        if ingest_manager:
-            ingest_manager.stop()
+        self._worker_manager.destroy_session(session_id)
 
         if session.mediasoup_compositor_peer_id:
             try:

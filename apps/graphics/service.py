@@ -6,6 +6,8 @@ import logging
 import uuid
 from typing import Any
 
+from apps.compositor.commands import UpdateGraphicsCommand
+from apps.compositor.worker_manager import get_session_worker_manager
 from apps.graphics.constants import (
     LAYER_BANNER,
     LAYER_CHAT,
@@ -97,17 +99,21 @@ class GraphicsService:
         *,
         layout_only: bool,
     ) -> None:
-        from apps.compositor.registry import get as get_ingest_manager
-
-        ingest_manager = get_ingest_manager(str(session.id))
-        if ingest_manager is None:
+        worker_manager = get_session_worker_manager()
+        if not worker_manager.is_running(str(session.id)):
             # Persist-only is OK for GET before ingest starts; writes still succeed.
             # Applying to canvas requires a live pipeline — soft-skip rather than 503
             # so clients can stage graphics before producers join.
             logger.info(
-                'Graphics saved for session %s but ingest manager is not running',
+                'Graphics saved for session %s but session worker is not running',
                 session.id,
             )
             return
 
-        ingest_manager.apply_graphics(state, layout_only=layout_only)
+        worker_manager.send_command(
+            UpdateGraphicsCommand(
+                session_id=str(session.id),
+                graphics_state=state,
+                layout_only=layout_only,
+            )
+        )
