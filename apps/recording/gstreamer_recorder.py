@@ -72,7 +72,7 @@ def _set_element_state(element: Gst.Element, state: Gst.State, *, label: str) ->
 def _configure_video_encoder(venc: Gst.Element, *, video_bitrate: int) -> None:
     factory_name = venc.get_factory().get_name()
     if factory_name == 'x264enc':
-        venc.set_property('speed-preset', 'ultrafast')
+        venc.set_property('speed-preset', 'fast')
         venc.set_property('tune', 'zerolatency')
         venc.set_property('key-int-max', 60)
         venc.set_property('bitrate', max(video_bitrate // 1000, 500))
