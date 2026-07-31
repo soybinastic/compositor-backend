@@ -76,6 +76,7 @@ class StopRecordingCommand(SessionCommand):
 class StartStreamCommand(SessionCommand):
     destination_type: str
     destination_url: str
+    destination_urls: list[str] | None = None
     output_dir: Path | None = None
 
     @property

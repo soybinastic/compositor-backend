@@ -49,18 +49,23 @@ class WorkerEventDispatchTests(TestCase):
 
     @patch('core.worker_event_dispatch.emit_event')
     @patch('apps.streaming.service.StreamingService')
-    def test_stream_reconnecting_only_emits_webhook(
+    def test_stream_destination_failed_marks_single_destination(
         self,
         mock_streaming_cls,
         mock_emit_event,
     ):
+        session_id = str(uuid.uuid4())
         dispatch_worker_event(
-            events.STREAM_RECONNECTING,
-            {'session_id': str(uuid.uuid4()), 'attempt': 1},
+            events.STREAM_DESTINATION_FAILED,
+            {
+                'session_id': session_id,
+                'destination_url': 'rtmp://live.twitch.tv/app/key',
+                'error': 'connection lost',
+            },
         )
 
         mock_emit_event.assert_called_once()
-        mock_streaming_cls.return_value.mark_active_stream_failed.assert_not_called()
+        mock_streaming_cls.return_value.mark_stream_destination_failed.assert_called_once()
 
 
 class WorkerEventEmitterTests(TestCase):

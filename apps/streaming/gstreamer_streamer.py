@@ -110,6 +110,7 @@ def _build_av_encode_elements(
     *,
     video_bitrate: int,
     audio_bitrate: int,
+    branch_suffix: str = '',
 ) -> tuple[
     Gst.Element,
     list[Gst.Element],
@@ -123,15 +124,16 @@ def _build_av_encode_elements(
 
     Returns (v_queue, video_chain, a_queue, audio_chain, h264parse, aacparse).
     """
-    v_queue = Gst.ElementFactory.make('queue', 'stream_v_queue')
-    v_convert = Gst.ElementFactory.make('videoconvert', 'stream_v_convert')
-    venc = _make_encoder(('x264enc', 'openh264enc'), 'stream_venc')
-    h264parse = Gst.ElementFactory.make('h264parse', 'stream_h264parse')
-    a_queue = Gst.ElementFactory.make('queue', 'stream_a_queue')
-    a_convert = Gst.ElementFactory.make('audioconvert', 'stream_a_convert')
-    a_resample = Gst.ElementFactory.make('audioresample', 'stream_a_resample')
-    aenc = _make_encoder(('avenc_aac', 'voaacenc', 'fdkaacenc'), 'stream_aenc')
-    aacparse = Gst.ElementFactory.make('aacparse', 'stream_aacparse')
+    suffix = f'_{branch_suffix}' if branch_suffix else ''
+    v_queue = Gst.ElementFactory.make('queue', f'stream_v_queue{suffix}')
+    v_convert = Gst.ElementFactory.make('videoconvert', f'stream_v_convert{suffix}')
+    venc = _make_encoder(('x264enc', 'openh264enc'), f'stream_venc{suffix}')
+    h264parse = Gst.ElementFactory.make('h264parse', f'stream_h264parse{suffix}')
+    a_queue = Gst.ElementFactory.make('queue', f'stream_a_queue{suffix}')
+    a_convert = Gst.ElementFactory.make('audioconvert', f'stream_a_convert{suffix}')
+    a_resample = Gst.ElementFactory.make('audioresample', f'stream_a_resample{suffix}')
+    aenc = _make_encoder(('avenc_aac', 'voaacenc', 'fdkaacenc'), f'stream_aenc{suffix}')
+    aacparse = Gst.ElementFactory.make('aacparse', f'stream_aacparse{suffix}')
 
     if not all(
         [v_queue, v_convert, h264parse, a_queue, a_convert, a_resample, aacparse]
@@ -154,6 +156,7 @@ def build_rtmp_streaming_branch(
     destination_url: str,
     video_bitrate: int,
     audio_bitrate: int,
+    branch_suffix: str = '',
 ) -> StreamingBranch:
     """
     Create an FLV/RTMP live streaming subgraph (elements only; link later).
@@ -161,6 +164,7 @@ def build_rtmp_streaming_branch(
     Destination URL form for Twitch:
       rtmp://live.twitch.tv/app/<stream_key>
     """
+    suffix = branch_suffix or str(abs(hash(destination_url.strip())) % 10_000)
     (
         v_queue,
         video_chain,
@@ -171,9 +175,10 @@ def build_rtmp_streaming_branch(
     ) = _build_av_encode_elements(
         video_bitrate=video_bitrate,
         audio_bitrate=audio_bitrate,
+        branch_suffix=suffix,
     )
-    flvmux = Gst.ElementFactory.make('flvmux', 'stream_flvmux')
-    sink = _make_sink(('rtmpsink', 'rtmp2sink'), 'stream_rtmp_sink')
+    flvmux = Gst.ElementFactory.make('flvmux', f'stream_flvmux_{suffix}')
+    sink = _make_sink(('rtmpsink', 'rtmp2sink'), f'stream_rtmp_sink_{suffix}')
 
     if flvmux is None:
         raise RuntimeError('Failed to create flvmux for RTMP streaming')
@@ -207,6 +212,7 @@ def build_hls_streaming_branch(
     output_dir: Path,
     video_bitrate: int,
     audio_bitrate: int,
+    branch_suffix: str = 'hls',
 ) -> StreamingBranch:
     """
     Create a local HLS output subgraph (elements only; link later).
@@ -228,8 +234,9 @@ def build_hls_streaming_branch(
     ) = _build_av_encode_elements(
         video_bitrate=video_bitrate,
         audio_bitrate=audio_bitrate,
+        branch_suffix=branch_suffix,
     )
-    hlssink = Gst.ElementFactory.make('hlssink2', 'stream_hls_sink')
+    hlssink = Gst.ElementFactory.make('hlssink2', f'stream_hls_sink_{branch_suffix}')
     if hlssink is None:
         raise RuntimeError('Failed to create hlssink2 for HLS streaming')
 
@@ -263,6 +270,7 @@ def build_streaming_branch(
     output_dir: Path | None,
     video_bitrate: int,
     audio_bitrate: int,
+    branch_suffix: str = '',
 ) -> StreamingBranch:
     """Factory: create an unlinked RTMP or HLS StreamingBranch."""
     if destination_type == DestinationType.RTMP:
@@ -272,6 +280,7 @@ def build_streaming_branch(
             destination_url=destination_url,
             video_bitrate=video_bitrate,
             audio_bitrate=audio_bitrate,
+            branch_suffix=branch_suffix,
         )
 
     if destination_type == DestinationType.HLS:
@@ -281,6 +290,7 @@ def build_streaming_branch(
             output_dir=output_dir,
             video_bitrate=video_bitrate,
             audio_bitrate=audio_bitrate,
+            branch_suffix=branch_suffix or 'hls',
         )
 
     raise ValueError(f'Unsupported destination type: {destination_type}')

@@ -100,6 +100,7 @@ class CompositorPipelineStatus:
     streaming_active: bool
     streaming_destination_type: str | None
     streaming_destination_url: str | None
+    streaming_destination_urls: list[str]
     video_backend: str | None
     requested_video_backend: str
 
@@ -151,10 +152,10 @@ class CompositorPipeline:
         self._audio_tee: Gst.Element | None = None
         self._participants: dict[str, ParticipantBranch] = {}
         self._recording: RecordingBranch | None = None
-        self._streaming: StreamingBranch | None = None
-        self._streaming_config: tuple[str, str, Path | None] | None = None
-        self._stream_monitor: PipelineBusMonitor | None = None
-        self._stream_reconnect_attempts = 0
+        self._streaming_branches: list[StreamingBranch] = []
+        self._streaming_config: tuple[str, list[str], Path | None] | None = None
+        self._stream_monitors: dict[str, PipelineBusMonitor] = {}
+        self._stream_reconnect_attempts: dict[str, int] = {}
         self._on_stream_permanent_failure: Callable[[str], None] | None = None
         self._composited_frames = 0
         self._lock = threading.Lock()
@@ -377,7 +378,7 @@ class CompositorPipeline:
 
     def stop(self) -> None:
         with self._lock:
-            if self._streaming is not None:
+            if self._streaming_branches:
                 try:
                     self._stop_streaming_unlocked()
                 except Exception:
@@ -390,13 +391,14 @@ class CompositorPipeline:
                         and self._video_tee is not None
                         and self._audio_tee is not None
                     ):
-                        teardown_streaming_branch(
-                            self._streaming,
-                            self._pipeline,
-                            video_tee=self._video_tee,
-                            audio_tee=self._audio_tee,
-                        )
-                    self._streaming = None
+                        for branch in list(self._streaming_branches):
+                            teardown_streaming_branch(
+                                branch,
+                                self._pipeline,
+                                video_tee=self._video_tee,
+                                audio_tee=self._audio_tee,
+                            )
+                    self._streaming_branches = []
 
             if self._recording is not None:
                 try:
@@ -475,43 +477,53 @@ class CompositorPipeline:
         *,
         destination_type: str,
         destination_url: str,
+        destination_urls: list[str] | None = None,
         output_dir: Path | None = None,
     ) -> None:
         with self._lock:
             if self._pipeline is None or self._video_tee is None or self._audio_tee is None:
                 raise RuntimeError('Compositor pipeline is not started')
 
-            if self._streaming is not None:
+            if self._streaming_branches:
                 raise RuntimeError('Streaming is already active')
 
-            # Create → add → link → tee attach → sync (same order as recording).
-            # Linking before pipeline.add left RTMP with no media on Twitch.
-            branch = build_streaming_branch(
-                destination_type=destination_type,
+            resolved_urls = self._resolve_streaming_urls(
+                destination_type,
                 destination_url=destination_url,
-                output_dir=output_dir,
-                video_bitrate=settings.STREAMING_VIDEO_BITRATE,
-                audio_bitrate=settings.STREAMING_AUDIO_BITRATE,
-            )
-            start_streaming_on_pipeline(
-                self._pipeline,
-                branch,
-                video_tee=self._video_tee,
-                audio_tee=self._audio_tee,
+                destination_urls=destination_urls,
             )
 
-            self._streaming = branch
-            self._streaming_config = (destination_type, destination_url, output_dir)
-            self._stream_reconnect_attempts = 0
+            branches: list[StreamingBranch] = []
+            for index, url in enumerate(resolved_urls):
+                branch = build_streaming_branch(
+                    destination_type=destination_type,
+                    destination_url=url,
+                    output_dir=output_dir if destination_type == DestinationType.HLS else None,
+                    video_bitrate=settings.STREAMING_VIDEO_BITRATE,
+                    audio_bitrate=settings.STREAMING_AUDIO_BITRATE,
+                    branch_suffix=str(index),
+                )
+                start_streaming_on_pipeline(
+                    self._pipeline,
+                    branch,
+                    video_tee=self._video_tee,
+                    audio_tee=self._audio_tee,
+                )
+                branches.append(branch)
+
+            self._streaming_branches = branches
+            self._streaming_config = (destination_type, resolved_urls, output_dir)
+            self._stream_reconnect_attempts = {url: 0 for url in resolved_urls}
 
             if destination_type == DestinationType.RTMP:
-                self._start_stream_monitor()
+                for branch in branches:
+                    self._start_stream_monitor(branch)
 
             logger.info(
                 'Streaming started for session %s (%s -> %s)',
                 self.session_id,
                 destination_type,
-                destination_url,
+                ', '.join(resolved_urls),
             )
 
     def stop_streaming(self) -> None:
@@ -520,7 +532,7 @@ class CompositorPipeline:
 
     def is_streaming(self) -> bool:
         with self._lock:
-            return self._streaming is not None
+            return bool(self._streaming_branches)
 
     def add_participant(
         self,
@@ -657,6 +669,8 @@ class CompositorPipeline:
             recording_path = (
                 str(self._recording.file_path) if self._recording is not None else None
             )
+            streaming_urls = [branch.destination_url for branch in self._streaming_branches]
+            primary_branch = self._streaming_branches[0] if self._streaming_branches else None
             return CompositorPipelineStatus(
                 layout=self._layout,
                 canvas_width=self.width,
@@ -666,19 +680,20 @@ class CompositorPipeline:
                 host_peer_id=self._host_peer_id,
                 recording_active=self._recording is not None,
                 recording_file_path=recording_path,
-                streaming_active=self._streaming is not None,
+                streaming_active=bool(self._streaming_branches),
                 streaming_destination_type=(
-                    self._streaming.destination_type if self._streaming else None
+                    primary_branch.destination_type if primary_branch else None
                 ),
                 streaming_destination_url=(
-                    self._streaming.destination_url if self._streaming else None
+                    primary_branch.destination_url if primary_branch else None
                 ),
+                streaming_destination_urls=streaming_urls,
                 video_backend=self._resolved_video_backend,
                 requested_video_backend=self._requested_video_backend,
             )
 
     def _stop_streaming_unlocked(self) -> None:
-        if self._streaming is None or self._pipeline is None:
+        if not self._streaming_branches or self._pipeline is None:
             raise RuntimeError('No active stream')
 
         self._teardown_streaming_unlocked()
@@ -689,78 +704,95 @@ class CompositorPipeline:
         )
 
     def _teardown_streaming_unlocked(self) -> None:
-        if self._streaming is None or self._pipeline is None:
+        if not self._streaming_branches or self._pipeline is None:
             return
 
-        self._stop_stream_monitor()
-        branch = self._streaming
-        destination_url = branch.destination_url
+        self._stop_stream_monitors()
+        branches = list(self._streaming_branches)
+        destination_urls = [branch.destination_url for branch in branches]
 
         try:
-            finalize_hls_stream(
-                branch,
-                self._pipeline,
-                timeout_sec=settings.STREAMING_EOS_TIMEOUT_SEC,
-            )
+            for branch in branches:
+                finalize_hls_stream(
+                    branch,
+                    self._pipeline,
+                    timeout_sec=settings.STREAMING_EOS_TIMEOUT_SEC,
+                )
         finally:
             assert self._video_tee is not None
             assert self._audio_tee is not None
-            teardown_streaming_branch(
-                branch,
-                self._pipeline,
-                video_tee=self._video_tee,
-                audio_tee=self._audio_tee,
-            )
-            self._streaming = None
+            for branch in branches:
+                teardown_streaming_branch(
+                    branch,
+                    self._pipeline,
+                    video_tee=self._video_tee,
+                    audio_tee=self._audio_tee,
+                )
+            self._streaming_branches = []
             self._streaming_config = None
-            self._stream_reconnect_attempts = 0
+            self._stream_reconnect_attempts = {}
 
         logger.debug(
-            'Streaming branch removed for session %s (%s)',
+            'Streaming branches removed for session %s (%s)',
             self.session_id,
-            destination_url,
+            ', '.join(destination_urls),
         )
 
-    def _start_stream_monitor(self) -> None:
-        if self._pipeline is None or self._streaming is None:
+    def _start_stream_monitor(self, branch: StreamingBranch) -> None:
+        if self._pipeline is None:
             return
 
-        self._stop_stream_monitor()
-        watched = set(self._streaming.elements)
-        self._stream_monitor = PipelineBusMonitor(
+        destination_url = branch.destination_url
+        self._stop_stream_monitor(destination_url)
+        watched = set(branch.elements)
+        monitor = PipelineBusMonitor(
             self._pipeline,
             watched_elements=watched,
-            on_error=self._handle_stream_error,
+            on_error=lambda error_message, url=destination_url: self._handle_stream_error(
+                url,
+                error_message,
+            ),
         )
-        self._stream_monitor.start()
+        monitor.start()
+        self._stream_monitors[destination_url] = monitor
 
-    def _stop_stream_monitor(self) -> None:
-        if self._stream_monitor is not None:
-            self._stream_monitor.stop()
-            self._stream_monitor = None
+    def _stop_stream_monitor(self, destination_url: str) -> None:
+        monitor = self._stream_monitors.pop(destination_url, None)
+        if monitor is not None:
+            monitor.stop()
 
-    def _handle_stream_error(self, error_message: str) -> None:
+    def _stop_stream_monitors(self) -> None:
+        for destination_url in list(self._stream_monitors):
+            self._stop_stream_monitor(destination_url)
+
+    def _handle_stream_error(self, destination_url: str, error_message: str) -> None:
         logger.warning(
-            'Stream error for session %s: %s',
+            'Stream error for session %s destination %s: %s',
             self.session_id,
+            destination_url,
             error_message,
         )
 
         with self._lock:
-            if self._streaming is None or self._streaming_config is None:
+            if not self._streaming_branches or self._streaming_config is None:
                 return
 
-            if self._streaming.destination_type != DestinationType.RTMP:
+            destination_type, _urls, _output_dir = self._streaming_config
+            if destination_type != DestinationType.RTMP:
+                return
+
+            branch = self._find_streaming_branch(destination_url)
+            if branch is None:
                 return
 
             max_attempts = settings.STREAMING_RTMP_MAX_RECONNECT_ATTEMPTS
-            if self._stream_reconnect_attempts >= max_attempts:
-                self._fail_stream_permanently(error_message)
+            attempts = self._stream_reconnect_attempts.get(destination_url, 0)
+            if attempts >= max_attempts:
+                self._fail_stream_destination_permanently(destination_url, error_message)
                 return
 
-            self._stream_reconnect_attempts += 1
-            attempt = self._stream_reconnect_attempts
-            destination_url = self._streaming.destination_url
+            self._stream_reconnect_attempts[destination_url] = attempts + 1
+            attempt = attempts + 1
 
         emit_worker_event(
             events.STREAM_RECONNECTING,
@@ -777,8 +809,8 @@ class CompositorPipeline:
         time.sleep(delay)
 
         with self._lock:
-            if not self._reconnect_streaming_unlocked():
-                self._fail_stream_permanently(error_message)
+            if not self._reconnect_streaming_branch_unlocked(destination_url):
+                self._fail_stream_destination_permanently(destination_url, error_message)
                 return
 
         emit_worker_event(
@@ -790,32 +822,39 @@ class CompositorPipeline:
             },
         )
         logger.info(
-            'RTMP stream reconnected for session %s (attempt %s)',
+            'RTMP stream reconnected for session %s destination %s (attempt %s)',
             self.session_id,
+            destination_url,
             attempt,
         )
 
-    def _reconnect_streaming_unlocked(self) -> bool:
+    def _reconnect_streaming_branch_unlocked(self, destination_url: str) -> bool:
         if (
             self._pipeline is None
             or self._video_tee is None
             or self._audio_tee is None
-            or self._streaming is None
             or self._streaming_config is None
         ):
             return False
 
-        branch = self._streaming
+        branch = self._find_streaming_branch(destination_url)
+        if branch is None:
+            return False
+
+        destination_type, _urls, output_dir = self._streaming_config
+        if destination_type != DestinationType.RTMP:
+            return False
+
+        self._stop_stream_monitor(destination_url)
         teardown_streaming_branch(
             branch,
             self._pipeline,
             video_tee=self._video_tee,
             audio_tee=self._audio_tee,
         )
-        self._streaming = None
-        self._stop_stream_monitor()
-
-        destination_type, destination_url, output_dir = self._streaming_config
+        self._streaming_branches = [
+            item for item in self._streaming_branches if item.destination_url != destination_url
+        ]
 
         try:
             new_branch = build_streaming_branch(
@@ -824,6 +863,7 @@ class CompositorPipeline:
                 output_dir=output_dir,
                 video_bitrate=settings.STREAMING_VIDEO_BITRATE,
                 audio_bitrate=settings.STREAMING_AUDIO_BITRATE,
+                branch_suffix=str(abs(hash(destination_url)) % 10_000),
             )
             start_streaming_on_pipeline(
                 self._pipeline,
@@ -831,22 +871,38 @@ class CompositorPipeline:
                 video_tee=self._video_tee,
                 audio_tee=self._audio_tee,
             )
-            self._streaming = new_branch
-            self._start_stream_monitor()
+            self._streaming_branches.append(new_branch)
+            self._start_stream_monitor(new_branch)
             return True
         except Exception:
             logger.exception(
-                'Failed to reconnect RTMP stream for session %s',
+                'Failed to reconnect RTMP stream for session %s destination %s',
                 self.session_id,
+                destination_url,
             )
             return False
 
-    def _fail_stream_permanently(self, error_message: str) -> None:
-        destination_url = self._streaming.destination_url if self._streaming else ''
-        self._teardown_streaming_unlocked()
+    def _fail_stream_destination_permanently(
+        self,
+        destination_url: str,
+        error_message: str,
+    ) -> None:
+        branch = self._find_streaming_branch(destination_url)
+        if branch is not None and self._pipeline is not None and self._video_tee and self._audio_tee:
+            self._stop_stream_monitor(destination_url)
+            teardown_streaming_branch(
+                branch,
+                self._pipeline,
+                video_tee=self._video_tee,
+                audio_tee=self._audio_tee,
+            )
+            self._streaming_branches = [
+                item for item in self._streaming_branches if item.destination_url != destination_url
+            ]
+            self._stream_reconnect_attempts.pop(destination_url, None)
 
         emit_worker_event(
-            events.STREAM_FAILED,
+            events.STREAM_DESTINATION_FAILED,
             self.session_id,
             {
                 'destination_url': destination_url,
@@ -854,8 +910,45 @@ class CompositorPipeline:
             },
         )
 
-        if self._on_stream_permanent_failure is not None:
-            self._on_stream_permanent_failure(error_message)
+        if not self._streaming_branches:
+            self._streaming_config = None
+            if self._on_stream_permanent_failure is not None:
+                self._on_stream_permanent_failure(error_message)
+            emit_worker_event(
+                events.STREAM_FAILED,
+                self.session_id,
+                {
+                    'destination_url': destination_url,
+                    'error': error_message,
+                },
+            )
+
+    def _find_streaming_branch(self, destination_url: str) -> StreamingBranch | None:
+        for branch in self._streaming_branches:
+            if branch.destination_url == destination_url:
+                return branch
+        return None
+
+    @staticmethod
+    def _resolve_streaming_urls(
+        destination_type: str,
+        *,
+        destination_url: str,
+        destination_urls: list[str] | None,
+    ) -> list[str]:
+        if destination_type == DestinationType.HLS:
+            return [destination_url]
+
+        if destination_urls:
+            resolved = [url.strip() for url in destination_urls if url.strip()]
+            if resolved:
+                return resolved
+
+        single = destination_url.strip()
+        if single:
+            return [single]
+
+        raise ValueError('RTMP destination_url is required')
 
     def _stop_recording_unlocked(self) -> Path:
         if self._recording is None or self._pipeline is None:

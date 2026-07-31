@@ -21,9 +21,19 @@ from apps.streaming.exceptions import (
     StreamAlreadyActiveError,
     StreamNotActiveError,
 )
-from apps.streaming.models import DestinationType, SessionStream, StreamStatus
+from apps.streaming.models import DestinationType, SessionStream, StreamDestination, StreamStatus
 from core import events
 from core.webhooks import emit_event
+
+
+@dataclass(frozen=True)
+class StreamDestinationResult:
+    destination_id: uuid.UUID
+    url: str
+    label: str
+    status: str
+    started_at: datetime
+    stopped_at: datetime | None
 
 
 @dataclass(frozen=True)
@@ -32,6 +42,8 @@ class StreamResult:
     session_id: uuid.UUID
     destination_type: str
     destination_url: str
+    destination_urls: list[str]
+    destinations: list[StreamDestinationResult]
     output_path: str
     status: str
     started_at: datetime
@@ -50,10 +62,18 @@ class StreamingService:
         *,
         destination_type: str,
         destination_url: str = '',
+        destination_urls: list[str] | None = None,
+        destinations: list[dict[str, str]] | None = None,
     ) -> StreamResult:
         session = self._get_active_session(session_id)
         self._assert_no_active_stream(session)
-        self._validate_destination(destination_type, destination_url)
+        rtmp_entries = self._resolve_rtmp_entries(
+            destination_type,
+            destination_url=destination_url,
+            destination_urls=destination_urls,
+            destinations=destinations,
+        )
+        self._validate_destination(destination_type, rtmp_entries)
 
         worker_manager = get_session_worker_manager()
         if not worker_manager.is_running(str(session_id)):
@@ -62,41 +82,55 @@ class StreamingService:
             )
 
         output_dir = None
-        resolved_url = destination_url.strip()
+        resolved_urls = [url for url, _label in rtmp_entries]
         output_path = ''
+        primary_url = ''
 
         if destination_type == DestinationType.HLS:
             output_dir = self._build_hls_output_dir(session_id)
             output_path = str(output_dir)
-            resolved_url = str(output_dir / 'playlist.m3u8')
-        elif not resolved_url:
-            default_url = getattr(settings, 'DEFAULT_RTMP_URL', '')
-            if default_url:
-                resolved_url = default_url
-            else:
-                raise InvalidDestinationError('destination_url is required for RTMP streams')
+            primary_url = str(output_dir / 'playlist.m3u8')
+        else:
+            primary_url = resolved_urls[0]
 
         stream = SessionStream.objects.create(
             session=session,
             destination_type=destination_type,
-            destination_url=resolved_url,
+            destination_url=primary_url,
             output_path=output_path,
             status=StreamStatus.LIVE,
             started_at=timezone.now(),
         )
+
+        destination_records: list[StreamDestination] = []
+        if destination_type == DestinationType.RTMP:
+            for url, label in rtmp_entries:
+                destination_records.append(
+                    StreamDestination.objects.create(
+                        stream=stream,
+                        url=url,
+                        label=label,
+                        status=StreamStatus.LIVE,
+                        started_at=timezone.now(),
+                    )
+                )
 
         try:
             worker_manager.send_command(
                 StartStreamCommand(
                     session_id=str(session_id),
                     destination_type=destination_type,
-                    destination_url=resolved_url,
+                    destination_url=primary_url,
+                    destination_urls=resolved_urls,
                     output_dir=output_dir,
                 )
             )
         except Exception as exc:
             stream.mark_failed()
             stream.save(update_fields=['status', 'stopped_at'])
+            for destination in destination_records:
+                destination.mark_failed()
+                destination.save(update_fields=['status', 'stopped_at'])
             emit_event(
                 events.STREAM_FAILED,
                 {
@@ -114,7 +148,8 @@ class StreamingService:
                 'session_id': str(session_id),
                 'stream_id': str(stream.id),
                 'destination_type': destination_type,
-                'destination_url': resolved_url,
+                'destination_url': primary_url,
+                'destination_urls': resolved_urls,
             },
         )
         return self._to_result(stream)
@@ -127,6 +162,7 @@ class StreamingService:
         if not worker_manager.is_running(str(session_id)):
             stream.mark_failed()
             stream.save(update_fields=['status', 'stopped_at'])
+            self._mark_all_destinations(stream, StreamStatus.FAILED)
             raise IngestManagerNotRunningError(
                 'Compositor ingest is not running for this session'
             )
@@ -137,9 +173,11 @@ class StreamingService:
             )
             stream.mark_stopped()
             stream.save(update_fields=['status', 'stopped_at'])
+            self._mark_all_destinations(stream, StreamStatus.STOPPED)
         except Exception as exc:
             stream.mark_failed()
             stream.save(update_fields=['status', 'stopped_at'])
+            self._mark_all_destinations(stream, StreamStatus.FAILED)
             emit_event(
                 events.STREAM_FAILED,
                 {
@@ -182,13 +220,16 @@ class StreamingService:
                     StopStreamCommand(session_id=str(session_id))
                 )
                 stream.mark_stopped()
+                self._mark_all_destinations(stream, StreamStatus.STOPPED)
             except Exception:
                 stream.mark_failed()
+                self._mark_all_destinations(stream, StreamStatus.FAILED)
             stream.save(update_fields=['status', 'stopped_at'])
             return self._to_result(stream)
 
         stream.mark_failed()
         stream.save(update_fields=['status', 'stopped_at'])
+        self._mark_all_destinations(stream, StreamStatus.FAILED)
         return self._to_result(stream)
 
     def mark_active_stream_failed(self, session_id: uuid.UUID, reason: str) -> StreamResult | None:
@@ -206,11 +247,48 @@ class StreamingService:
 
         stream.mark_failed()
         stream.save(update_fields=['status', 'stopped_at'])
+        self._mark_all_destinations(stream, StreamStatus.FAILED)
+        return self._to_result(stream)
+
+    def mark_stream_destination_failed(
+        self,
+        session_id: uuid.UUID,
+        destination_url: str,
+        reason: str,
+    ) -> StreamResult | None:
+        """Mark one RTMP destination failed; fail the session only when all are down."""
+        stream = (
+            SessionStream.objects.filter(
+                session_id=session_id,
+                status=StreamStatus.LIVE,
+            )
+            .order_by('-started_at')
+            .first()
+        )
+        if stream is None:
+            return None
+
+        destination = (
+            stream.destinations.filter(url=destination_url, status=StreamStatus.LIVE)
+            .order_by('-started_at')
+            .first()
+        )
+        if destination is not None:
+            destination.mark_failed()
+            destination.save(update_fields=['status', 'stopped_at'])
+
+        if stream.destinations.filter(status=StreamStatus.LIVE).exists():
+            return self._to_result(stream)
+
+        stream.mark_failed()
+        stream.save(update_fields=['status', 'stopped_at'])
         return self._to_result(stream)
 
     def list_streams(self, session_id: uuid.UUID) -> list[StreamResult]:
         self._get_session(session_id)
-        streams = SessionStream.objects.filter(session_id=session_id)
+        streams = SessionStream.objects.filter(session_id=session_id).prefetch_related(
+            'destinations'
+        )
         return [self._to_result(stream) for stream in streams]
 
     def _get_session(self, session_id: uuid.UUID) -> StudioSession:
@@ -226,16 +304,64 @@ class StreamingService:
         return session
 
     @staticmethod
-    def _validate_destination(destination_type: str, destination_url: str) -> None:
+    def _resolve_rtmp_entries(
+        destination_type: str,
+        *,
+        destination_url: str,
+        destination_urls: list[str] | None,
+        destinations: list[dict[str, str]] | None,
+    ) -> list[tuple[str, str]]:
+        if destination_type != DestinationType.RTMP:
+            return []
+
+        if destinations:
+            entries = [
+                (item['url'].strip(), (item.get('label') or '').strip())
+                for item in destinations
+                if item.get('url', '').strip()
+            ]
+        elif destination_urls:
+            entries = [(url.strip(), '') for url in destination_urls if url.strip()]
+        else:
+            single = destination_url.strip()
+            entries = [(single, '')] if single else []
+
+        if not entries:
+            default_url = getattr(settings, 'DEFAULT_RTMP_URL', '')
+            if default_url:
+                return [(default_url.strip(), '')]
+            raise InvalidDestinationError('destination_url is required for RTMP streams')
+
+        max_destinations = getattr(settings, 'STREAMING_MAX_DESTINATIONS', 10)
+        if len(entries) > max_destinations:
+            raise InvalidDestinationError(
+                f'At most {max_destinations} RTMP destinations are allowed'
+            )
+
+        deduped: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for url, label in entries:
+            if url in seen:
+                continue
+            seen.add(url)
+            deduped.append((url, label))
+        return deduped
+
+    @staticmethod
+    def _validate_destination(
+        destination_type: str,
+        rtmp_entries: list[tuple[str, str]],
+    ) -> None:
         if destination_type not in DestinationType.values:
             raise InvalidDestinationError(f'Unsupported destination type: {destination_type}')
 
-        if destination_type == DestinationType.RTMP and destination_url:
-            lowered = destination_url.lower()
-            if not (lowered.startswith('rtmp://') or lowered.startswith('rtmps://')):
-                raise InvalidDestinationError(
-                    'RTMP destination_url must start with rtmp:// or rtmps://'
-                )
+        if destination_type == DestinationType.RTMP:
+            for url, _label in rtmp_entries:
+                lowered = url.lower()
+                if not (lowered.startswith('rtmp://') or lowered.startswith('rtmps://')):
+                    raise InvalidDestinationError(
+                        'RTMP destination_url must start with rtmp:// or rtmps://'
+                    )
 
     @staticmethod
     def _assert_no_active_stream(session: StudioSession) -> None:
@@ -265,12 +391,37 @@ class StreamingService:
         return Path(settings.STREAMING_HLS_DIR) / str(session_id) / timestamp
 
     @staticmethod
+    def _mark_all_destinations(stream: SessionStream, status: str) -> None:
+        now = timezone.now()
+        for destination in stream.destinations.filter(status=StreamStatus.LIVE):
+            destination.status = status
+            destination.stopped_at = now
+            destination.save(update_fields=['status', 'stopped_at'])
+
+    @staticmethod
     def _to_result(stream: SessionStream) -> StreamResult:
+        destination_records = list(stream.destinations.all())
+        destination_urls = [item.url for item in destination_records]
+        if not destination_urls and stream.destination_url:
+            destination_urls = [stream.destination_url]
+
         return StreamResult(
             stream_id=stream.id,
             session_id=stream.session_id,
             destination_type=stream.destination_type,
             destination_url=stream.destination_url,
+            destination_urls=destination_urls,
+            destinations=[
+                StreamDestinationResult(
+                    destination_id=item.id,
+                    url=item.url,
+                    label=item.label,
+                    status=item.status,
+                    started_at=item.started_at,
+                    stopped_at=item.stopped_at,
+                )
+                for item in destination_records
+            ],
             output_path=stream.output_path,
             status=stream.status,
             started_at=stream.started_at,

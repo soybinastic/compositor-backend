@@ -60,6 +60,7 @@ class SessionIngestStatus:
     streaming_destination_url: str | None
     video_backend: str | None
     requested_video_backend: str
+    streaming_destination_urls: list[str] = field(default_factory=list)
     participants: list[ParticipantIngestStatus] = field(default_factory=list)
     rtmp_sources: list[RtmpSourceIngestStatus] = field(default_factory=list)
 
@@ -260,11 +261,13 @@ class SessionIngestManager:
         *,
         destination_type: str,
         destination_url: str,
+        destination_urls: list[str] | None = None,
         output_dir=None,
     ) -> None:
         self._compositor_pipeline.start_streaming(
             destination_type=destination_type,
             destination_url=destination_url,
+            destination_urls=destination_urls,
             output_dir=output_dir,
         )
 
@@ -327,6 +330,7 @@ class SessionIngestManager:
                 streaming_active=pipeline_status.streaming_active,
                 streaming_destination_type=pipeline_status.streaming_destination_type,
                 streaming_destination_url=pipeline_status.streaming_destination_url,
+                streaming_destination_urls=pipeline_status.streaming_destination_urls,
                 video_backend=pipeline_status.video_backend,
                 requested_video_backend=pipeline_status.requested_video_backend,
                 participants=participants,

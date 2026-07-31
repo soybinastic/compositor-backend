@@ -53,10 +53,15 @@ class CommandCodecTests(TestCase):
             session_id='session-1',
             destination_type='rtmp',
             destination_url='rtmp://example/live',
+            destination_urls=['rtmp://example/live', 'rtmp://other/live'],
             output_dir=Path('/tmp/hls'),
         )
         restored = decode_command(encode_command(command))
         self.assertEqual(restored.output_dir, Path('/tmp/hls'))
+        self.assertEqual(
+            restored.destination_urls,
+            ['rtmp://example/live', 'rtmp://other/live'],
+        )
 
     def test_sync_producers_roundtrip(self):
         peers = [{'peerId': 'guest-1', 'producers': []}]
@@ -83,6 +88,7 @@ class CommandCodecTests(TestCase):
             streaming_active=False,
             streaming_destination_type=None,
             streaming_destination_url=None,
+            streaming_destination_urls=[],
             video_backend='cpu',
             requested_video_backend='cpu',
         )
@@ -107,6 +113,7 @@ class CommandCodecTests(TestCase):
             streaming_active=False,
             streaming_destination_type=None,
             streaming_destination_url=None,
+            streaming_destination_urls=[],
             video_backend='cpu',
             requested_video_backend='cpu',
         )

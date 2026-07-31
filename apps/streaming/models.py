@@ -49,3 +49,35 @@ class SessionStream(models.Model):
     def mark_failed(self) -> None:
         self.status = StreamStatus.FAILED
         self.stopped_at = timezone.now()
+
+
+class StreamDestination(models.Model):
+    """One RTMP egress target within a live stream session."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    stream = models.ForeignKey(
+        SessionStream,
+        on_delete=models.CASCADE,
+        related_name='destinations',
+    )
+    url = models.CharField(max_length=512)
+    label = models.CharField(max_length=64, blank=True)
+    status = models.CharField(
+        max_length=16,
+        choices=StreamStatus.choices,
+        default=StreamStatus.LIVE,
+    )
+    started_at = models.DateTimeField(default=timezone.now)
+    stopped_at = models.DateTimeField(blank=True, null=True)
+
+    class Meta:
+        db_table = 'stream_destinations'
+        ordering = ['started_at']
+
+    def mark_stopped(self) -> None:
+        self.status = StreamStatus.STOPPED
+        self.stopped_at = timezone.now()
+
+    def mark_failed(self) -> None:
+        self.status = StreamStatus.FAILED
+        self.stopped_at = timezone.now()

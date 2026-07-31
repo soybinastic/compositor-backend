@@ -41,6 +41,7 @@ _COMMAND_TYPES: dict[CommandType, type[SessionCommand]] = {
 }
 
 _PATH_FIELDS = frozenset({'file_path', 'output_dir'})
+_LIST_FIELDS = frozenset({'destination_urls'})
 
 
 def encode_command(command: SessionCommand) -> dict[str, Any]:
@@ -57,6 +58,8 @@ def decode_command(payload: dict[str, Any]) -> SessionCommand:
         raw = payload.get(field.name)
         if field.name in _PATH_FIELDS:
             decoded[field.name] = Path(raw) if raw is not None else None
+        elif field.name in _LIST_FIELDS:
+            decoded[field.name] = list(raw) if raw is not None else None
         else:
             decoded[field.name] = raw
     return command_cls(**decoded)
@@ -111,6 +114,7 @@ def decode_session_ingest_status(payload: dict[str, Any]) -> SessionIngestStatus
         streaming_active=payload['streaming_active'],
         streaming_destination_type=payload.get('streaming_destination_type'),
         streaming_destination_url=payload.get('streaming_destination_url'),
+        streaming_destination_urls=payload.get('streaming_destination_urls') or [],
         video_backend=payload.get('video_backend'),
         requested_video_backend=payload['requested_video_backend'],
         participants=participants,
