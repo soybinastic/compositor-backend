@@ -107,6 +107,8 @@ class CompositorPipelineStatus:
 
 # Attenuate each ingest source before audiomixer summing to avoid clipping.
 _AUDIO_INGEST_VOLUME = 0.7
+# High-pass rumble/proximity boom below voice fundamentals.
+_AUDIO_HIGHPASS_CUTOFF_HZ = 100.0
 
 
 def _make_ingest_volume_element(name: str, volume: float = _AUDIO_INGEST_VOLUME) -> Gst.Element:
@@ -117,15 +119,24 @@ def _make_ingest_volume_element(name: str, volume: float = _AUDIO_INGEST_VOLUME)
     return element
 
 
+def _make_voice_highpass_element(name: str, cutoff_hz: float = _AUDIO_HIGHPASS_CUTOFF_HZ) -> Gst.Element:
+    element = Gst.ElementFactory.make('audiocheblimit', name)
+    if element is None:
+        raise RuntimeError(f'Failed to create audiocheblimit element {name}')
+    element.set_property('mode', 1)
+    element.set_property('cutoff', cutoff_hz)
+    return element
+
+
 def _make_audio_limiter_element() -> Gst.Element:
     limiter = Gst.ElementFactory.make('audiodynamic', 'audio_limiter')
     if limiter is None:
         raise RuntimeError('Failed to create audiodynamic limiter element')
-    # Compressor mode catches peaks that survive per-source attenuation.
+    # GStreamer audiodynamic ratio is not dB:N — use documented compressor values.
     limiter.set_property('mode', 0)
     limiter.set_property('characteristics', 1)
-    limiter.set_property('threshold', 0.4)
-    limiter.set_property('ratio', 8.0)
+    limiter.set_property('threshold', 0.25)
+    limiter.set_property('ratio', 0.5)
     return limiter
 
 
@@ -1195,7 +1206,7 @@ class CompositorPipeline:
         )
         audio_src_pad.add_probe(
             Gst.PadProbeType.BUFFER,
-            self._make_running_time_offset_probe(),
+            self._make_running_time_offset_probe(continuous=False),
             None,
         )
         video_src_pad.add_probe(
@@ -1295,6 +1306,7 @@ class CompositorPipeline:
         tail_elements = [
             Gst.ElementFactory.make('audioconvert', f'audio_convert_{participant_peer_id}'),
             Gst.ElementFactory.make('audioresample', f'audio_resample_{participant_peer_id}'),
+            _make_voice_highpass_element(f'audio_highpass_{participant_peer_id}'),
             _make_ingest_volume_element(f'audio_volume_{participant_peer_id}'),
             audio_queue,
         ]
@@ -1450,11 +1462,21 @@ class CompositorPipeline:
         ingest_tail = self._video_mix_backend.build_ingest_tail(source_id)
         audio_convert = Gst.ElementFactory.make('audioconvert', f'rtmp_a_convert_{source_id}')
         audio_resample = Gst.ElementFactory.make('audioresample', f'rtmp_a_resample_{source_id}')
+        audio_highpass = _make_voice_highpass_element(f'rtmp_a_highpass_{source_id}')
         audio_volume = _make_ingest_volume_element(f'rtmp_a_volume_{source_id}')
         audio_queue = Gst.ElementFactory.make('queue', f'rtmp_a_queue_{source_id}')
 
         if not all(
-            [src, video_convert, *ingest_tail, audio_convert, audio_resample, audio_volume, audio_queue]
+            [
+                src,
+                video_convert,
+                *ingest_tail,
+                audio_convert,
+                audio_resample,
+                audio_highpass,
+                audio_volume,
+                audio_queue,
+            ]
         ):
             raise RuntimeError(f'Failed to create RTMP ingest elements for {source_id}')
 
@@ -1477,6 +1499,7 @@ class CompositorPipeline:
             *video_chain,
             audio_convert,
             audio_resample,
+            audio_highpass,
             audio_volume,
             audio_queue,
         ]
@@ -1485,7 +1508,7 @@ class CompositorPipeline:
             label=f'rtmp-video-{source_id}',
         )
         self._link_sequential(
-            [audio_convert, audio_resample, audio_volume, audio_queue],
+            [audio_convert, audio_resample, audio_highpass, audio_volume, audio_queue],
             label=f'rtmp-audio-{source_id}',
         )
 
