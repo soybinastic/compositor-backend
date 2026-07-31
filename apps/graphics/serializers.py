@@ -61,6 +61,7 @@ class BannerSerializer(serializers.Serializer):
     theme = serializers.CharField(required=False, allow_blank=True, default='plain')
     primary = serializers.CharField(required=False, allow_blank=True, default='')
     secondary = serializers.CharField(required=False, allow_blank=True, default='')
+    accent = serializers.CharField(required=False, allow_blank=True, default='')
     parent_data = serializers.DictField(required=False)
     textOverlay = serializers.DictField(required=False)
     graphic = serializers.DictField(required=False)
