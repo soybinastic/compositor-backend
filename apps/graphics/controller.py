@@ -410,6 +410,7 @@ class GraphicsController:
         theme = str(config.get('theme') or 'plain')
         primary = str(config.get('primary') or '')
         secondary = str(config.get('secondary') or '')
+        accent = str(config.get('accent') or '')
         sig = content_signature(
             {
                 'title': title,
@@ -418,6 +419,7 @@ class GraphicsController:
                 'theme': theme,
                 'primary': primary,
                 'secondary': secondary,
+                'accent': accent,
                 'layer': LAYER_BANNER,
             }
         )
@@ -437,6 +439,7 @@ class GraphicsController:
                 theme=theme,
                 primary=primary,
                 secondary=secondary,
+                accent=accent,
                 font_size=font_size,
                 is_primary=True,
             )
@@ -461,6 +464,7 @@ class GraphicsController:
                 theme=theme,
                 primary=primary,
                 secondary=secondary,
+                accent=accent,
                 font_size=max(16, font_size - 8),
                 is_primary=False,
             )

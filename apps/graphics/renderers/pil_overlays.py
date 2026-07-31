@@ -38,13 +38,59 @@ def _parse_color(value: str | None, default: tuple[int, int, int, int]) -> tuple
     return default
 
 
+def _normalize_banner_theme(theme: str) -> str:
+    key = str(theme or 'classic').lower()
+    if key in ('plain', 'classic'):
+        return 'classic'
+    if key == 'accent':
+        return 'default'
+    return key
+
+
+def _draw_banner_shape(
+    draw: ImageDraw.ImageDraw,
+    *,
+    width: int,
+    height: int,
+    theme: str,
+    bg: tuple[int, int, int, int],
+    accent: tuple[int, int, int, int],
+) -> None:
+    w = max(1, width - 1)
+    h = max(1, height - 1)
+
+    if theme == 'rounded':
+        draw.rounded_rectangle([0, 0, w, h], radius=12, fill=bg)
+        return
+
+    if theme == 'pill':
+        radius = max(8, height // 2)
+        draw.rounded_rectangle([0, 0, w, h], radius=radius, fill=bg)
+        return
+
+    if theme == 'outlined':
+        fill = (bg[0], bg[1], bg[2], min(bg[3], 165))
+        draw.rectangle([0, 0, width, height], fill=fill)
+        draw.rectangle([0, 0, w, h], outline=accent, width=2)
+        return
+
+    draw.rectangle([0, 0, width, height], fill=bg)
+
+    if theme == 'default':
+        draw.rectangle([0, 0, 8, height], fill=accent)
+    elif theme == 'bracket':
+        draw.rectangle([0, 0, 8, height], fill=accent)
+        draw.rectangle([max(0, width - 8), 0, width, height], fill=accent)
+
+
 def render_banner_bar(
     *,
     width: int,
     title: str,
-    theme: str = 'plain',
+    theme: str = 'classic',
     primary: str = '',
     secondary: str = '',
+    accent: str = '',
     font_size: int = 36,
     is_primary: bool = True,
 ) -> Image.Image:
@@ -52,16 +98,23 @@ def render_banner_bar(
     height = max(48, font_size + 24)
     img = Image.new('RGBA', (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    bg = _parse_color(primary, (20, 20, 20, 200))
-    accent = _parse_color(secondary, (0, 160, 220, 255))
+
+    theme_key = _normalize_banner_theme(theme)
+    bg = _parse_color(
+        primary if is_primary else secondary,
+        (20, 20, 20, 200) if is_primary else (55, 65, 81, 220),
+    )
+    accent_color = _parse_color(accent or secondary, (0, 160, 220, 255))
     fg = (255, 255, 255, 255)
 
-    if theme == 'rounded':
-        draw.rounded_rectangle([0, 0, width - 1, height - 1], radius=12, fill=bg)
-    else:
-        draw.rectangle([0, 0, width, height], fill=bg)
-        if theme == 'accent':
-            draw.rectangle([0, 0, 8, height], fill=accent)
+    _draw_banner_shape(
+        draw,
+        width=width,
+        height=height,
+        theme=theme_key,
+        bg=bg,
+        accent=accent_color,
+    )
 
     font = _font(font_size)
     draw.text((20, (height - font_size) // 2), text, font=font, fill=fg)
