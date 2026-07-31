@@ -1,8 +1,8 @@
-"""CINEMA — host large (~75%); others in a bottom filmstrip with gaps."""
+"""CINEMA — slot 0 large (~75%); others in a bottom filmstrip with gaps."""
 
 from __future__ import annotations
 
-from apps.layouts.strategies.base import LayoutStrategy, Size, TileConfig, resolve_host_id
+from apps.layouts.strategies.base import LayoutStrategy, Size, TileConfig, split_primary_and_others
 from apps.layouts.types import LayoutType, ScaleMode
 
 
@@ -18,22 +18,22 @@ class CinemaLayout(LayoutStrategy):
         canvas: Size,
         host_source_id: str | None = None,
     ) -> list[TileConfig]:
+        _ = host_source_id
         if not source_ids:
             return []
 
-        host_id = resolve_host_id(source_ids, host_source_id)
-        others = [source_id for source_id in source_ids if source_id != host_id]
+        primary_id, others = split_primary_and_others(source_ids)
 
-        host_height = max(int(canvas.height * self.HOST_HEIGHT_RATIO), 1)
-        strip_height = canvas.height - host_height
+        primary_height = max(int(canvas.height * self.HOST_HEIGHT_RATIO), 1)
+        strip_height = canvas.height - primary_height
 
         tiles = [
             TileConfig(
-                source_id=host_id,
+                source_id=primary_id,
                 x=0,
                 y=0,
                 width=canvas.width,
-                height=host_height if others else canvas.height,
+                height=primary_height if others else canvas.height,
                 zorder=1,
                 scale_mode=ScaleMode.CONTAIN,
             )
@@ -46,7 +46,7 @@ class CinemaLayout(LayoutStrategy):
         usable_width = max(canvas.width - gap * (len(others) + 1), len(others))
         thumb_width = max(usable_width // len(others), 1)
         thumb_height = max(strip_height - gap * 2, 1)
-        y = host_height + gap
+        y = primary_height + gap
 
         for index, source_id in enumerate(others):
             tiles.append(

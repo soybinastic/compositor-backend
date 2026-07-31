@@ -1,8 +1,8 @@
-"""PICTURE_IN_PICTURE / OVERLAY — host full frame; guests as floating corner tiles."""
+"""PICTURE_IN_PICTURE / OVERLAY — slot 0 full frame; others as floating corner tiles."""
 
 from __future__ import annotations
 
-from apps.layouts.strategies.base import LayoutStrategy, Size, TileConfig, resolve_host_id
+from apps.layouts.strategies.base import LayoutStrategy, Size, TileConfig, split_primary_and_others
 from apps.layouts.types import LayoutType, ScaleMode
 
 
@@ -20,15 +20,15 @@ class PictureInPictureLayout(LayoutStrategy):
         canvas: Size,
         host_source_id: str | None = None,
     ) -> list[TileConfig]:
+        _ = host_source_id
         if not source_ids:
             return []
 
-        host_id = resolve_host_id(source_ids, host_source_id)
-        others = [source_id for source_id in source_ids if source_id != host_id]
+        primary_id, others = split_primary_and_others(source_ids)
 
         tiles = [
             TileConfig(
-                source_id=host_id,
+                source_id=primary_id,
                 x=0,
                 y=0,
                 width=canvas.width,

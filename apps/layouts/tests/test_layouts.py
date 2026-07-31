@@ -55,13 +55,22 @@ class ThumbnailLayoutTests(TestCase):
         self.assertEqual(tile_map['guest'].y, 864)
         self.assertEqual(tile_map['guest'].height, 216)
 
-    def test_first_participant_becomes_host_when_unspecified(self):
+    def test_slot_zero_gets_main_area_when_guest_first(self):
+        manager = LayoutManager.for_layout(LayoutType.THUMBNAIL, Size(width=1920, height=1080))
+        tiles = manager.compute_tiles(['guest', 'host'], host_source_id='host')
+        tile_map = {tile.source_id: tile for tile in tiles}
+
+        self.assertEqual(tile_map['guest'].width, 1920)
+        self.assertEqual(tile_map['guest'].height, 864)
+        self.assertEqual(tile_map['host'].y, 864)
+
+    def test_first_participant_becomes_primary_when_unspecified(self):
         manager = LayoutManager.for_layout(LayoutType.THUMBNAIL, Size(width=1000, height=500))
         tiles = manager.compute_tiles(['first', 'second'])
-        host_tile = tiles[0]
+        primary_tile = tiles[0]
 
-        self.assertEqual(host_tile.source_id, 'first')
-        self.assertEqual(host_tile.height, 400)
+        self.assertEqual(primary_tile.source_id, 'first')
+        self.assertEqual(primary_tile.height, 400)
 
 
 class GridLayoutTests(TestCase):
@@ -112,6 +121,14 @@ class SpotlightLayoutTests(TestCase):
         self.assertEqual(tile_map['g1'].height, 300)
         self.assertEqual(tile_map['g2'].y, 300)
 
+    def test_slot_zero_left_when_guest_first(self):
+        manager = LayoutManager.for_layout(LayoutType.SPOTLIGHT, Size(width=1000, height=600))
+        tiles = manager.compute_tiles(['guest', 'host'], host_source_id='host')
+        tile_map = {tile.source_id: tile for tile in tiles}
+
+        self.assertEqual(tile_map['guest'].width, 700)
+        self.assertEqual(tile_map['host'].x, 700)
+
 
 class CinemaLayoutTests(TestCase):
     def test_filmstrip_with_gaps(self):
@@ -123,6 +140,14 @@ class CinemaLayoutTests(TestCase):
         self.assertGreater(tile_map['g1'].y, 810)
         self.assertGreater(tile_map['g1'].x, 0)
         self.assertNotEqual(tile_map['g1'].x, tile_map['g2'].x)
+
+    def test_slot_zero_gets_main_area_when_guest_first(self):
+        manager = LayoutManager.for_layout(LayoutType.CINEMA, Size(width=1920, height=1080))
+        tiles = manager.compute_tiles(['guest', 'host'], host_source_id='host')
+        tile_map = {tile.source_id: tile for tile in tiles}
+
+        self.assertEqual(tile_map['guest'].height, 810)
+        self.assertGreater(tile_map['host'].y, 810)
 
 
 class PictureInPictureLayoutTests(TestCase):
@@ -141,6 +166,18 @@ class PictureInPictureLayoutTests(TestCase):
         self.assertGreater(tile_map['guest'].x, 1000)
         self.assertGreater(tile_map['guest'].y, 700)
 
+    def test_guest_first_gets_full_frame(self):
+        manager = LayoutManager.for_layout(
+            LayoutType.PICTURE_IN_PICTURE,
+            Size(width=1920, height=1080),
+        )
+        tiles = manager.compute_tiles(['guest', 'host'], host_source_id='host')
+        tile_map = {tile.source_id: tile for tile in tiles}
+
+        self.assertEqual(tile_map['guest'].width, 1920)
+        self.assertEqual(tile_map['guest'].height, 1080)
+        self.assertGreater(tile_map['host'].zorder, tile_map['guest'].zorder)
+
     def test_overlay_alias(self):
         pip = get_layout_strategy(LayoutType.PICTURE_IN_PICTURE.value)
         overlay = get_layout_strategy(LayoutType.OVERLAY.value)
@@ -148,7 +185,7 @@ class PictureInPictureLayoutTests(TestCase):
 
 
 class FullscreenLayoutTests(TestCase):
-    def test_only_host_is_tiled(self):
+    def test_only_slot_zero_is_tiled(self):
         manager = LayoutManager.for_layout(LayoutType.FULLSCREEN, Size(width=1920, height=1080))
         tiles = manager.compute_tiles(['host', 'guest'], host_source_id='host')
 
@@ -156,6 +193,13 @@ class FullscreenLayoutTests(TestCase):
         self.assertEqual(tiles[0].source_id, 'host')
         self.assertEqual(tiles[0].width, 1920)
         self.assertEqual(tiles[0].height, 1080)
+
+    def test_guest_first_shows_guest_fullscreen(self):
+        manager = LayoutManager.for_layout(LayoutType.FULLSCREEN, Size(width=1920, height=1080))
+        tiles = manager.compute_tiles(['guest', 'host'], host_source_id='host')
+
+        self.assertEqual(len(tiles), 1)
+        self.assertEqual(tiles[0].source_id, 'guest')
 
 
 class LayoutManagerTests(TestCase):
