@@ -44,7 +44,7 @@ class PipelineBusMonitor:
 
     def stop(self) -> None:
         self._stop_event.set()
-        if self._thread:
+        if self._thread and threading.current_thread() is not self._thread:
             self._thread.join(timeout=2)
 
     def _run(self) -> None:
