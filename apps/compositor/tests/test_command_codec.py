@@ -10,6 +10,7 @@ from apps.compositor.commands import (
     CommandType,
     GetStatusCommand,
     RemoveRtmpSourceCommand,
+    SetTileOrderCommand,
     StartRecordingCommand,
     StartCountdownCommand,
     StartStreamCommand,
@@ -73,6 +74,18 @@ class CommandCodecTests(TestCase):
         )
         restored = decode_command(encode_command(command))
         self.assertEqual(restored.peer_producers_infos, peers)
+
+    def test_set_tile_order_roundtrip(self):
+        command = SetTileOrderCommand(
+            session_id='session-1',
+            host_peer_id='host-a',
+            slot_assignments={'0': 'host-a', '1': 'guest-b'},
+            hidden_source_ids=['guest-hidden'],
+        )
+        restored = decode_command(encode_command(command))
+        self.assertEqual(restored.host_peer_id, 'host-a')
+        self.assertEqual(restored.slot_assignments, {'0': 'host-a', '1': 'guest-b'})
+        self.assertEqual(restored.hidden_source_ids, ['guest-hidden'])
 
     def test_session_ingest_status_roundtrip(self):
         status = SessionIngestStatus(
@@ -171,4 +184,11 @@ def _sample_command(command_type: CommandType):
         )
     if command_type == CommandType.STOP_COUNTDOWN:
         return StopCountdownCommand(session_id=session_id)
+    if command_type == CommandType.SET_TILE_ORDER:
+        return SetTileOrderCommand(
+            session_id=session_id,
+            host_peer_id='host-a',
+            slot_assignments={'0': 'host-a'},
+            hidden_source_ids=['guest-x'],
+        )
     raise AssertionError(f'Unhandled command type: {command_type}')

@@ -24,6 +24,7 @@ class CommandType(str, Enum):
     SYNC_PRODUCERS = 'SyncProducers'
     START_COUNTDOWN = 'StartCountdown'
     STOP_COUNTDOWN = 'StopCountdown'
+    SET_TILE_ORDER = 'SetTileOrder'
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -144,6 +145,17 @@ class StopCountdownCommand(SessionCommand):
     @property
     def command_type(self) -> CommandType:
         return CommandType.STOP_COUNTDOWN
+
+
+@dataclass(frozen=True, kw_only=True)
+class SetTileOrderCommand(SessionCommand):
+    host_peer_id: str | None = None
+    slot_assignments: dict[str, str] | None = None
+    hidden_source_ids: list[str] = field(default_factory=list)
+
+    @property
+    def command_type(self) -> CommandType:
+        return CommandType.SET_TILE_ORDER
 
 
 @dataclass

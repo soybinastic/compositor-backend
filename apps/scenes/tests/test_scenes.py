@@ -73,6 +73,24 @@ class SceneApiTests(TestCase):
         self.assertEqual(self.session.layout, LayoutType.SPOTLIGHT)
         self.assertEqual(str(self.session.active_scene_id), scene_id)
 
+    @patch('apps.scenes.service.send_tile_order_command')
+    @patch('apps.scenes.service.get_session_worker_manager')
+    def test_activate_camera_scene_sends_tile_order_when_worker_running(
+        self,
+        mock_get_manager,
+        mock_send_tile_order,
+    ):
+        manager = MagicMock()
+        manager.is_running.return_value = True
+        mock_get_manager.return_value = manager
+
+        list_response = self.client.get(f'{self.base}/')
+        scene_id = list_response.data[0]['scene_id']
+
+        response = self.client.post(f'{self.base}/{scene_id}/activate/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        mock_send_tile_order.assert_called_once()
+
     def test_rename_scene(self):
         list_response = self.client.get(f'{self.base}/')
         scene_id = list_response.data[0]['scene_id']

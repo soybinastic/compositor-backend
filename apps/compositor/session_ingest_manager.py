@@ -12,6 +12,7 @@ from django.conf import settings
 from apps.compositor.compositor_pipeline import CompositorPipeline
 from apps.compositor.consumer_service import ConsumerService, ParticipantIngest
 from apps.compositor.ports import PortAllocator
+from apps.compositor.tile_order_sync import apply_tile_order_to_pipeline
 from apps.sessions.models import StudioSession
 from integrations.mediasoup.client import MediasoupHttpClient
 
@@ -111,6 +112,8 @@ class SessionIngestManager:
         )
         compositor_pipeline.start()
 
+        apply_tile_order_to_pipeline(compositor_pipeline, session)
+
         # Restore persisted graphics onto the live canvas when present.
         graphics_config = getattr(session, 'graphics_config', None) or {}
         if any(graphics_config.values() if isinstance(graphics_config, dict) else []):
@@ -147,6 +150,19 @@ class SessionIngestManager:
         with self._lock:
             self.layout = layout
             self._compositor_pipeline.set_layout(layout, graphics_state=graphics_state)
+
+    def set_tile_order(
+        self,
+        *,
+        host_peer_id: str | None = None,
+        slot_assignments: dict[str, str] | None = None,
+        hidden_source_ids: list[str] | None = None,
+    ) -> None:
+        self._compositor_pipeline.set_tile_order(
+            host_peer_id=host_peer_id,
+            slot_assignments=slot_assignments,
+            hidden_source_ids=hidden_source_ids,
+        )
 
     def apply_graphics(self, state: dict, *, layout_only: bool = False) -> None:
         self._compositor_pipeline.apply_graphics(state, layout_only=layout_only)

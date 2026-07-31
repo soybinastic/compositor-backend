@@ -36,7 +36,6 @@ class LayoutStrategy(ABC):
         """Return tile geometry for each video source on the canvas."""
 
 
-def resolve_host_id(source_ids: list[str], host_source_id: str | None) -> str:
-    if host_source_id is not None and host_source_id in source_ids:
-        return host_source_id
-    return source_ids[0]
+def split_primary_and_others(source_ids: list[str]) -> tuple[str, list[str]]:
+    """Primary tile is slot 0; remaining sources keep their relative order."""
+    return source_ids[0], source_ids[1:]

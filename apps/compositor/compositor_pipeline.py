@@ -31,6 +31,7 @@ from apps.graphics.post_mixer_overlays import (
 from apps.layouts.manager import LayoutManager
 from apps.layouts.strategies.base import Size, TileConfig
 from apps.layouts.types import ScaleMode
+from apps.compositor.tile_order import layout_max_visible, normalize_slot_assignments, resolve_source_order
 from apps.recording.gstreamer_recorder import (
     RecordingBranch,
     build_recording_branch,
@@ -176,6 +177,9 @@ class CompositorPipeline:
         self._resolved_video_backend: str | None = None
         self._video_mix_backend: VideoMixBackend | None = None
         self._host_peer_id: str | None = None
+        self._slot_assignments: dict[int, str] | None = None
+        self._hidden_source_ids: frozenset[str] = frozenset()
+        self._host_owned_source_ids: set[str] = set()
         self._layout_manager = LayoutManager.for_layout(
             layout,
             Size(width=width, height=height),
@@ -618,17 +622,7 @@ class CompositorPipeline:
     def remove_participant(self, participant_peer_id: str) -> None:
         with self._lock:
             self._remove_participant_unlocked(participant_peer_id)
-
-            if self._host_peer_id == participant_peer_id:
-                self._host_peer_id = next(
-                    (
-                        pid
-                        for pid in self._participants
-                        if not pid.startswith('rtmp-')
-                    ),
-                    next(iter(self._participants), None),
-                )
-
+            self._host_owned_source_ids.discard(participant_peer_id)
             self._apply_layout_unlocked()
 
     def add_rtmp_source(self, source_id: str, *, url: str, display_name: str = '') -> IngestStats:
@@ -645,6 +639,7 @@ class CompositorPipeline:
                 display_name=display_name,
             )
             self._participants[source_id] = branch
+            self._host_owned_source_ids.add(source_id)
             self._apply_layout_unlocked()
             logger.info(
                 'RTMP source added for session %s (source=%s url=%s)',
@@ -657,6 +652,7 @@ class CompositorPipeline:
     def remove_rtmp_source(self, source_id: str) -> None:
         with self._lock:
             self._remove_participant_unlocked(source_id)
+            self._host_owned_source_ids.discard(source_id)
             self._apply_layout_unlocked()
 
     def get_rtmp_source_stats(self, source_id: str) -> IngestStats | None:
@@ -664,6 +660,22 @@ class CompositorPipeline:
         if branch is None or not source_id.startswith('rtmp-'):
             return None
         return branch.stats
+
+    def set_tile_order(
+        self,
+        *,
+        host_peer_id: str | None = None,
+        slot_assignments: dict[str, str] | None = None,
+        hidden_source_ids: list[str] | None = None,
+    ) -> None:
+        with self._lock:
+            self._host_peer_id = host_peer_id
+            if slot_assignments:
+                self._slot_assignments = normalize_slot_assignments(slot_assignments)
+            else:
+                self._slot_assignments = None
+            self._hidden_source_ids = frozenset(hidden_source_ids or [])
+            self._apply_layout_unlocked()
 
     def set_layout(self, layout: str, *, graphics_state: dict | None = None) -> None:
         pending = graphics_state if graphics_state is not None else self._graphics._pending_state
@@ -1620,7 +1632,7 @@ class CompositorPipeline:
         )
 
         tiles = self._layout_manager.compute_tiles(
-            list(self._participants.keys()),
+            self._ordered_source_ids_unlocked(),
             host_source_id=self._host_peer_id,
         )
         # Inset cameras when a post-mixer background is active so margins show it.
@@ -1652,6 +1664,16 @@ class CompositorPipeline:
 
         # Pads first, then a single overlay rebuild (avoids mid-stream thrash).
         self._graphics.commit_layout_overlays(visible_cutouts)
+
+    def _ordered_source_ids_unlocked(self) -> list[str]:
+        return resolve_source_order(
+            list(self._participants.keys()),
+            host_peer_id=self._host_peer_id,
+            slot_assignments=self._slot_assignments,
+            hidden_source_ids=self._hidden_source_ids,
+            host_owned_source_ids=self._host_owned_source_ids,
+            max_visible=layout_max_visible(self._layout),
+        )
 
     @staticmethod
     def _set_pad_property_if_present(pad: Gst.Pad, name: str, value) -> None:

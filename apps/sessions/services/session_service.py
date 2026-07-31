@@ -9,6 +9,10 @@ from apps.sessions.exceptions import (
     SessionNotFoundError,
 )
 from apps.sessions.models import LayoutType, SessionStatus, StudioSession
+from apps.compositor.tile_order import (
+    merge_tile_order_config,
+    sanitize_hidden_source_ids,
+)
 from apps.sessions.repositories.session_repository import SessionRepository
 from apps.sessions.services.invite_service import InviteService
 from apps.sessions.services.mediasoup_bootstrap import MediasoupMediaPlaneBootstrap
@@ -123,6 +127,49 @@ class SessionService:
             )
 
         return session
+
+    def update_tile_config(
+        self,
+        session_id: uuid.UUID,
+        *,
+        host_peer_id: str | None = None,
+        tile_order_config: dict | None = None,
+        hidden_source_ids: list[str] | None = None,
+        _host_peer_id_provided: bool = False,
+        _tile_order_config_provided: bool = False,
+        _hidden_source_ids_provided: bool = False,
+    ) -> StudioSession:
+        session = self.get_session(session_id)
+        self._assert_not_ended(session)
+
+        update_fields: list[str] = []
+
+        if _host_peer_id_provided:
+            session.host_peer_id = host_peer_id
+            update_fields.append('host_peer_id')
+
+        if _tile_order_config_provided:
+            session.tile_order_config = merge_tile_order_config(
+                tile_order_config,
+                existing=session.tile_order_config,
+            )
+            update_fields.append('tile_order_config')
+
+        if _hidden_source_ids_provided:
+            session.hidden_source_ids = sanitize_hidden_source_ids(hidden_source_ids)
+            update_fields.append('hidden_source_ids')
+
+        if not update_fields:
+            return session
+
+        session = self._repository.save(session)
+        self._sync_tile_order_to_worker(session)
+        return session
+
+    def _sync_tile_order_to_worker(self, session: StudioSession) -> None:
+        from apps.compositor.tile_order_sync import send_tile_order_command
+
+        send_tile_order_command(session)
 
     def end_session(self, session_id: uuid.UUID) -> StudioSession:
         session = self.get_session(session_id)
