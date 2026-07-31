@@ -23,6 +23,18 @@ def _serialize_stream(stream) -> dict:
         'session_id': stream.session_id,
         'destination_type': stream.destination_type,
         'destination_url': stream.destination_url,
+        'destination_urls': stream.destination_urls,
+        'destinations': [
+            {
+                'destination_id': destination.destination_id,
+                'url': destination.url,
+                'label': destination.label,
+                'status': destination.status,
+                'started_at': destination.started_at,
+                'stopped_at': destination.stopped_at,
+            }
+            for destination in stream.destinations
+        ],
         'output_path': stream.output_path,
         'status': stream.status,
         'started_at': stream.started_at,
@@ -55,12 +67,21 @@ class SessionStreamStartView(APIView):
     def post(self, request, session_id):
         serializer = StartStreamSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        validated = serializer.validated_data
+        rtmp_entries = validated.get('_rtmp_entries', [])
 
         try:
             stream = _streaming_service().start_stream(
                 session_id,
-                destination_type=serializer.validated_data['destination_type'],
-                destination_url=serializer.validated_data.get('destination_url', ''),
+                destination_type=validated['destination_type'],
+                destination_url=validated.get('destination_url', ''),
+                destination_urls=[url for url, _label in rtmp_entries] or None,
+                destinations=[
+                    {'url': url, 'label': label}
+                    for url, label in rtmp_entries
+                ]
+                if rtmp_entries
+                else None,
             )
         except SessionNotFoundError:
             return Response(

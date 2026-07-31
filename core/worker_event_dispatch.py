@@ -23,6 +23,8 @@ def dispatch_worker_event(event_type: str, payload: dict[str, Any]) -> None:
 
     if event_type == events.STREAM_FAILED:
         _mark_stream_failed(payload)
+    elif event_type == events.STREAM_DESTINATION_FAILED:
+        _mark_stream_destination_failed(payload)
 
 
 def _mark_stream_failed(payload: dict[str, Any]) -> None:
@@ -39,5 +41,31 @@ def _mark_stream_failed(payload: dict[str, Any]) -> None:
     except Exception:
         logger.exception(
             'Failed to mark stream failed for session %s',
+            session_id,
+        )
+
+
+def _mark_stream_destination_failed(payload: dict[str, Any]) -> None:
+    session_id = payload.get('session_id')
+    destination_url = payload.get('destination_url')
+    if not session_id or not destination_url:
+        logger.warning(
+            'STREAM_DESTINATION_FAILED event missing fields: %s',
+            payload,
+        )
+        return
+
+    error = payload.get('error', '')
+    try:
+        from apps.streaming.service import StreamingService
+
+        StreamingService().mark_stream_destination_failed(
+            uuid.UUID(str(session_id)),
+            str(destination_url),
+            str(error),
+        )
+    except Exception:
+        logger.exception(
+            'Failed to mark stream destination failed for session %s',
             session_id,
         )

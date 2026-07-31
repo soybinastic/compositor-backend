@@ -45,6 +45,7 @@ def dispatch_command(ingest_manager: SessionIngestManager, command: SessionComma
         ingest_manager.start_stream(
             destination_type=command.destination_type,
             destination_url=command.destination_url,
+            destination_urls=command.destination_urls,
             output_dir=command.output_dir,
         )
         return None

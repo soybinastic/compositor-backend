@@ -12,6 +12,7 @@ RECORDING_FAILED = 'recording.failed'
 STREAM_STARTED = 'stream.started'
 STREAM_STOPPED = 'stream.stopped'
 STREAM_FAILED = 'stream.failed'
+STREAM_DESTINATION_FAILED = 'stream.destination_failed'
 STREAM_RECONNECTING = 'stream.reconnecting'
 STREAM_RECONNECTED = 'stream.reconnected'
 
