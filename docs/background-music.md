@@ -23,9 +23,9 @@ PATCH `/api/v1/sessions/{session_id}/scenes/{scene_id}/`
 }
 ```
 
-Selecting or replacing a track stores config only. Playback starts from an explicit transport command.
+Selecting or replacing a track saves config and **starts preview playback in the browser** immediately. The compositor program mix is updated in the background (best-effort; preview and recording may drift).
 
-Frontend polls `GET .../background-music/` every 2s and calls transport POST routes directly (no in-browser audio mixing).
+Frontend uses a hidden `HTMLAudioElement` for studio preview. Compositor GStreamer mix is used for recording and live stream.
 
 ## Runtime state (compositor-owned)
 

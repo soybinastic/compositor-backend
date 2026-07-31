@@ -55,6 +55,7 @@ class BackgroundMusicPipelineTests(TestCase):
 
         playing_state = pipeline.play_background_music()
         self.assertEqual(playing_state['playback_state'], 'playing')
+        self.assertLess(playing_state['position_ms'], 5000)
 
         paused_state = pipeline.pause_background_music()
         self.assertEqual(paused_state['playback_state'], 'paused')

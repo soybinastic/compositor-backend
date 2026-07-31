@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -108,6 +109,8 @@ class BackgroundMusicManager:
                 self._apply_volume_properties_unlocked()
                 if self._playback_state == PLAYBACK_IDLE:
                     self._playback_state = PLAYBACK_READY
+                if self._config.get('enabled'):
+                    self._autoplay_if_ready_unlocked()
                 return
 
             self._teardown_branch_unlocked()
@@ -122,6 +125,8 @@ class BackgroundMusicManager:
                 )
                 self._apply_volume_properties_unlocked()
                 self._playback_state = PLAYBACK_READY
+                if self._config.get('enabled'):
+                    self._autoplay_if_ready_unlocked()
             except Exception as exc:
                 logger.exception(
                     'Failed to load background music for session %s',
@@ -136,14 +141,7 @@ class BackgroundMusicManager:
 
     def play(self) -> None:
         with self._lock:
-            if self._branch is None:
-                raise ValueError('no_track_loaded')
-            self._playback_state = PLAYBACK_LOADING
-            self._branch.uridecodebin.set_state(Gst.State.PLAYING)
-            for element in self._branch.elements:
-                element.sync_state_with_parent()
-            self._refresh_duration_unlocked()
-            self._playback_state = PLAYBACK_PLAYING
+            self._start_playback_unlocked(from_start=True)
 
     def pause(self) -> None:
         with self._lock:
@@ -154,10 +152,7 @@ class BackgroundMusicManager:
 
     def resume(self) -> None:
         with self._lock:
-            if self._branch is None:
-                raise ValueError('no_track_loaded')
-            self._branch.uridecodebin.set_state(Gst.State.PLAYING)
-            self._playback_state = PLAYBACK_PLAYING
+            self._start_playback_unlocked(from_start=False)
 
     def stop(self) -> None:
         with self._lock:
@@ -246,6 +241,10 @@ class BackgroundMusicManager:
                 return
             if audio_src_pad.link(mixer_pad) != Gst.PadLinkReturn.OK:
                 raise RuntimeError('Failed to link background music branch to audiomixer')
+            logger.info(
+                'Background music branch linked to audiomixer for session %s',
+                self.session_id,
+            )
 
         handler_id = src.connect('pad-added', on_pad_added, None)
         branch.signal_handlers.append((src, handler_id))
@@ -291,6 +290,67 @@ class BackgroundMusicManager:
             return
         level = 0.0 if self._config.get('muted') else float(self._config.get('volume', 0.5))
         self._branch.volume_element.set_property('volume', level)
+
+    def _autoplay_if_ready_unlocked(self) -> None:
+        if self._branch is None:
+            return
+        if self._playback_state not in {
+            PLAYBACK_READY,
+            PLAYBACK_STOPPED,
+            PLAYBACK_IDLE,
+            PLAYBACK_PAUSED,
+        }:
+            return
+        try:
+            self._start_playback_unlocked(from_start=True)
+        except ValueError as exc:
+            logger.warning(
+                'Background music autoplay deferred for session %s: %s',
+                self.session_id,
+                exc.args[0] if exc.args else exc,
+            )
+
+    def _start_playback_unlocked(self, *, from_start: bool) -> None:
+        if self._branch is None:
+            raise ValueError('no_track_loaded')
+
+        self._playback_state = PLAYBACK_LOADING
+        self._error = None
+        if from_start:
+            self._seek_to_start_unlocked()
+
+        self._branch.uridecodebin.set_state(Gst.State.PLAYING)
+        for element in self._branch.elements:
+            element.sync_state_with_parent()
+
+        if not self._wait_for_mixer_linked_unlocked(timeout_sec=8.0):
+            self._playback_state = PLAYBACK_ERROR
+            self._error = {
+                'code': 'playback_timeout',
+                'message': 'Background music did not connect to the program mix in time.',
+            }
+            raise ValueError('playback_timeout')
+
+        self._refresh_duration_unlocked()
+        self._playback_state = PLAYBACK_PLAYING
+
+    def _wait_for_mixer_linked_unlocked(self, *, timeout_sec: float) -> bool:
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            if self._is_mixer_linked_unlocked():
+                return True
+            time.sleep(0.05)
+        return self._is_mixer_linked_unlocked()
+
+    def _is_mixer_linked_unlocked(self) -> bool:
+        branch = self._branch
+        if branch is None:
+            return False
+        src_pad = branch.audio_queue.get_static_pad('src')
+        if src_pad is None or not src_pad.is_linked():
+            return False
+        peer = src_pad.get_peer()
+        return peer is not None
 
     def _seek_to_start_unlocked(self) -> None:
         if self._branch is None:
