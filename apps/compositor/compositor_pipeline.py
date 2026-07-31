@@ -669,10 +669,15 @@ class CompositorPipeline:
         pending = graphics_state if graphics_state is not None else self._graphics._pending_state
         prepared_bg = self._graphics.prefetch_background_still(pending or {}, layout)
         with self._lock:
-            if graphics_state is not None:
-                self._graphics.set_pending_state(graphics_state)
             self._layout = layout
             self._layout_manager.set_strategy(layout)
+            if graphics_state is not None:
+                self._graphics.apply_state(
+                    graphics_state,
+                    layout=layout,
+                    layout_only=False,
+                    prepared_background=prepared_bg,
+                )
             self._apply_layout_unlocked(prepared_background=prepared_bg)
 
     def apply_graphics(
