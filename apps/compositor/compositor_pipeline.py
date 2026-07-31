@@ -122,11 +122,10 @@ def _make_audio_limiter_element() -> Gst.Element:
     if limiter is None:
         raise RuntimeError('Failed to create audiodynamic limiter element')
     # Compressor mode catches peaks that survive per-source attenuation.
-    limiter.set_property('mode', 1)
+    limiter.set_property('mode', 0)
+    limiter.set_property('characteristics', 1)
     limiter.set_property('threshold', 0.4)
     limiter.set_property('ratio', 8.0)
-    limiter.set_property('attack', 0.005)
-    limiter.set_property('release', 0.05)
     return limiter
 
 
