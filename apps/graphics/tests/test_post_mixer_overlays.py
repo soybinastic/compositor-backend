@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 from django.test import SimpleTestCase
 from PIL import Image
 
-from apps.graphics.constants import LAYER_BACKGROUND, LAYER_LOGO, LAYER_OVERLAY, LAYER_TICKER
+from apps.graphics.constants import LAYER_BACKGROUND, LAYER_COUNTDOWN, LAYER_LOGO, LAYER_OVERLAY, LAYER_TICKER
 from apps.graphics.post_mixer_overlays import (
     LAYER_GRAPHICS_STACK,
     POST_MIXER_OVERLAY_KEYS,
@@ -22,7 +22,7 @@ class PostMixerOverlayTests(SimpleTestCase):
     def test_overlay_key_order(self):
         self.assertEqual(
             POST_MIXER_OVERLAY_KEYS,
-            (LAYER_GRAPHICS_STACK, LAYER_TICKER),
+            (LAYER_GRAPHICS_STACK, LAYER_TICKER, LAYER_COUNTDOWN),
         )
 
     def test_image_to_pixbuf_roundtrip_size(self):

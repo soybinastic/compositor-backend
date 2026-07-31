@@ -141,6 +141,37 @@ def render_ticker_bar(
     return img
 
 
+def format_countdown_label(seconds_remaining: int) -> str:
+    minutes, seconds = divmod(max(0, seconds_remaining), 60)
+    return f'{minutes}:{seconds:02d}'
+
+
+def render_countdown_overlay(
+    *,
+    canvas_width: int,
+    canvas_height: int,
+    seconds_remaining: int,
+) -> Image.Image:
+    label = format_countdown_label(seconds_remaining)
+    box_w = min(420, max(220, canvas_width // 4))
+    box_h = min(180, max(100, canvas_height // 5))
+    img = Image.new('RGBA', (box_w, box_h), (0, 0, 0, 180))
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle([0, 0, box_w - 1, box_h - 1], radius=16, fill=(0, 0, 0, 200))
+    font_size = max(36, min(96, box_h // 2))
+    font = _font(font_size)
+    bbox = draw.textbbox((0, 0), label, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    draw.text(
+        ((box_w - text_w) // 2, (box_h - text_h) // 2 - 4),
+        label,
+        font=font,
+        fill=(255, 255, 255, 255),
+    )
+    return img
+
+
 def render_chat_panel(
     *,
     width: int,

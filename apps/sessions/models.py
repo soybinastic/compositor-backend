@@ -55,6 +55,7 @@ class StudioSession(models.Model):
         on_delete=models.SET_NULL,
         related_name='+',
     )
+    countdown_state = models.JSONField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     ended_at = models.DateTimeField(blank=True, null=True)
 

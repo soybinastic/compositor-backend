@@ -22,6 +22,8 @@ class CommandType(str, Enum):
     REMOVE_RTMP_SOURCE = 'RemoveRtmpSource'
     GET_STATUS = 'GetStatus'
     SYNC_PRODUCERS = 'SyncProducers'
+    START_COUNTDOWN = 'StartCountdown'
+    STOP_COUNTDOWN = 'StopCountdown'
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -125,6 +127,23 @@ class SyncProducersCommand(SessionCommand):
     @property
     def command_type(self) -> CommandType:
         return CommandType.SYNC_PRODUCERS
+
+
+@dataclass(frozen=True, kw_only=True)
+class StartCountdownCommand(SessionCommand):
+    started_at_epoch: float
+    duration_seconds: int
+
+    @property
+    def command_type(self) -> CommandType:
+        return CommandType.START_COUNTDOWN
+
+
+@dataclass(frozen=True, kw_only=True)
+class StopCountdownCommand(SessionCommand):
+    @property
+    def command_type(self) -> CommandType:
+        return CommandType.STOP_COUNTDOWN
 
 
 @dataclass

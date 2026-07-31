@@ -151,6 +151,15 @@ class SessionIngestManager:
     def apply_graphics(self, state: dict, *, layout_only: bool = False) -> None:
         self._compositor_pipeline.apply_graphics(state, layout_only=layout_only)
 
+    def start_countdown(self, *, started_at_epoch: float, duration_seconds: int) -> None:
+        self._compositor_pipeline.start_countdown(
+            started_at_epoch=started_at_epoch,
+            duration_seconds=duration_seconds,
+        )
+
+    def stop_countdown(self) -> None:
+        self._compositor_pipeline.stop_countdown()
+
     def sync_producers(self, peer_producers_infos: list[dict[str, Any]]) -> None:
         """Attach or detach participants based on mediasoup producer state."""
         if self._stopped:

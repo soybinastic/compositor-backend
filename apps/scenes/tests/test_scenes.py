@@ -127,7 +127,47 @@ class SceneApiTests(TestCase):
         self.assertEqual(response.data['type'], SceneType.COUNTDOWN)
         self.assertEqual(response.data['countdown']['duration_seconds'], 30)
 
-    def test_cannot_activate_countdown_scene(self):
+    def test_activate_countdown_scene_starts_countdown(self):
+        list_response = self.client.get(f'{self.base}/')
+        scene1_id = list_response.data[0]['scene_id']
+
+        scene2_response = self.client.post(
+            f'{self.base}/',
+            {'type': SceneType.CAMERA},
+            format='json',
+        )
+        scene2_id = scene2_response.data['scene_id']
+
+        create_response = self.client.post(
+            f'{self.base}/',
+            {
+                'type': SceneType.COUNTDOWN,
+                'duration_seconds': 10,
+                'target_scene_id': scene2_id,
+            },
+            format='json',
+        )
+        countdown_id = create_response.data['scene_id']
+
+        with patch('apps.scenes.service.get_session_worker_manager') as mock_get_manager:
+            manager = MagicMock()
+            manager.is_running.return_value = False
+            mock_get_manager.return_value = manager
+
+            response = self.client.post(f'{self.base}/{countdown_id}/activate/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['activation_type'], 'countdown')
+        self.assertTrue(response.data['countdown_state']['active'])
+        self.assertEqual(response.data['countdown_state']['duration_seconds'], 10)
+        self.assertEqual(response.data['countdown_state']['target_scene_id'], scene2_id)
+
+        self.session.refresh_from_db()
+        self.assertTrue(self.session.countdown_state['active'])
+        # Active camera scene stays unchanged while countdown runs
+        self.assertEqual(str(self.session.active_scene_id), scene1_id)
+
+    def test_get_session_includes_countdown_state(self):
         list_response = self.client.get(f'{self.base}/')
         target_id = list_response.data[0]['scene_id']
 
@@ -135,15 +175,22 @@ class SceneApiTests(TestCase):
             f'{self.base}/',
             {
                 'type': SceneType.COUNTDOWN,
-                'duration_seconds': 10,
+                'duration_seconds': 5,
                 'target_scene_id': target_id,
             },
             format='json',
         )
         countdown_id = create_response.data['scene_id']
 
-        response = self.client.post(f'{self.base}/{countdown_id}/activate/')
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        with patch('apps.scenes.service.get_session_worker_manager') as mock_get_manager:
+            manager = MagicMock()
+            manager.is_running.return_value = False
+            mock_get_manager.return_value = manager
+            self.client.post(f'{self.base}/{countdown_id}/activate/')
+
+        response = self.client.get(f'/api/v1/sessions/{self.session.id}/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data['countdown_state']['active'])
 
     def test_missing_session_returns_404(self):
         missing = uuid.uuid4()

@@ -4,7 +4,7 @@ from rest_framework.views import APIView
 
 from apps.scenes.exceptions import (
     ActiveSceneDeleteError,
-    CountdownSceneNotActivatableError,
+    CountdownAlreadyActiveError,
     InvalidCountdownTargetError,
     SceneNotFoundError,
 )
@@ -140,7 +140,10 @@ class SessionSceneActivateView(APIView):
             from apps.sessions.services.session_service import SessionService
 
             session = SessionService().get_session(session_id)
-            scene = _scene_service().activate_scene(session_id, scene_id)
+            scene, activation_type, countdown_state = _scene_service().activate_scene(
+                session_id,
+                scene_id,
+            )
             session.refresh_from_db()
         except SessionNotFoundError:
             return Response({'detail': 'Session not found'}, status=status.HTTP_404_NOT_FOUND)
@@ -148,10 +151,22 @@ class SessionSceneActivateView(APIView):
             return Response({'detail': 'Scene not found'}, status=status.HTTP_404_NOT_FOUND)
         except SessionEndedError as exc:
             return Response({'detail': str(exc)}, status=status.HTTP_409_CONFLICT)
-        except CountdownSceneNotActivatableError as exc:
+        except CountdownAlreadyActiveError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_409_CONFLICT)
+        except InvalidCountdownTargetError as exc:
             return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
+        if activation_type == 'countdown':
+            return Response(
+                {
+                    'activation_type': 'countdown',
+                    'scene': _serialize_scene(scene, session),
+                    'countdown_state': countdown_state,
+                }
+            )
+
         payload = {
+            'activation_type': 'camera',
             'scene': _serialize_scene(scene, session),
             'layout': session.layout,
             'graphics_config': scene.graphics_config,

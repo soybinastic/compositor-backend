@@ -29,6 +29,7 @@ from apps.graphics.constants import (
     LAYER_OVERLAY,
     LAYER_QR,
     LAYER_TICKER,
+    LAYER_COUNTDOWN,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,7 @@ LAYER_GRAPHICS_STACK = 'graphics_stack'
 POST_MIXER_OVERLAY_KEYS: tuple[str, ...] = (
     LAYER_GRAPHICS_STACK,
     LAYER_TICKER,
+    LAYER_COUNTDOWN,
 )
 
 # Bottom → top within the software-composited stack.

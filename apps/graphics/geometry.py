@@ -178,6 +178,18 @@ def chat_geometry(canvas_w: int, canvas_h: int) -> tuple[int, int, int, int]:
     return x, y, w, h
 
 
+def countdown_geometry(
+    canvas_w: int,
+    canvas_h: int,
+    *,
+    box_width: int,
+    box_height: int,
+) -> tuple[int, int, int, int]:
+    x = max(0, (canvas_w - box_width) // 2)
+    y = max(0, (canvas_h - box_height) // 2)
+    return _clamp_rect(x, y, box_width, box_height, canvas_w, canvas_h)
+
+
 def _clamp_rect(
     x: int,
     y: int,

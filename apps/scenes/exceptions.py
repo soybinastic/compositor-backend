@@ -10,5 +10,9 @@ class CountdownSceneNotActivatableError(Exception):
     pass
 
 
+class CountdownAlreadyActiveError(Exception):
+    pass
+
+
 class InvalidCountdownTargetError(Exception):
     pass

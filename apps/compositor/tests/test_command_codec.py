@@ -11,7 +11,9 @@ from apps.compositor.commands import (
     GetStatusCommand,
     RemoveRtmpSourceCommand,
     StartRecordingCommand,
+    StartCountdownCommand,
     StartStreamCommand,
+    StopCountdownCommand,
     StopRecordingCommand,
     StopStreamCommand,
     SyncProducersCommand,
@@ -161,4 +163,12 @@ def _sample_command(command_type: CommandType):
         return RemoveRtmpSourceCommand(session_id=session_id, source_id='src-1')
     if command_type == CommandType.SYNC_PRODUCERS:
         return SyncProducersCommand(session_id=session_id, peer_producers_infos=[])
+    if command_type == CommandType.START_COUNTDOWN:
+        return StartCountdownCommand(
+            session_id=session_id,
+            started_at_epoch=1_700_000_000.0,
+            duration_seconds=30,
+        )
+    if command_type == CommandType.STOP_COUNTDOWN:
+        return StopCountdownCommand(session_id=session_id)
     raise AssertionError(f'Unhandled command type: {command_type}')
