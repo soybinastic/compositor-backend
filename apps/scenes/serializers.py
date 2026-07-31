@@ -6,6 +6,7 @@ from apps.scenes.constants import (
     DEFAULT_SOURCES_CONFIG,
 )
 from apps.scenes.models import SceneType, StudioScene
+from apps.scenes.serializers_tile import SourcesConfigSerializer
 from apps.sessions.models import LayoutType
 
 
@@ -57,7 +58,7 @@ class UpdateSceneSerializer(serializers.Serializer):
     layout = serializers.ChoiceField(choices=LayoutType.choices, required=False)
     graphics_config = serializers.JSONField(required=False)
     devices = DevicesConfigSerializer(required=False)
-    sources = serializers.JSONField(required=False)
+    sources = SourcesConfigSerializer(required=False)
     background_music = serializers.JSONField(required=False)
 
 

@@ -9,8 +9,10 @@ from datetime import datetime, timezone
 from typing import Any
 
 from apps.compositor.commands import ChangeLayoutCommand, StartCountdownCommand, StopCountdownCommand
+from apps.compositor.tile_order_sync import send_tile_order_command
 from apps.compositor.worker_manager import get_session_worker_manager
 from apps.graphics.state import empty_graphics_state, snapshot_graphics_state
+from apps.compositor.tile_order import merge_sources_config
 from apps.scenes.constants import (
     DEFAULT_BACKGROUND_MUSIC_CONFIG,
     DEFAULT_DEVICES_CONFIG,
@@ -99,8 +101,13 @@ class SceneService:
         scene = self.get_scene(session_id, scene_id)
 
         if scene.scene_type != SceneType.CAMERA:
-            if any(v is not None for v in (layout, graphics_config, devices)):
-                raise ValueError('Only camera scenes support layout/graphics/devices updates')
+            if any(
+                v is not None
+                for v in (layout, graphics_config, devices, sources_config)
+            ):
+                raise ValueError(
+                    'Only camera scenes support layout/graphics/devices/sources updates'
+                )
             if name is not None:
                 scene.name = name.strip()
                 scene.save(update_fields=['name', 'updated_at'])
@@ -120,7 +127,10 @@ class SceneService:
             scene.devices_config = {**DEFAULT_DEVICES_CONFIG, **devices}
             update_fields.append('devices_config')
         if sources_config is not None:
-            scene.sources_config = sources_config
+            scene.sources_config = merge_sources_config(
+                sources_config,
+                existing=scene.sources_config,
+            )
             update_fields.append('sources_config')
         if background_music_config is not None:
             scene.background_music_config = background_music_config
@@ -131,7 +141,7 @@ class SceneService:
         if session.active_scene_id == scene.id:
             self._apply_camera_scene_to_session(session, scene)
             session.save(update_fields=['layout', 'graphics_config'])
-            self._send_layout_command(session, scene.layout, scene.graphics_config)
+            self._sync_compositor_scene(session, scene)
 
         return scene
 
@@ -162,7 +172,7 @@ class SceneService:
         session.active_scene = scene
         session.save(update_fields=['layout', 'graphics_config', 'active_scene_id'])
 
-        self._send_layout_command(session, scene.layout, scene.graphics_config)
+        self._sync_compositor_scene(session, scene)
         return scene, 'camera', None
 
     def start_countdown(
@@ -229,7 +239,7 @@ class SceneService:
         self._send_stop_countdown_command(session)
 
         if target is not None:
-            self._send_layout_command(session, target.layout, target.graphics_config)
+            self._sync_compositor_scene(session, target)
         return target
 
     def sync_active_scene_layout(self, session: StudioSession, layout: str) -> None:
@@ -349,6 +359,14 @@ class SceneService:
     ) -> None:
         session.layout = scene.layout or LayoutType.CONTAIN
         session.graphics_config = snapshot_graphics_state(scene.graphics_config or empty_graphics_state())
+
+    def _sync_compositor_scene(
+        self,
+        session: StudioSession,
+        scene: StudioScene,
+    ) -> None:
+        send_tile_order_command(session, scene=scene)
+        self._send_layout_command(session, scene.layout, scene.graphics_config)
 
     def _send_layout_command(
         self,

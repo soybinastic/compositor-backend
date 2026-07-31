@@ -41,7 +41,7 @@ def run_session_worker(
 
     Returns a process exit code (0 = clean shutdown).
     """
-    session = StudioSession.objects.get(pk=session_id)
+    session = StudioSession.objects.select_related('active_scene').get(pk=session_id)
     executor = SessionCommandExecutor(session_id)
     heartbeat: SessionWorkerHeartbeat | None = None
 

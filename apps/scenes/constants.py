@@ -9,6 +9,7 @@ DEFAULT_DEVICES_CONFIG: dict = {
 DEFAULT_SOURCES_CONFIG: dict = {
     'version': 1,
     'sources': [],
+    'assignments': {},
 }
 
 DEFAULT_BACKGROUND_MUSIC_CONFIG: dict = {

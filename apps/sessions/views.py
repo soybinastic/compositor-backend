@@ -18,6 +18,7 @@ from apps.sessions.serializers import (
     SessionIngestStatusSerializer,
     SessionSerializer,
     UpdateLayoutSerializer,
+    UpdateSessionTileConfigSerializer,
     ValidateInviteSerializer,
 )
 from apps.sessions.services.session_service import SessionService
@@ -100,6 +101,31 @@ class SessionDetailView(APIView):
                 {'detail': 'Session not found'},
                 status=status.HTTP_404_NOT_FOUND,
             )
+
+        return Response(SessionSerializer(session).data)
+
+    def patch(self, request, session_id):
+        serializer = UpdateSessionTileConfigSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        try:
+            session = _session_service().update_tile_config(
+                session_id,
+                host_peer_id=data.get('host_peer_id'),
+                tile_order_config=data.get('tile_order_config'),
+                hidden_source_ids=data.get('hidden_source_ids'),
+                _host_peer_id_provided='host_peer_id' in data,
+                _tile_order_config_provided='tile_order_config' in data,
+                _hidden_source_ids_provided='hidden_source_ids' in data,
+            )
+        except SessionNotFoundError:
+            return Response(
+                {'detail': 'Session not found'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        except SessionEndedError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_409_CONFLICT)
 
         return Response(SessionSerializer(session).data)
 

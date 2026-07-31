@@ -7,6 +7,7 @@ from apps.compositor.commands import (
     ChangeLayoutCommand,
     GetStatusCommand,
     RemoveRtmpSourceCommand,
+    SetTileOrderCommand,
     SessionCommand,
     StartCountdownCommand,
     StartRecordingCommand,
@@ -84,6 +85,14 @@ def dispatch_command(ingest_manager: SessionIngestManager, command: SessionComma
 
     if isinstance(command, StopCountdownCommand):
         ingest_manager.stop_countdown()
+        return None
+
+    if isinstance(command, SetTileOrderCommand):
+        ingest_manager.set_tile_order(
+            host_peer_id=command.host_peer_id,
+            slot_assignments=command.slot_assignments,
+            hidden_source_ids=command.hidden_source_ids,
+        )
         return None
 
     raise TypeError(f'Unsupported command type: {type(command).__name__}')

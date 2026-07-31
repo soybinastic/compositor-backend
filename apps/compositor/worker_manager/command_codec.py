@@ -13,6 +13,7 @@ from apps.compositor.commands import (
     CommandType,
     GetStatusCommand,
     RemoveRtmpSourceCommand,
+    SetTileOrderCommand,
     SessionCommand,
     StartCountdownCommand,
     StartRecordingCommand,
@@ -42,6 +43,7 @@ _COMMAND_TYPES: dict[CommandType, type[SessionCommand]] = {
     CommandType.SYNC_PRODUCERS: SyncProducersCommand,
     CommandType.START_COUNTDOWN: StartCountdownCommand,
     CommandType.STOP_COUNTDOWN: StopCountdownCommand,
+    CommandType.SET_TILE_ORDER: SetTileOrderCommand,
 }
 
 _PATH_FIELDS = frozenset({'file_path', 'output_dir'})
