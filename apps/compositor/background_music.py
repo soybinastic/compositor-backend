@@ -14,6 +14,7 @@ import gi
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst  # noqa: E402
 
+from apps.compositor.gst_pad_probes import make_running_time_offset_probe
 from apps.scenes.background_music import (
     normalize_background_music_config,
     resolve_background_music_url,
@@ -40,6 +41,7 @@ class BackgroundMusicBranch:
     mixer_sink_pad: Gst.Pad
     elements: list[Gst.Element] = field(default_factory=list)
     signal_handlers: list[tuple[Gst.Element, int]] = field(default_factory=list)
+    mixer_src_probe_id: int | None = None
     track_url: str | None = None
     track_title: str | None = None
 
@@ -212,12 +214,25 @@ class BackgroundMusicManager:
         for element in elements:
             self._pipeline.add(element)
 
+        audio_src_pad = audio_queue.get_static_pad('src')
+        if audio_src_pad is None:
+            raise RuntimeError('Failed to get background music queue src pad')
+
+        # uridecodebin emits file timestamps from zero; align to pipeline
+        # running time so force-live audiomixer does not drop BGM buffers.
+        mixer_src_probe_id = audio_src_pad.add_probe(
+            Gst.PadProbeType.BUFFER,
+            make_running_time_offset_probe(self._pipeline, continuous=True),
+            None,
+        )
+
         branch = BackgroundMusicBranch(
             uridecodebin=src,
             volume_element=volume_element,
             audio_queue=audio_queue,
             mixer_sink_pad=mixer_pad,
             elements=elements,
+            mixer_src_probe_id=mixer_src_probe_id,
             track_url=url,
             track_title=title or None,
         )
@@ -262,6 +277,13 @@ class BackgroundMusicManager:
         for element, handler_id in branch.signal_handlers:
             try:
                 element.disconnect(handler_id)
+            except Exception:
+                pass
+
+        src_pad = branch.audio_queue.get_static_pad('src')
+        if src_pad is not None and branch.mixer_src_probe_id is not None:
+            try:
+                src_pad.remove_probe(branch.mixer_src_probe_id)
             except Exception:
                 pass
 

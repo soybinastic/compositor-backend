@@ -17,6 +17,7 @@ gi.require_version('Gst', '1.0')
 from gi.repository import Gst  # noqa: E402
 
 from apps.compositor.background_music import BackgroundMusicManager
+from apps.compositor.gst_pad_probes import make_running_time_offset_probe
 from apps.compositor.ingest_branch import IngestStats
 from apps.compositor.pipeline_bus_monitor import PipelineBusMonitor
 from apps.compositor.video_mix_backend import (
@@ -1282,12 +1283,12 @@ class CompositorPipeline:
 
         video_src_pad.add_probe(
             Gst.PadProbeType.BUFFER,
-            self._make_running_time_offset_probe(),
+            make_running_time_offset_probe(self._pipeline),
             None,
         )
         audio_src_pad.add_probe(
             Gst.PadProbeType.BUFFER,
-            self._make_running_time_offset_probe(continuous=False),
+            make_running_time_offset_probe(self._pipeline, continuous=False),
             None,
         )
         video_src_pad.add_probe(
@@ -1798,53 +1799,6 @@ class CompositorPipeline:
                     stage,
                     count,
                     branch.participant_peer_id,
-                )
-            return Gst.PadProbeReturn.OK
-
-        return _probe
-
-    def _make_running_time_offset_probe(self, *, continuous: bool = True):
-        """
-        Keep buffer PTS aligned to pipeline running time.
-
-        Mediasoup RTP timestamps are an arbitrary offset from this pipeline's
-        clock. A one-shot offset drifts; compositor/audiomixer then hold or
-        drop buffers even while the decoder keeps producing frames.
-
-        For live still graphics (appsrc do-timestamp), pass continuous=False —
-        timestamps are already near running time after the first alignment.
-        Continuous re-offset on a leaky still pad can jitter the mixer.
-        """
-        state = {'logged': False, 'applied': False}
-
-        def _probe(pad: Gst.Pad, info: Gst.PadProbeInfo, _user_data) -> Gst.PadProbeReturn:
-            if self._pipeline is None:
-                return Gst.PadProbeReturn.OK
-
-            if not continuous and state['applied']:
-                return Gst.PadProbeReturn.OK
-
-            buffer = info.get_buffer()
-            if buffer is None or buffer.pts == Gst.CLOCK_TIME_NONE:
-                return Gst.PadProbeReturn.OK
-
-            clock = self._pipeline.get_clock()
-            if clock is None:
-                return Gst.PadProbeReturn.OK
-
-            running_time = clock.get_time() - self._pipeline.get_base_time()
-            if running_time < 0:
-                return Gst.PadProbeReturn.OK
-
-            pad.set_offset(int(running_time) - int(buffer.pts))
-            state['applied'] = True
-            if not state['logged']:
-                state['logged'] = True
-                logger.info(
-                    'Applied running-time pad offset=%s on %s (continuous=%s)',
-                    pad.get_offset(),
-                    pad.get_path_string(),
-                    continuous,
                 )
             return Gst.PadProbeReturn.OK
 
