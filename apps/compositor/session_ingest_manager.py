@@ -302,6 +302,40 @@ class SessionIngestManager:
     def is_streaming(self) -> bool:
         return self._compositor_pipeline.is_streaming()
 
+    def apply_background_music(
+        self,
+        config: dict | None,
+        *,
+        scene_id: str | None = None,
+    ) -> None:
+        self._compositor_pipeline.apply_background_music(config, scene_id=scene_id)
+
+    def play_background_music(self) -> dict:
+        return self._compositor_pipeline.play_background_music()
+
+    def pause_background_music(self) -> dict:
+        return self._compositor_pipeline.pause_background_music()
+
+    def resume_background_music(self) -> dict:
+        return self._compositor_pipeline.resume_background_music()
+
+    def stop_background_music(self) -> dict:
+        return self._compositor_pipeline.stop_background_music()
+
+    def set_background_music_volume(
+        self,
+        volume: float,
+        *,
+        muted: bool | None = None,
+    ) -> dict:
+        return self._compositor_pipeline.set_background_music_volume(
+            volume,
+            muted=muted,
+        )
+
+    def get_background_music_state(self) -> dict:
+        return self._compositor_pipeline.get_background_music_state()
+
     def get_status(self) -> SessionIngestStatus:
         pipeline_status = self._compositor_pipeline.get_status()
 

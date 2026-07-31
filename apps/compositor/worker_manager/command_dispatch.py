@@ -5,17 +5,24 @@ from __future__ import annotations
 from apps.compositor.commands import (
     AddRtmpSourceCommand,
     ChangeLayoutCommand,
+    GetBackgroundMusicStateCommand,
     GetStatusCommand,
+    PauseBackgroundMusicCommand,
+    PlayBackgroundMusicCommand,
     RemoveRtmpSourceCommand,
+    ResumeBackgroundMusicCommand,
+    SetBackgroundMusicVolumeCommand,
     SetTileOrderCommand,
     SessionCommand,
     StartCountdownCommand,
     StartRecordingCommand,
     StartStreamCommand,
+    StopBackgroundMusicCommand,
     StopCountdownCommand,
     StopRecordingCommand,
     StopStreamCommand,
     SyncProducersCommand,
+    UpdateBackgroundMusicCommand,
     UpdateGraphicsCommand,
 )
 from apps.compositor.session_ingest_manager import SessionIngestManager
@@ -94,5 +101,33 @@ def dispatch_command(ingest_manager: SessionIngestManager, command: SessionComma
             hidden_source_ids=command.hidden_source_ids,
         )
         return None
+
+    if isinstance(command, UpdateBackgroundMusicCommand):
+        ingest_manager.apply_background_music(
+            command.config,
+            scene_id=command.scene_id,
+        )
+        return None
+
+    if isinstance(command, PlayBackgroundMusicCommand):
+        return ingest_manager.play_background_music()
+
+    if isinstance(command, PauseBackgroundMusicCommand):
+        return ingest_manager.pause_background_music()
+
+    if isinstance(command, ResumeBackgroundMusicCommand):
+        return ingest_manager.resume_background_music()
+
+    if isinstance(command, StopBackgroundMusicCommand):
+        return ingest_manager.stop_background_music()
+
+    if isinstance(command, SetBackgroundMusicVolumeCommand):
+        return ingest_manager.set_background_music_volume(
+            command.volume,
+            muted=command.muted,
+        )
+
+    if isinstance(command, GetBackgroundMusicStateCommand):
+        return ingest_manager.get_background_music_state()
 
     raise TypeError(f'Unsupported command type: {type(command).__name__}')

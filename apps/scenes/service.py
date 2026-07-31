@@ -8,11 +8,17 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from apps.compositor.commands import ChangeLayoutCommand, StartCountdownCommand, StopCountdownCommand
+from apps.compositor.commands import (
+    ChangeLayoutCommand,
+    StartCountdownCommand,
+    StopCountdownCommand,
+    UpdateBackgroundMusicCommand,
+)
 from apps.compositor.tile_order_sync import send_tile_order_command
 from apps.compositor.worker_manager import get_session_worker_manager
 from apps.graphics.state import empty_graphics_state, snapshot_graphics_state
 from apps.compositor.tile_order import merge_sources_config
+from apps.scenes.background_music import normalize_background_music_config
 from apps.scenes.constants import (
     DEFAULT_BACKGROUND_MUSIC_CONFIG,
     DEFAULT_DEVICES_CONFIG,
@@ -367,6 +373,29 @@ class SceneService:
     ) -> None:
         send_tile_order_command(session, scene=scene)
         self._send_layout_command(session, scene.layout, scene.graphics_config)
+        self._send_background_music_command(session, scene)
+
+    def _send_background_music_command(
+        self,
+        session: StudioSession,
+        scene: StudioScene,
+    ) -> None:
+        worker_manager = get_session_worker_manager()
+        if not worker_manager.is_running(str(session.id)):
+            logger.info(
+                'Scene activated for session %s but session worker is not running '
+                '(background music not synced)',
+                session.id,
+            )
+            return
+
+        worker_manager.send_command(
+            UpdateBackgroundMusicCommand(
+                session_id=str(session.id),
+                scene_id=str(scene.id),
+                config=normalize_background_music_config(scene.background_music_config),
+            )
+        )
 
     def _send_layout_command(
         self,

@@ -18,4 +18,5 @@ DEFAULT_BACKGROUND_MUSIC_CONFIG: dict = {
     'track': None,
     'volume': 0.5,
     'loop': True,
+    'muted': False,
 }

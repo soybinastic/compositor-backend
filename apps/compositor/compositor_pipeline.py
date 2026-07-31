@@ -16,6 +16,7 @@ import gi
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst  # noqa: E402
 
+from apps.compositor.background_music import BackgroundMusicManager
 from apps.compositor.ingest_branch import IngestStats
 from apps.compositor.pipeline_bus_monitor import PipelineBusMonitor
 from apps.compositor.video_mix_backend import (
@@ -198,6 +199,7 @@ class CompositorPipeline:
         self._on_stream_permanent_failure: Callable[[str], None] | None = None
         self._composited_frames = 0
         self._lock = threading.Lock()
+        self._background_music = BackgroundMusicManager(session_id)
         self._bus_stop = threading.Event()
         self._bus_thread: threading.Thread | None = None
         # Static/top graphics drawn after the mixer (not compositor sink pads).
@@ -408,6 +410,7 @@ class CompositorPipeline:
                 raise RuntimeError('Failed to start compositor pipeline')
 
             self._start_bus_logger(pipeline)
+            self._background_music.attach(pipeline, audiomixer)
 
             logger.info(
                 'Compositor pipeline started for session %s '
@@ -464,6 +467,7 @@ class CompositorPipeline:
             for participant_id in list(self._participants.keys()):
                 self._remove_participant_unlocked(participant_id)
 
+            self._background_music.detach()
             self._graphics.stop()
             self._stop_bus_logger()
 
@@ -660,6 +664,51 @@ class CompositorPipeline:
         if branch is None or not source_id.startswith('rtmp-'):
             return None
         return branch.stats
+
+    def apply_background_music(
+        self,
+        config: dict | None,
+        *,
+        scene_id: str | None = None,
+    ) -> None:
+        with self._lock:
+            if self._pipeline is None or self._audiomixer is None:
+                raise RuntimeError('Compositor pipeline is not started')
+            self._background_music.apply_config(config, scene_id=scene_id)
+
+    def play_background_music(self) -> dict:
+        with self._lock:
+            self._background_music.play()
+            return self._background_music.get_runtime_state()
+
+    def pause_background_music(self) -> dict:
+        with self._lock:
+            self._background_music.pause()
+            return self._background_music.get_runtime_state()
+
+    def resume_background_music(self) -> dict:
+        with self._lock:
+            self._background_music.resume()
+            return self._background_music.get_runtime_state()
+
+    def stop_background_music(self) -> dict:
+        with self._lock:
+            self._background_music.stop()
+            return self._background_music.get_runtime_state()
+
+    def set_background_music_volume(
+        self,
+        volume: float,
+        *,
+        muted: bool | None = None,
+    ) -> dict:
+        with self._lock:
+            self._background_music.set_volume(volume, muted=muted)
+            return self._background_music.get_runtime_state()
+
+    def get_background_music_state(self) -> dict:
+        with self._lock:
+            return self._background_music.get_runtime_state()
 
     def set_tile_order(
         self,

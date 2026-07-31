@@ -11,17 +11,24 @@ from apps.compositor.commands import (
     ChangeLayoutCommand,
     CommandResult,
     CommandType,
+    GetBackgroundMusicStateCommand,
     GetStatusCommand,
+    PauseBackgroundMusicCommand,
+    PlayBackgroundMusicCommand,
     RemoveRtmpSourceCommand,
+    ResumeBackgroundMusicCommand,
+    SetBackgroundMusicVolumeCommand,
     SetTileOrderCommand,
     SessionCommand,
     StartCountdownCommand,
     StartRecordingCommand,
     StartStreamCommand,
+    StopBackgroundMusicCommand,
     StopCountdownCommand,
     StopRecordingCommand,
     StopStreamCommand,
     SyncProducersCommand,
+    UpdateBackgroundMusicCommand,
     UpdateGraphicsCommand,
 )
 from apps.compositor.session_ingest_manager import (
@@ -44,6 +51,13 @@ _COMMAND_TYPES: dict[CommandType, type[SessionCommand]] = {
     CommandType.START_COUNTDOWN: StartCountdownCommand,
     CommandType.STOP_COUNTDOWN: StopCountdownCommand,
     CommandType.SET_TILE_ORDER: SetTileOrderCommand,
+    CommandType.UPDATE_BACKGROUND_MUSIC: UpdateBackgroundMusicCommand,
+    CommandType.PLAY_BACKGROUND_MUSIC: PlayBackgroundMusicCommand,
+    CommandType.PAUSE_BACKGROUND_MUSIC: PauseBackgroundMusicCommand,
+    CommandType.RESUME_BACKGROUND_MUSIC: ResumeBackgroundMusicCommand,
+    CommandType.STOP_BACKGROUND_MUSIC: StopBackgroundMusicCommand,
+    CommandType.SET_BACKGROUND_MUSIC_VOLUME: SetBackgroundMusicVolumeCommand,
+    CommandType.GET_BACKGROUND_MUSIC_STATE: GetBackgroundMusicStateCommand,
 }
 
 _PATH_FIELDS = frozenset({'file_path', 'output_dir'})
