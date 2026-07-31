@@ -68,6 +68,21 @@ def _make_sink(factory_names: tuple[str, ...], name: str) -> Gst.Element:
     raise RuntimeError(f'No GStreamer sink available from {factory_names}')
 
 
+def rtmp_sink_factory_names(destination_url: str) -> tuple[str, ...]:
+    """Return RTMP sink factories to try, preferring TLS-capable sinks for RTMPS."""
+    if destination_url.strip().lower().startswith('rtmps://'):
+        return ('rtmp2sink', 'rtmpsink')
+    return ('rtmpsink', 'rtmp2sink')
+
+
+def _configure_rtmp_sink(sink: Gst.Element) -> None:
+    """Tune live RTMP sinks so a slow network write cannot block the compositor."""
+    if sink.find_property('sync') is not None:
+        sink.set_property('sync', False)
+    if sink.find_property('async') is not None:
+        sink.set_property('async', False)
+
+
 def _configure_streaming_queue(queue: Gst.Element) -> None:
     """Bounded leaky queues so a slow RTMP sink cannot stall the compositor."""
     queue.set_property('leaky', 2)
@@ -178,16 +193,17 @@ def build_rtmp_streaming_branch(
         branch_suffix=suffix,
     )
     flvmux = Gst.ElementFactory.make('flvmux', f'stream_flvmux_{suffix}')
-    sink = _make_sink(('rtmpsink', 'rtmp2sink'), f'stream_rtmp_sink_{suffix}')
+    sink = _make_sink(
+        rtmp_sink_factory_names(destination_url),
+        f'stream_rtmp_sink_{suffix}',
+    )
 
     if flvmux is None:
         raise RuntimeError('Failed to create flvmux for RTMP streaming')
 
     flvmux.set_property('streamable', True)
     sink.set_property('location', destination_url.strip())
-    if sink.get_factory().get_name() == 'rtmpsink':
-        sink.set_property('sync', False)
-        sink.set_property('async', False)
+    _configure_rtmp_sink(sink)
 
     elements = [*video_chain, *audio_chain, flvmux, sink]
 

@@ -777,13 +777,22 @@ class CompositorPipeline:
         monitor = PipelineBusMonitor(
             self._pipeline,
             watched_elements=watched,
-            on_error=lambda error_message, url=destination_url: self._handle_stream_error(
+            on_error=lambda error_message, url=destination_url: self._dispatch_stream_error(
                 url,
                 error_message,
             ),
         )
         monitor.start()
         self._stream_monitors[destination_url] = monitor
+
+    def _dispatch_stream_error(self, destination_url: str, error_message: str) -> None:
+        """Handle stream errors off the bus-monitor thread (reconnect may stop/join it)."""
+        threading.Thread(
+            target=self._handle_stream_error,
+            args=(destination_url, error_message),
+            name=f'stream-error-{self.session_id[:8]}',
+            daemon=True,
+        ).start()
 
     def _stop_stream_monitor(self, destination_url: str) -> None:
         monitor = self._stream_monitors.pop(destination_url, None)
