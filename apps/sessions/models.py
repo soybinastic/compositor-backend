@@ -48,6 +48,13 @@ class StudioSession(models.Model):
         null=True,
     )
     graphics_config = models.JSONField(default=dict, blank=True)
+    active_scene = models.ForeignKey(
+        'scenes.StudioScene',
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='+',
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     ended_at = models.DateTimeField(blank=True, null=True)
 

@@ -28,6 +28,7 @@ class ValidateInviteSerializer(serializers.Serializer):
 class SessionSerializer(serializers.ModelSerializer):
     session_id = serializers.UUIDField(source='id', read_only=True)
     room_id = serializers.CharField(read_only=True)
+    active_scene_id = serializers.UUIDField(read_only=True, allow_null=True)
 
     class Meta:
         model = StudioSession
@@ -37,6 +38,7 @@ class SessionSerializer(serializers.ModelSerializer):
             'host_display_name',
             'layout',
             'status',
+            'active_scene_id',
             'created_at',
             'ended_at',
         ]
