@@ -16,6 +16,7 @@ from apps.graphics.constants import (
     LAYER_BACKGROUND,
     LAYER_BANNER,
     LAYER_CHAT,
+    LAYER_COUNTDOWN,
     LAYER_LOGO,
     LAYER_OVERLAY,
     LAYER_QR,
@@ -26,6 +27,7 @@ from apps.graphics.constants import (
 from apps.graphics.geometry import (
     banner_geometry,
     chat_geometry,
+    countdown_geometry,
     logo_geometry,
     overlay_geometry,
     qr_geometry,
@@ -50,6 +52,7 @@ from apps.graphics.post_mixer_overlays import (
 from apps.graphics.renderers.pil_overlays import (
     render_banner_bar,
     render_chat_panel,
+    render_countdown_overlay,
     render_ticker_bar,
 )
 from apps.graphics.visibility import (
@@ -83,6 +86,10 @@ class GraphicsController:
         self._video_cutouts: list[tuple[int, int, int, int]] = []
         self._ticker_stop = threading.Event()
         self._ticker_thread: threading.Thread | None = None
+        self._countdown_stop = threading.Event()
+        self._countdown_thread: threading.Thread | None = None
+        self._countdown_started_at = 0.0
+        self._countdown_duration = 0
         self._pending_state: dict[str, Any] = {}
         self._stack_fingerprint: object | None = None
 
@@ -98,6 +105,7 @@ class GraphicsController:
     def stop(self) -> None:
         """Full teardown (pipeline shutdown)."""
         self._stop_ticker_animation()
+        self._stop_countdown_animation()
         for key in list(self._branches.keys()):
             self._remove_branch(key)
         for key in list(self._pixbuf_layers.keys()):
@@ -106,6 +114,7 @@ class GraphicsController:
     def clear_live(self) -> None:
         """Clear live graphics (post-mixer overlays). Keeps config persistence separate."""
         self._stop_ticker_animation()
+        self._stop_countdown_animation()
         for key in list(self._pixbuf_layers.keys()):
             self._clear_pixbuf_layer(key)
         self._video_cutouts = []
@@ -555,6 +564,42 @@ class GraphicsController:
         self._set_pixbuf_layer(LAYER_CHAT, img, geometry=geom, signature=sig)
         self._reposition_ticker_if_present('')
 
+    def start_countdown(self, *, started_at_epoch: float, duration_seconds: int) -> None:
+        self._countdown_started_at = started_at_epoch
+        self._countdown_duration = max(1, int(duration_seconds))
+        self._stop_countdown_animation()
+        self._countdown_stop.clear()
+        self._render_countdown_frame()
+        self._start_countdown_animation()
+
+    def stop_countdown(self) -> None:
+        self._stop_countdown_animation()
+        self._clear_pixbuf_layer(LAYER_COUNTDOWN)
+
+    def _countdown_seconds_remaining(self) -> int:
+        elapsed = time.time() - self._countdown_started_at
+        return max(0, int(self._countdown_duration - elapsed + 0.999))
+
+    def _render_countdown_frame(self) -> None:
+        remaining = self._countdown_seconds_remaining()
+        img = render_countdown_overlay(
+            canvas_width=self._owner.width,
+            canvas_height=self._owner.height,
+            seconds_remaining=remaining,
+        )
+        geom = countdown_geometry(
+            self._owner.width,
+            self._owner.height,
+            box_width=img.width,
+            box_height=img.height,
+        )
+        self._set_pixbuf_layer(
+            LAYER_COUNTDOWN,
+            img,
+            geometry=geom,
+            signature=f'countdown:{remaining}',
+        )
+
     # --- attach helpers --------------------------------------------------
 
     def _set_pixbuf_layer(
@@ -580,6 +625,13 @@ class GraphicsController:
             apply_pixbuf_to_overlay(element, state._image, geometry, state=state)
             return state
 
+        if layer_key == LAYER_COUNTDOWN:
+            element = self._owner._post_mixer_overlays.get(LAYER_COUNTDOWN)
+            if element is None:
+                raise RuntimeError('Post-mixer overlay element missing for countdown')
+            apply_pixbuf_to_overlay(element, state._image, geometry, state=state)
+            return state
+
         if rebuild:
             self._rebuild_graphics_stack()
         else:
@@ -602,12 +654,26 @@ class GraphicsController:
                 return
             apply_pixbuf_to_overlay(element, state._image, geometry, state=state)
             return
+        if layer_key == LAYER_COUNTDOWN:
+            element = self._owner._post_mixer_overlays.get(LAYER_COUNTDOWN)
+            if element is None:
+                return
+            apply_pixbuf_to_overlay(element, state._image, geometry, state=state)
+            return
         self._rebuild_graphics_stack()
 
     def _clear_pixbuf_layer(self, layer_key: str) -> None:
         state = self._pixbuf_layers.pop(layer_key, None)
         if layer_key == LAYER_TICKER:
             element = self._owner._post_mixer_overlays.get(LAYER_TICKER)
+            if element is not None:
+                clear_pixbuf_overlay(
+                    element,
+                    state or PixbufLayerState(layer_key=layer_key),
+                )
+            return
+        if layer_key == LAYER_COUNTDOWN:
+            element = self._owner._post_mixer_overlays.get(LAYER_COUNTDOWN)
             if element is not None:
                 clear_pixbuf_overlay(
                     element,
@@ -736,6 +802,32 @@ class GraphicsController:
         if self._ticker_thread is not None:
             self._ticker_thread.join(timeout=1.0)
             self._ticker_thread = None
+
+    def _start_countdown_animation(self) -> None:
+        self._countdown_stop.clear()
+        owner = self._owner
+
+        def _run() -> None:
+            while not self._countdown_stop.is_set():
+                if self._countdown_seconds_remaining() <= 0:
+                    self._render_countdown_frame()
+                    break
+                self._render_countdown_frame()
+                if self._countdown_stop.wait(1.0):
+                    break
+
+        self._countdown_thread = threading.Thread(
+            target=_run,
+            name=f'countdown-{owner.session_id[:8]}',
+            daemon=True,
+        )
+        self._countdown_thread.start()
+
+    def _stop_countdown_animation(self) -> None:
+        self._countdown_stop.set()
+        if self._countdown_thread is not None:
+            self._countdown_thread.join(timeout=1.0)
+            self._countdown_thread = None
 
 
 def _cover_resize(image, width: int, height: int):

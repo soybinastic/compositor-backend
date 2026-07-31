@@ -669,10 +669,15 @@ class CompositorPipeline:
         pending = graphics_state if graphics_state is not None else self._graphics._pending_state
         prepared_bg = self._graphics.prefetch_background_still(pending or {}, layout)
         with self._lock:
-            if graphics_state is not None:
-                self._graphics.set_pending_state(graphics_state)
             self._layout = layout
             self._layout_manager.set_strategy(layout)
+            if graphics_state is not None:
+                self._graphics.apply_state(
+                    graphics_state,
+                    layout=layout,
+                    layout_only=False,
+                    prepared_background=prepared_bg,
+                )
             self._apply_layout_unlocked(prepared_background=prepared_bg)
 
     def apply_graphics(
@@ -699,6 +704,21 @@ class CompositorPipeline:
         with self._lock:
             self._graphics.clear_live()
             self._apply_layout_unlocked()
+
+    def start_countdown(self, *, started_at_epoch: float, duration_seconds: int) -> None:
+        with self._lock:
+            if self._pipeline is None:
+                raise RuntimeError('Compositor pipeline is not started')
+            self._graphics.start_countdown(
+                started_at_epoch=started_at_epoch,
+                duration_seconds=duration_seconds,
+            )
+
+    def stop_countdown(self) -> None:
+        with self._lock:
+            if self._pipeline is None:
+                return
+            self._graphics.stop_countdown()
 
     def get_participant_stats(self, participant_peer_id: str) -> IngestStats | None:
         branch = self._participants.get(participant_peer_id)

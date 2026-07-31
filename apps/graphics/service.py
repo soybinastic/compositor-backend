@@ -78,6 +78,10 @@ class GraphicsService:
         session.graphics_config = merged
         session.save(update_fields=['graphics_config'])
 
+        from apps.scenes.service import SceneService
+
+        SceneService(self._sessions).sync_active_scene_graphics(session, merged)
+
         self._apply_to_pipeline(session, merged, layout_only=False)
         return snapshot_graphics_state(merged)
 

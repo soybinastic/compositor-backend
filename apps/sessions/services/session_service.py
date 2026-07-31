@@ -82,6 +82,10 @@ class SessionService:
             },
         )
 
+        from apps.scenes.service import SceneService
+
+        SceneService(self).ensure_default_scene(session)
+
         return SessionCreateResult(
             session=session,
             invite_url=self._invite_service.build_invite_url(session),
@@ -99,6 +103,10 @@ class SessionService:
         self._assert_not_ended(session)
         session.layout = layout
         session = self._repository.save(session)
+
+        from apps.scenes.service import SceneService
+
+        SceneService(self).sync_active_scene_layout(session, layout)
 
         from apps.compositor.commands import ChangeLayoutCommand
         from apps.compositor.worker_manager import get_session_worker_manager

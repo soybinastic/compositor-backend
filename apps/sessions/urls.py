@@ -15,6 +15,11 @@ from apps.sources.views import (
     SessionRtmpSourceDeleteView,
     SessionRtmpSourceListView,
 )
+from apps.scenes.views import (
+    SessionSceneActivateView,
+    SessionSceneDetailView,
+    SessionSceneListCreateView,
+)
 from apps.sessions.views import (
     HealthView,
     MetricsView,
@@ -89,5 +94,20 @@ urlpatterns = [
         'sessions/<uuid:session_id>/rtmp-sources/<str:source_id>/',
         SessionRtmpSourceDeleteView.as_view(),
         name='session-rtmp-source-delete',
+    ),
+    path(
+        'sessions/<uuid:session_id>/scenes/',
+        SessionSceneListCreateView.as_view(),
+        name='session-scene-list-create',
+    ),
+    path(
+        'sessions/<uuid:session_id>/scenes/<uuid:scene_id>/',
+        SessionSceneDetailView.as_view(),
+        name='session-scene-detail',
+    ),
+    path(
+        'sessions/<uuid:session_id>/scenes/<uuid:scene_id>/activate/',
+        SessionSceneActivateView.as_view(),
+        name='session-scene-activate',
     ),
 ]

@@ -42,6 +42,7 @@ INSTALLED_APPS = [
     'apps.streaming.apps.StreamingConfig',
     'apps.sources.apps.SourcesConfig',
     'apps.graphics.apps.GraphicsConfig',
+    'apps.scenes.apps.ScenesConfig',
 ]
 
 MIDDLEWARE = [

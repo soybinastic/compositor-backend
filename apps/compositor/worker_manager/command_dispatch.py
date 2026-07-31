@@ -8,8 +8,10 @@ from apps.compositor.commands import (
     GetStatusCommand,
     RemoveRtmpSourceCommand,
     SessionCommand,
+    StartCountdownCommand,
     StartRecordingCommand,
     StartStreamCommand,
+    StopCountdownCommand,
     StopRecordingCommand,
     StopStreamCommand,
     SyncProducersCommand,
@@ -72,5 +74,16 @@ def dispatch_command(ingest_manager: SessionIngestManager, command: SessionComma
 
     if isinstance(command, GetStatusCommand):
         return ingest_manager.get_status()
+
+    if isinstance(command, StartCountdownCommand):
+        ingest_manager.start_countdown(
+            started_at_epoch=command.started_at_epoch,
+            duration_seconds=command.duration_seconds,
+        )
+        return None
+
+    if isinstance(command, StopCountdownCommand):
+        ingest_manager.stop_countdown()
+        return None
 
     raise TypeError(f'Unsupported command type: {type(command).__name__}')
