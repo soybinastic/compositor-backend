@@ -2,7 +2,9 @@
 
 DEFAULT_DEVICES_CONFIG: dict = {
     'cameraId': None,
+    'cameraLabel': None,
     'microphoneId': None,
+    'microphoneLabel': None,
     'speakerId': None,
 }
 
