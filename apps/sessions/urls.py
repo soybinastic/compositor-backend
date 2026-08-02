@@ -20,6 +20,10 @@ from apps.scenes.views import (
     SessionSceneDetailView,
     SessionSceneListCreateView,
 )
+from apps.background_music.views import (
+    SessionBackgroundMusicStateView,
+    SessionSceneBackgroundMusicTransportView,
+)
 from apps.sessions.views import (
     HealthView,
     MetricsView,
@@ -109,5 +113,15 @@ urlpatterns = [
         'sessions/<uuid:session_id>/scenes/<uuid:scene_id>/activate/',
         SessionSceneActivateView.as_view(),
         name='session-scene-activate',
+    ),
+    path(
+        'sessions/<uuid:session_id>/background-music/',
+        SessionBackgroundMusicStateView.as_view(),
+        name='session-background-music-state',
+    ),
+    path(
+        'sessions/<uuid:session_id>/scenes/<uuid:scene_id>/background-music/<str:action>/',
+        SessionSceneBackgroundMusicTransportView.as_view(),
+        name='session-scene-background-music-transport',
     ),
 ]

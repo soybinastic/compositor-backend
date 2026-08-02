@@ -8,16 +8,23 @@ from apps.compositor.commands import (
     ChangeLayoutCommand,
     CommandResult,
     CommandType,
+    GetBackgroundMusicStateCommand,
     GetStatusCommand,
+    PauseBackgroundMusicCommand,
+    PlayBackgroundMusicCommand,
     RemoveRtmpSourceCommand,
+    ResumeBackgroundMusicCommand,
+    SetBackgroundMusicVolumeCommand,
     SetTileOrderCommand,
     StartRecordingCommand,
     StartCountdownCommand,
     StartStreamCommand,
+    StopBackgroundMusicCommand,
     StopCountdownCommand,
     StopRecordingCommand,
     StopStreamCommand,
     SyncProducersCommand,
+    UpdateBackgroundMusicCommand,
     UpdateGraphicsCommand,
 )
 from apps.compositor.session_ingest_manager import SessionIngestStatus
@@ -191,4 +198,27 @@ def _sample_command(command_type: CommandType):
             slot_assignments={'0': 'host-a'},
             hidden_source_ids=['guest-x'],
         )
+    if command_type == CommandType.UPDATE_BACKGROUND_MUSIC:
+        return UpdateBackgroundMusicCommand(
+            session_id=session_id,
+            scene_id='scene-1',
+            config={'version': 1, 'enabled': False, 'track': None},
+        )
+    if command_type == CommandType.PLAY_BACKGROUND_MUSIC:
+        return PlayBackgroundMusicCommand(session_id=session_id, scene_id='scene-1')
+    if command_type == CommandType.PAUSE_BACKGROUND_MUSIC:
+        return PauseBackgroundMusicCommand(session_id=session_id, scene_id='scene-1')
+    if command_type == CommandType.RESUME_BACKGROUND_MUSIC:
+        return ResumeBackgroundMusicCommand(session_id=session_id, scene_id='scene-1')
+    if command_type == CommandType.STOP_BACKGROUND_MUSIC:
+        return StopBackgroundMusicCommand(session_id=session_id, scene_id='scene-1')
+    if command_type == CommandType.SET_BACKGROUND_MUSIC_VOLUME:
+        return SetBackgroundMusicVolumeCommand(
+            session_id=session_id,
+            scene_id='scene-1',
+            volume=0.5,
+            muted=False,
+        )
+    if command_type == CommandType.GET_BACKGROUND_MUSIC_STATE:
+        return GetBackgroundMusicStateCommand(session_id=session_id)
     raise AssertionError(f'Unhandled command type: {command_type}')

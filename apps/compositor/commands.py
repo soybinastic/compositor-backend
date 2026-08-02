@@ -25,6 +25,13 @@ class CommandType(str, Enum):
     START_COUNTDOWN = 'StartCountdown'
     STOP_COUNTDOWN = 'StopCountdown'
     SET_TILE_ORDER = 'SetTileOrder'
+    UPDATE_BACKGROUND_MUSIC = 'UpdateBackgroundMusic'
+    PLAY_BACKGROUND_MUSIC = 'PlayBackgroundMusic'
+    PAUSE_BACKGROUND_MUSIC = 'PauseBackgroundMusic'
+    RESUME_BACKGROUND_MUSIC = 'ResumeBackgroundMusic'
+    STOP_BACKGROUND_MUSIC = 'StopBackgroundMusic'
+    SET_BACKGROUND_MUSIC_VOLUME = 'SetBackgroundMusicVolume'
+    GET_BACKGROUND_MUSIC_STATE = 'GetBackgroundMusicState'
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -156,6 +163,70 @@ class SetTileOrderCommand(SessionCommand):
     @property
     def command_type(self) -> CommandType:
         return CommandType.SET_TILE_ORDER
+
+
+@dataclass(frozen=True, kw_only=True)
+class UpdateBackgroundMusicCommand(SessionCommand):
+    scene_id: str
+    config: dict[str, Any]
+
+    @property
+    def command_type(self) -> CommandType:
+        return CommandType.UPDATE_BACKGROUND_MUSIC
+
+
+@dataclass(frozen=True, kw_only=True)
+class PlayBackgroundMusicCommand(SessionCommand):
+    scene_id: str
+
+    @property
+    def command_type(self) -> CommandType:
+        return CommandType.PLAY_BACKGROUND_MUSIC
+
+
+@dataclass(frozen=True, kw_only=True)
+class PauseBackgroundMusicCommand(SessionCommand):
+    scene_id: str
+
+    @property
+    def command_type(self) -> CommandType:
+        return CommandType.PAUSE_BACKGROUND_MUSIC
+
+
+@dataclass(frozen=True, kw_only=True)
+class ResumeBackgroundMusicCommand(SessionCommand):
+    scene_id: str
+
+    @property
+    def command_type(self) -> CommandType:
+        return CommandType.RESUME_BACKGROUND_MUSIC
+
+
+@dataclass(frozen=True, kw_only=True)
+class StopBackgroundMusicCommand(SessionCommand):
+    scene_id: str
+
+    @property
+    def command_type(self) -> CommandType:
+        return CommandType.STOP_BACKGROUND_MUSIC
+
+
+@dataclass(frozen=True, kw_only=True)
+class SetBackgroundMusicVolumeCommand(SessionCommand):
+    scene_id: str
+    volume: float
+    muted: bool | None = None
+
+    @property
+    def command_type(self) -> CommandType:
+        return CommandType.SET_BACKGROUND_MUSIC_VOLUME
+
+
+@dataclass(frozen=True, kw_only=True)
+class GetBackgroundMusicStateCommand(SessionCommand):
+    @property
+    def command_type(self) -> CommandType:
+        return CommandType.GET_BACKGROUND_MUSIC_STATE
 
 
 @dataclass

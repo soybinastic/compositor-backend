@@ -91,6 +91,95 @@ class SceneApiTests(TestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         mock_send_tile_order.assert_called_once()
 
+    @patch('apps.scenes.service.get_session_worker_manager')
+    def test_activate_camera_scene_sends_background_music_when_worker_running(
+        self,
+        mock_get_manager,
+    ):
+        manager = MagicMock()
+        manager.is_running.return_value = True
+        mock_get_manager.return_value = manager
+
+        list_response = self.client.get(f'{self.base}/')
+        scene_id = list_response.data[0]['scene_id']
+
+        scene = StudioScene.objects.get(id=scene_id)
+        scene.background_music_config = {
+            'version': 1,
+            'enabled': False,
+            'track': {
+                'asset_id': 'track-1',
+                'url': 'https://studio-assets.b-cdn.net/bgm/twilight_drift.mp3',
+                'title': 'Twilight Drift',
+            },
+            'volume': 0.5,
+            'loop': True,
+            'muted': False,
+        }
+        scene.save(update_fields=['background_music_config'])
+
+        with patch('apps.scenes.service.send_tile_order_command'):
+            response = self.client.post(f'{self.base}/{scene_id}/activate/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        from apps.compositor.commands import UpdateBackgroundMusicCommand
+
+        bgm_calls = [
+            call.args[0]
+            for call in manager.send_command.call_args_list
+            if isinstance(call.args[0], UpdateBackgroundMusicCommand)
+        ]
+        self.assertEqual(len(bgm_calls), 1)
+        command = bgm_calls[0]
+        self.assertEqual(command.scene_id, scene_id)
+        self.assertEqual(
+            command.config['track']['url'],
+            'https://studio-assets.b-cdn.net/bgm/twilight_drift.mp3',
+        )
+
+    @patch('apps.scenes.service.get_session_worker_manager')
+    def test_patch_active_scene_background_music_syncs_to_worker(
+        self,
+        mock_get_manager,
+    ):
+        manager = MagicMock()
+        manager.is_running.return_value = True
+        mock_get_manager.return_value = manager
+
+        list_response = self.client.get(f'{self.base}/')
+        scene_id = list_response.data[0]['scene_id']
+
+        with patch('apps.scenes.service.send_tile_order_command'):
+            response = self.client.patch(
+                f'{self.base}/{scene_id}/',
+                {
+                    'background_music': {
+                        'track': {
+                            'asset_id': 'track-2',
+                            'url': 'https://studio-assets.b-cdn.net/bgm/morning_light.mp3',
+                            'title': 'Morning Light',
+                        },
+                    },
+                },
+                format='json',
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        from apps.compositor.commands import UpdateBackgroundMusicCommand
+
+        bgm_calls = [
+            call.args[0]
+            for call in manager.send_command.call_args_list
+            if isinstance(call.args[0], UpdateBackgroundMusicCommand)
+        ]
+        self.assertEqual(len(bgm_calls), 1)
+        self.assertEqual(
+            bgm_calls[0].config['track']['url'],
+            'https://studio-assets.b-cdn.net/bgm/morning_light.mp3',
+        )
+
     def test_rename_scene(self):
         list_response = self.client.get(f'{self.base}/')
         scene_id = list_response.data[0]['scene_id']
