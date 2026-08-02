@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -24,6 +25,8 @@ from apps.streaming.exceptions import (
 from apps.streaming.models import DestinationType, SessionStream, StreamDestination, StreamStatus
 from core import events
 from core.webhooks import emit_event
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -64,6 +67,8 @@ class StreamingService:
         destination_url: str = '',
         destination_urls: list[str] | None = None,
         destinations: list[dict[str, str]] | None = None,
+        tenant_id: str | None = None,
+        twitch_chat_enabled: bool = False,
     ) -> StreamResult:
         session = self._get_active_session(session_id)
         self._assert_no_active_stream(session)
@@ -152,11 +157,19 @@ class StreamingService:
                 'destination_urls': resolved_urls,
             },
         )
-        return self._to_result(stream)
+        result = self._to_result(stream)
+        if tenant_id and self._should_enable_twitch_chat(
+            destination_type=destination_type,
+            rtmp_entries=rtmp_entries,
+            twitch_chat_enabled=twitch_chat_enabled,
+        ):
+            self._start_twitch_chat(session_id, tenant_id)
+        return result
 
     def stop_stream(self, session_id: uuid.UUID) -> StreamResult:
         session = self._get_active_session(session_id)
         stream = self._get_active_stream(session)
+        self._stop_twitch_chat(session_id)
 
         worker_manager = get_session_worker_manager()
         if not worker_manager.is_running(str(session_id)):
@@ -211,6 +224,7 @@ class StreamingService:
         if stream is None:
             return None
 
+        self._stop_twitch_chat(session_id)
         worker_manager = get_session_worker_manager()
         if worker_manager.is_running(str(session_id)) and worker_manager.is_streaming(
             str(session_id)
@@ -245,6 +259,7 @@ class StreamingService:
         if stream is None:
             return None
 
+        self._stop_twitch_chat(session_id)
         stream.mark_failed()
         stream.save(update_fields=['status', 'stopped_at'])
         self._mark_all_destinations(stream, StreamStatus.FAILED)
@@ -427,3 +442,32 @@ class StreamingService:
             started_at=stream.started_at,
             stopped_at=stream.stopped_at,
         )
+
+    @staticmethod
+    def _should_enable_twitch_chat(
+        *,
+        destination_type: str,
+        rtmp_entries: list[tuple[str, str]],
+        twitch_chat_enabled: bool,
+    ) -> bool:
+        if not twitch_chat_enabled or destination_type != DestinationType.RTMP:
+            return False
+        return any('twitch.tv' in url.lower() for url, _label in rtmp_entries)
+
+    @staticmethod
+    def _start_twitch_chat(session_id: uuid.UUID, tenant_id: str) -> None:
+        try:
+            from apps.integrations.twitch_chat.manager import get_twitch_chat_manager
+
+            get_twitch_chat_manager().start(session_id, tenant_id)
+        except Exception:
+            logger.exception('Failed to start Twitch chat listener for session %s', session_id)
+
+    @staticmethod
+    def _stop_twitch_chat(session_id: uuid.UUID) -> None:
+        try:
+            from apps.integrations.twitch_chat.manager import get_twitch_chat_manager
+
+            get_twitch_chat_manager().stop(session_id)
+        except Exception:
+            logger.exception('Failed to stop Twitch chat listener for session %s', session_id)

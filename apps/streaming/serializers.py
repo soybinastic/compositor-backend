@@ -17,6 +17,8 @@ class StartStreamSerializer(serializers.Serializer):
         allow_empty=False,
     )
     destinations = StreamDestinationInputSerializer(many=True, required=False, allow_empty=False)
+    tenant_id = serializers.UUIDField(required=False, allow_null=True)
+    twitch_chat_enabled = serializers.BooleanField(required=False, default=False)
 
     def validate(self, attrs):
         destination_type = attrs['destination_type']

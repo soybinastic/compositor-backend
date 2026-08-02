@@ -208,6 +208,9 @@ STREAMING_AUDIO_BITRATE = int(os.getenv('STREAMING_AUDIO_BITRATE', '192000'))
 STREAMING_EOS_TIMEOUT_SEC = float(os.getenv('STREAMING_EOS_TIMEOUT_SEC', '5'))
 DEFAULT_RTMP_URL = os.getenv('DEFAULT_RTMP_URL', '')
 
+# studio-persistence (Twitch chat credentials for live overlay)
+PERSISTENCE_API_URL = os.getenv('PERSISTENCE_API_URL', 'http://localhost:8001/api/persistence')
+
 WEBHOOK_URL = os.getenv('WEBHOOK_URL', '')
 WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET', '')
 WEBHOOK_TIMEOUT_SEC = float(os.getenv('WEBHOOK_TIMEOUT_SEC', '5'))

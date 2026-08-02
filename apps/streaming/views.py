@@ -82,6 +82,8 @@ class SessionStreamStartView(APIView):
                 ]
                 if rtmp_entries
                 else None,
+                tenant_id=str(validated['tenant_id']) if validated.get('tenant_id') else None,
+                twitch_chat_enabled=validated.get('twitch_chat_enabled', False),
             )
         except SessionNotFoundError:
             return Response(
