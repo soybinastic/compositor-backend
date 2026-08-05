@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing import Any
 
 from apps.graphics.constants import (
+    BANNER_BAR_GAP,
+    BANNER_BOTTOM_INSET,
     BANNER_X,
     CHAT_EDGE_MARGIN,
     CHAT_PANEL_HEIGHT,
@@ -137,21 +139,31 @@ def overlay_geometry(
     return 0, 0, canvas_w, canvas_h
 
 
-def banner_geometry(
+def banner_layout(
     canvas_w: int,
     canvas_h: int,
     *,
-    primary: bool,
+    bar_width: int,
+    primary_height: int,
+    secondary_height: int,
     font_size: int,
-    bar_height: int,
-) -> tuple[int, int, int, int]:
+    has_secondary: bool,
+) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int] | None]:
+    """Return (primary_geom, secondary_geom) for stacked lower-third bars."""
     extra = 40 if font_size >= 70 else 0
-    if primary:
-        y = canvas_h - bar_height * 2 - 96 - extra
-    else:
-        y = canvas_h - bar_height - 40 - extra
-    w = max(1, canvas_w - BANNER_X * 2)
-    return BANNER_X, max(0, y), w, bar_height
+    x = BANNER_X
+    w = max(1, min(bar_width, canvas_w - BANNER_X * 2))
+
+    if has_secondary:
+        secondary_y = canvas_h - secondary_height - BANNER_BOTTOM_INSET - extra
+        primary_y = secondary_y - BANNER_BAR_GAP - primary_height
+        return (
+            (x, max(0, primary_y), w, primary_height),
+            (x, max(0, secondary_y), w, secondary_height),
+        )
+
+    primary_y = canvas_h - primary_height - BANNER_BOTTOM_INSET - extra
+    return (x, max(0, primary_y), w, primary_height), None
 
 
 def ticker_geometry(

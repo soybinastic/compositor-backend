@@ -11,8 +11,10 @@ from apps.graphics.constants import (
     ZORDER_QR,
     ZORDER_TICKER,
 )
-from apps.graphics.geometry import logo_geometry, overlay_geometry, qr_geometry
+from apps.graphics.constants import BANNER_X
+from apps.graphics.geometry import banner_layout, logo_geometry, overlay_geometry, qr_geometry
 from apps.graphics.gst_branches import content_signature, is_video_url
+from apps.graphics.renderers.pil_overlays import banner_bar_height, banner_content_width
 
 
 class ZOrderTests(SimpleTestCase):
@@ -55,3 +57,48 @@ class GeometryTests(SimpleTestCase):
 
     def test_overlay_full_frame_default(self):
         self.assertEqual(overlay_geometry(1920, 1080, {}), (0, 0, 1920, 1080))
+
+
+class BannerLayoutTests(SimpleTestCase):
+    def test_dual_bar_gap_is_tight(self):
+        primary_h = banner_bar_height(36)
+        secondary_h = banner_bar_height(28)
+        primary_geom, secondary_geom = banner_layout(
+            1920,
+            1080,
+            bar_width=420,
+            primary_height=primary_h,
+            secondary_height=secondary_h,
+            font_size=36,
+            has_secondary=True,
+        )
+        assert secondary_geom is not None
+        _, primary_y, _, _ = primary_geom
+        _, secondary_y, _, _ = secondary_geom
+        gap = secondary_y - (primary_y + primary_h)
+        self.assertEqual(gap, 2)
+
+    def test_content_width_shrink_wraps_short_text(self):
+        width = banner_content_width(
+            'Dr. Jane Smith',
+            'Product Lead · Acme Co',
+            36,
+            canvas_w=1920,
+        )
+        self.assertLess(width, 1920 - BANNER_X * 2)
+        self.assertGreaterEqual(width, 120)
+
+    def test_single_bar_anchors_to_bottom_inset(self):
+        primary_h = banner_bar_height(36)
+        primary_geom, secondary_geom = banner_layout(
+            1920,
+            1080,
+            bar_width=320,
+            primary_height=primary_h,
+            secondary_height=0,
+            font_size=36,
+            has_secondary=False,
+        )
+        self.assertIsNone(secondary_geom)
+        _, primary_y, _, h = primary_geom
+        self.assertEqual(primary_y + h, 1080 - 40)

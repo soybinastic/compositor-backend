@@ -25,7 +25,7 @@ from apps.graphics.constants import (
     LOGO_MAX_WIDTH,
 )
 from apps.graphics.geometry import (
-    banner_geometry,
+    banner_layout,
     chat_geometry,
     countdown_geometry,
     logo_geometry,
@@ -50,6 +50,8 @@ from apps.graphics.post_mixer_overlays import (
     compose_static_stack,
 )
 from apps.graphics.renderers.pil_overlays import (
+    banner_bar_height,
+    banner_content_width,
     render_banner_bar,
     render_chat_panel,
     render_countdown_overlay,
@@ -441,9 +443,28 @@ class GraphicsController:
 
         canvas_w = self._owner.width
         canvas_h = self._owner.height
+        bar_width = banner_content_width(
+            title,
+            description,
+            font_size,
+            canvas_w=canvas_w,
+        )
+        primary_height = banner_bar_height(font_size)
+        desc_font_size = max(16, font_size - 8)
+        secondary_height = banner_bar_height(desc_font_size) if description else 0
+        primary_geom, secondary_geom = banner_layout(
+            canvas_w,
+            canvas_h,
+            bar_width=bar_width,
+            primary_height=primary_height,
+            secondary_height=secondary_height,
+            font_size=font_size,
+            has_secondary=bool(description),
+        )
+
         if title:
             img = render_banner_bar(
-                width=max(1, canvas_w - 80),
+                width=bar_width,
                 title=title,
                 theme=theme,
                 primary=primary,
@@ -452,42 +473,28 @@ class GraphicsController:
                 font_size=font_size,
                 is_primary=True,
             )
-            geom = banner_geometry(
-                canvas_w,
-                canvas_h,
-                primary=True,
-                font_size=font_size,
-                bar_height=img.height,
-            )
             self._set_pixbuf_layer(
                 'banner_primary',
                 img,
-                geometry=geom,
+                geometry=primary_geom,
                 signature=sig,
             )
 
-        if description:
+        if description and secondary_geom is not None:
             img = render_banner_bar(
-                width=max(1, canvas_w - 80),
+                width=bar_width,
                 title=description,
                 theme=theme,
                 primary=primary,
                 secondary=secondary,
                 accent=accent,
-                font_size=max(16, font_size - 8),
+                font_size=desc_font_size,
                 is_primary=False,
-            )
-            geom = banner_geometry(
-                canvas_w,
-                canvas_h,
-                primary=False,
-                font_size=font_size,
-                bar_height=img.height,
             )
             self._set_pixbuf_layer(
                 'banner_secondary',
                 img,
-                geometry=geom,
+                geometry=secondary_geom,
                 signature=sig + ':sec',
             )
 

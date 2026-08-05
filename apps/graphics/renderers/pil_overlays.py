@@ -6,6 +6,12 @@ from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
 
+from apps.graphics.constants import (
+    BANNER_HORIZONTAL_PADDING,
+    BANNER_MIN_WIDTH,
+    BANNER_X,
+)
+
 
 def _font(size: int) -> ImageFont.ImageFont:
     try:
@@ -45,6 +51,35 @@ def _normalize_banner_theme(theme: str) -> str:
     if key == 'accent':
         return 'default'
     return key
+
+
+def banner_bar_height(font_size: int) -> int:
+    return max(48, font_size + 24)
+
+
+def banner_text_width(text: str, font_size: int) -> int:
+    if not text.strip():
+        return 0
+    font = _font(font_size)
+    probe = Image.new('RGBA', (1, 1))
+    draw = ImageDraw.Draw(probe)
+    bbox = draw.textbbox((0, 0), text, font=font)
+    return (bbox[2] - bbox[0]) + BANNER_HORIZONTAL_PADDING
+
+
+def banner_content_width(
+    title: str,
+    description: str,
+    font_size: int,
+    *,
+    canvas_w: int,
+) -> int:
+    title_width = banner_text_width(title, font_size)
+    desc_font_size = max(16, font_size - 8)
+    desc_width = banner_text_width(description, desc_font_size)
+    content_width = max(title_width, desc_width, BANNER_MIN_WIDTH)
+    max_width = max(1, canvas_w - BANNER_X * 2)
+    return min(content_width, max_width)
 
 
 def _draw_banner_shape(
@@ -94,8 +129,7 @@ def render_banner_bar(
     font_size: int = 36,
     is_primary: bool = True,
 ) -> Image.Image:
-    text = title if is_primary else title
-    height = max(48, font_size + 24)
+    height = banner_bar_height(font_size)
     img = Image.new('RGBA', (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
@@ -117,7 +151,7 @@ def render_banner_bar(
     )
 
     font = _font(font_size)
-    draw.text((20, (height - font_size) // 2), text, font=font, fill=fg)
+    draw.text((20, (height - font_size) // 2), title, font=font, fill=fg)
     return img
 
 
