@@ -1708,10 +1708,18 @@ class CompositorPipeline:
         # Prefer compositor sizing-policy when available (GStreamer ≥ 1.20).
         # keep-aspect-ratio ≈ contain; keep-aspect-ratio-crop ≈ cover (crop to fill).
         if pad.find_property('sizing-policy') is not None:
-            pad.set_property(
-                'sizing-policy',
-                CompositorPipeline._sizing_policy_for_scale_mode(tile.scale_mode),
-            )
+            policy = CompositorPipeline._sizing_policy_for_scale_mode(tile.scale_mode)
+            try:
+                pad.set_property('sizing-policy', policy)
+            except (TypeError, ValueError):
+                if tile.scale_mode == ScaleMode.COVER:
+                    logger.debug(
+                        'Compositor does not support sizing-policy %r; falling back to none',
+                        policy,
+                    )
+                    pad.set_property('sizing-policy', 'none')
+                else:
+                    raise
 
         if branch.video_scale is not None:
             branch.video_scale.set_property(
