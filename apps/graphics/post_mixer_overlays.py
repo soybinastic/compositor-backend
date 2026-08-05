@@ -31,6 +31,7 @@ from apps.graphics.constants import (
     LAYER_TICKER,
     LAYER_COUNTDOWN,
 )
+from apps.layouts.strategies.base import TileConfig
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,8 @@ STATIC_STACK_ORDER: tuple[str, ...] = (
 
 # Camera tile inset (px) when a background is active — creates the visible frame.
 BACKGROUND_TILE_INSET = 48
+# Gap between adjacent tiles (per side) — smaller than outer inset to avoid wide gutters.
+BACKGROUND_TILE_INNER_GAP = 12
 
 
 @dataclass
@@ -72,6 +75,48 @@ class PixbufLayerState:
     # Source image for stack rebuild / ticker; keep pixels alive for GdkPixbuf.
     _image: Image.Image | None = field(default=None, repr=False)
     _pixel_bytes: bytes | None = field(default=None, repr=False)
+
+
+def apply_directional_background_insets(
+    tiles: list[TileConfig],
+    *,
+    outer: int = BACKGROUND_TILE_INSET,
+    inner: int = BACKGROUND_TILE_INNER_GAP,
+) -> list[TileConfig]:
+    """
+    Shrink camera tiles when a background is active.
+
+    Outer canvas edges use ``outer`` px; shared edges between adjacent tiles use
+    ``inner`` px so multi-tile layouts do not get double-width gutters.
+    """
+    if not tiles:
+        return []
+
+    column_positions = sorted({tile.x for tile in tiles})
+    row_positions = sorted({tile.y for tile in tiles})
+    last_column = len(column_positions) - 1
+    last_row = len(row_positions) - 1
+
+    inset_tiles: list[TileConfig] = []
+    for tile in tiles:
+        column = column_positions.index(tile.x)
+        row = row_positions.index(tile.y)
+        left = outer if column == 0 else inner
+        right = outer if column == last_column else inner
+        top = outer if row == 0 else inner
+        bottom = outer if row == last_row else inner
+        inset_tiles.append(
+            TileConfig(
+                source_id=tile.source_id,
+                x=tile.x + left,
+                y=tile.y + top,
+                width=max(1, tile.width - left - right),
+                height=max(1, tile.height - top - bottom),
+                zorder=tile.zorder,
+                scale_mode=tile.scale_mode,
+            )
+        )
+    return inset_tiles
 
 
 def create_post_mixer_overlay_elements() -> dict[str, Gst.Element]:

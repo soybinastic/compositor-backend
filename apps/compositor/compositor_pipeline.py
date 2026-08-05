@@ -25,7 +25,7 @@ from apps.compositor.video_mix_backend import (
 )
 from apps.graphics.controller import GraphicsController
 from apps.graphics.post_mixer_overlays import (
-    BACKGROUND_TILE_INSET,
+    apply_directional_background_insets,
     create_post_mixer_overlay_elements,
 )
 from apps.layouts.manager import LayoutManager
@@ -1637,19 +1637,7 @@ class CompositorPipeline:
         )
         # Inset cameras when a post-mixer background is active so margins show it.
         if self._graphics.background_active:
-            inset = BACKGROUND_TILE_INSET
-            tiles = [
-                TileConfig(
-                    source_id=tile.source_id,
-                    x=tile.x + inset,
-                    y=tile.y + inset,
-                    width=max(1, tile.width - 2 * inset),
-                    height=max(1, tile.height - 2 * inset),
-                    zorder=tile.zorder,
-                    scale_mode=tile.scale_mode,
-                )
-                for tile in tiles
-            ]
+            tiles = apply_directional_background_insets(tiles)
         tile_map = {tile.source_id: tile for tile in tiles}
         visible_cutouts: list[tuple[int, int, int, int]] = []
 
