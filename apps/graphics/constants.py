@@ -21,6 +21,7 @@ LAYER_LOGO = 'logo'
 LAYER_QR = 'qr'
 LAYER_BANNER = 'banner'
 LAYER_TICKER = 'ticker'
+LAYER_TICKER_BACKGROUND = 'ticker_background'
 LAYER_CHAT = 'chat'
 LAYER_COUNTDOWN = 'countdown'
 

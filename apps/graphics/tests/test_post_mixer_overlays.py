@@ -5,7 +5,14 @@ from unittest.mock import MagicMock
 from django.test import SimpleTestCase
 from PIL import Image
 
-from apps.graphics.constants import LAYER_BACKGROUND, LAYER_COUNTDOWN, LAYER_LOGO, LAYER_OVERLAY, LAYER_TICKER
+from apps.graphics.constants import (
+    LAYER_BACKGROUND,
+    LAYER_COUNTDOWN,
+    LAYER_LOGO,
+    LAYER_OVERLAY,
+    LAYER_TICKER,
+    LAYER_TICKER_BACKGROUND,
+)
 from apps.graphics.post_mixer_overlays import (
     BACKGROUND_TILE_INNER_GAP,
     BACKGROUND_TILE_INSET,
@@ -27,7 +34,12 @@ class PostMixerOverlayTests(SimpleTestCase):
     def test_overlay_key_order(self):
         self.assertEqual(
             POST_MIXER_OVERLAY_KEYS,
-            (LAYER_GRAPHICS_STACK, LAYER_TICKER, LAYER_COUNTDOWN),
+            (
+                LAYER_GRAPHICS_STACK,
+                LAYER_TICKER_BACKGROUND,
+                LAYER_TICKER,
+                LAYER_COUNTDOWN,
+            ),
         )
 
     def test_image_to_pixbuf_roundtrip_size(self):
@@ -121,6 +133,22 @@ class PostMixerOverlayTests(SimpleTestCase):
         clear_pixbuf_overlay(element, state)
         element.set_property.assert_any_call('alpha', 0.0)
         self.assertFalse(state.visible)
+
+    def test_apply_preserves_oversized_image_when_requested(self):
+        element = MagicMock()
+        element.find_property.return_value = MagicMock()
+        state = PixbufLayerState(layer_key=LAYER_TICKER)
+        image = Image.new('RGBA', (64, 8), (0, 255, 0, 255))
+        apply_pixbuf_to_overlay(
+            element,
+            image,
+            (0, 100, 16, 8),
+            state=state,
+            preserve_image_size=True,
+        )
+        element.set_property.assert_any_call('overlay-width', 64)
+        element.set_property.assert_any_call('overlay-height', 8)
+        self.assertEqual(state._image.size, (64, 8))
 
     def test_create_elements_requires_plugin(self):
         elements = create_post_mixer_overlay_elements()

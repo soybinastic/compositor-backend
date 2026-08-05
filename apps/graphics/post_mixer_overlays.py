@@ -5,9 +5,11 @@ appsrc pad competes with camera aggregation and starves x264/RTMP. Drawing via
 gdkpixbufoverlay after the mixer blends once per output frame with no extra
 aggregator pad and no continuous frame pusher.
 
-Only two overlay elements are wired into the pipeline:
-  - graphics_stack: one software-composited RGBA for banner/overlay/logo/chat/qr
-  - ticker: separately animated via offset-x
+Post-mixer gdkpixbufoverlay elements (bottom → top):
+  - graphics_stack: banner / overlay / logo / chat / qr (software-composited)
+  - ticker_background: fixed full-width bar
+  - ticker: transparent text strip animated via offset-x
+  - countdown
 """
 
 from __future__ import annotations
@@ -25,11 +27,12 @@ from gi.repository import GdkPixbuf, GLib, Gst  # noqa: E402
 from apps.graphics.constants import (
     LAYER_BACKGROUND,
     LAYER_CHAT,
+    LAYER_COUNTDOWN,
     LAYER_LOGO,
     LAYER_OVERLAY,
     LAYER_QR,
     LAYER_TICKER,
-    LAYER_COUNTDOWN,
+    LAYER_TICKER_BACKGROUND,
 )
 from apps.layouts.strategies.base import TileConfig
 
@@ -40,6 +43,7 @@ LAYER_GRAPHICS_STACK = 'graphics_stack'
 # Pipeline elements (bottom → top). Stack is one blend; ticker scrolls separately.
 POST_MIXER_OVERLAY_KEYS: tuple[str, ...] = (
     LAYER_GRAPHICS_STACK,
+    LAYER_TICKER_BACKGROUND,
     LAYER_TICKER,
     LAYER_COUNTDOWN,
 )
@@ -242,10 +246,12 @@ def apply_pixbuf_to_overlay(
     geometry: tuple[int, int, int, int],
     *,
     state: PixbufLayerState,
+    preserve_image_size: bool = False,
 ) -> None:
     x, y, w, h = geometry
-    if image.size != (max(1, w), max(1, h)):
+    if not preserve_image_size and image.size != (max(1, w), max(1, h)):
         image = image.resize((max(1, w), max(1, h)), Image.Resampling.LANCZOS)
+    pix_w, pix_h = image.size
     pixbuf, raw = image_to_pixbuf(image)
     state._image = image
     state._pixel_bytes = raw
@@ -253,9 +259,9 @@ def apply_pixbuf_to_overlay(
     element.set_property('offset-x', int(x))
     element.set_property('offset-y', int(y))
     if element.find_property('overlay-width') is not None:
-        element.set_property('overlay-width', max(1, int(w)))
+        element.set_property('overlay-width', max(1, int(pix_w)))
     if element.find_property('overlay-height') is not None:
-        element.set_property('overlay-height', max(1, int(h)))
+        element.set_property('overlay-height', max(1, int(pix_h)))
     element.set_property('alpha', 1.0)
     state.geometry = geometry
     state.visible = True

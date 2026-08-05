@@ -163,14 +163,52 @@ def render_ticker_bar(
     secondary: str = '',
     font_size: int = 28,
 ) -> Image.Image:
-    height = max(40, font_size + 16)
-    # Wide strip so scrolling has room; pad will clip via compositor sizing.
-    strip_w = max(canvas_width * 2, font_size * max(len(text), 1))
+    """Legacy single-strip renderer (background + text). Prefer split renderers."""
+    height = ticker_bar_height(font_size)
+    bg = render_ticker_background(canvas_width=canvas_width, primary=primary, font_size=font_size)
+    text_strip = render_ticker_text_strip(
+        canvas_width=canvas_width,
+        text=text,
+        secondary=secondary,
+        font_size=font_size,
+    )
+    combined = bg.copy()
+    combined.alpha_composite(text_strip, dest=(0, 0))
+    return combined
+
+
+def ticker_bar_height(font_size: int = 28) -> int:
+    return max(40, font_size + 16)
+
+
+def render_ticker_background(
+    *,
+    canvas_width: int,
+    primary: str = '',
+    font_size: int = 28,
+) -> Image.Image:
+    height = ticker_bar_height(font_size)
     bg = _parse_color(primary, (0, 0, 0, 160))
-    fg = _parse_color(secondary, (255, 255, 255, 255))
-    img = Image.new('RGBA', (strip_w, height), bg)
-    draw = ImageDraw.Draw(img)
+    return Image.new('RGBA', (max(1, canvas_width), height), bg)
+
+
+def render_ticker_text_strip(
+    *,
+    canvas_width: int,
+    text: str,
+    secondary: str = '',
+    font_size: int = 28,
+) -> Image.Image:
+    height = ticker_bar_height(font_size)
     font = _font(font_size)
+    probe = Image.new('RGBA', (1, 1))
+    draw = ImageDraw.Draw(probe)
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_w = bbox[2] - bbox[0]
+    strip_w = max(canvas_width * 2, text_w + BANNER_HORIZONTAL_PADDING)
+    img = Image.new('RGBA', (strip_w, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    fg = _parse_color(secondary, (255, 255, 255, 255))
     draw.text((20, (height - font_size) // 2), text, font=font, fill=fg)
     return img
 
