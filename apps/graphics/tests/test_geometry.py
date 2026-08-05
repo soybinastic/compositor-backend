@@ -11,10 +11,21 @@ from apps.graphics.constants import (
     ZORDER_QR,
     ZORDER_TICKER,
 )
-from apps.graphics.constants import BANNER_X
-from apps.graphics.geometry import banner_layout, logo_geometry, overlay_geometry, qr_geometry
+from apps.graphics.constants import BANNER_TICKER_GAP, BANNER_X
+from apps.graphics.geometry import (
+    banner_bottom_inset,
+    banner_layout,
+    logo_geometry,
+    overlay_geometry,
+    qr_geometry,
+    ticker_geometry,
+)
 from apps.graphics.gst_branches import content_signature, is_video_url
-from apps.graphics.renderers.pil_overlays import banner_bar_height, banner_content_width
+from apps.graphics.renderers.pil_overlays import (
+    banner_bar_height,
+    banner_content_width,
+    ticker_bar_height,
+)
 
 
 class ZOrderTests(SimpleTestCase):
@@ -102,3 +113,44 @@ class BannerLayoutTests(SimpleTestCase):
         self.assertIsNone(secondary_geom)
         _, primary_y, _, h = primary_geom
         self.assertEqual(primary_y + h, 1080 - 40)
+
+    def test_bottom_ticker_clears_gap_above_ticker(self):
+        primary_h = banner_bar_height(36)
+        secondary_h = banner_bar_height(28)
+        ticker_h = ticker_bar_height()
+        inset = banner_bottom_inset(
+            bottom_ticker_active=True,
+            chat_active=False,
+            ticker_bar_height=ticker_h,
+        )
+        _, secondary_geom = banner_layout(
+            1920,
+            1080,
+            bar_width=420,
+            primary_height=primary_h,
+            secondary_height=secondary_h,
+            font_size=36,
+            has_secondary=True,
+            bottom_inset=inset,
+        )
+        assert secondary_geom is not None
+        _, ticker_y, _, _ = ticker_geometry(
+            1920,
+            1080,
+            position='bottom',
+            bar_height=ticker_h,
+            chat_active=False,
+        )
+        _, secondary_y, _, secondary_bar_h = secondary_geom
+        gap = ticker_y - (secondary_y + secondary_bar_h)
+        self.assertEqual(gap, BANNER_TICKER_GAP)
+
+    def test_banner_bottom_inset_without_ticker(self):
+        self.assertEqual(
+            banner_bottom_inset(
+                bottom_ticker_active=False,
+                chat_active=False,
+                ticker_bar_height=ticker_bar_height(),
+            ),
+            40,
+        )

@@ -7,6 +7,7 @@ from typing import Any
 from apps.graphics.constants import (
     BANNER_BAR_GAP,
     BANNER_BOTTOM_INSET,
+    BANNER_TICKER_GAP,
     BANNER_X,
     CHAT_EDGE_MARGIN,
     CHAT_PANEL_HEIGHT,
@@ -139,6 +140,19 @@ def overlay_geometry(
     return 0, 0, canvas_w, canvas_h
 
 
+def banner_bottom_inset(
+    *,
+    bottom_ticker_active: bool,
+    chat_active: bool,
+    ticker_bar_height: int,
+) -> int:
+    """Pixels from canvas bottom to the banner block bottom edge."""
+    if not bottom_ticker_active:
+        return BANNER_BOTTOM_INSET
+    nudge = TICKER_CHAT_Y_NUDGE if chat_active else 0
+    return ticker_bar_height + nudge + BANNER_TICKER_GAP
+
+
 def banner_layout(
     canvas_w: int,
     canvas_h: int,
@@ -148,21 +162,23 @@ def banner_layout(
     secondary_height: int,
     font_size: int,
     has_secondary: bool,
+    bottom_inset: int | None = None,
 ) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int] | None]:
     """Return (primary_geom, secondary_geom) for stacked lower-third bars."""
     extra = 40 if font_size >= 70 else 0
+    inset = BANNER_BOTTOM_INSET if bottom_inset is None else bottom_inset
     x = BANNER_X
     w = max(1, min(bar_width, canvas_w - BANNER_X * 2))
 
     if has_secondary:
-        secondary_y = canvas_h - secondary_height - BANNER_BOTTOM_INSET - extra
+        secondary_y = canvas_h - secondary_height - inset - extra
         primary_y = secondary_y - BANNER_BAR_GAP - primary_height
         return (
             (x, max(0, primary_y), w, primary_height),
             (x, max(0, secondary_y), w, secondary_height),
         )
 
-    primary_y = canvas_h - primary_height - BANNER_BOTTOM_INSET - extra
+    primary_y = canvas_h - primary_height - inset - extra
     return (x, max(0, primary_y), w, primary_height), None
 
 
