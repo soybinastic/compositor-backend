@@ -1,4 +1,4 @@
-"""CONTAIN layout — equal grid tiles with aspect-ratio preservation."""
+"""CONTAIN layout — dynamic grid; tiles crop-to-fill (background visible in margins)."""
 
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ class ContainLayout(LayoutStrategy):
                     width=tile_width,
                     height=tile_height,
                     zorder=1,
-                    scale_mode=ScaleMode.CONTAIN,
+                    scale_mode=ScaleMode.COVER,
                 )
             )
 

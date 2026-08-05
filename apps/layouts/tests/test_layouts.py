@@ -24,6 +24,7 @@ class ContainLayoutTests(TestCase):
 
         self.assertEqual(tile_map['a'].width, 960)
         self.assertEqual(tile_map['a'].height, 540)
+        self.assertEqual(tile_map['a'].scale_mode, ScaleMode.COVER)
         self.assertEqual(tile_map['b'].x, 960)
         self.assertEqual(tile_map['c'].y, 540)
 
@@ -41,7 +42,7 @@ class CoverLayoutTests(TestCase):
             self.assertEqual(cover_tiles[source_id].x, contain_tiles[source_id].x)
             self.assertEqual(cover_tiles[source_id].width, contain_tiles[source_id].width)
             self.assertEqual(cover_tiles[source_id].scale_mode, ScaleMode.COVER)
-            self.assertEqual(contain_tiles[source_id].scale_mode, ScaleMode.CONTAIN)
+            self.assertEqual(contain_tiles[source_id].scale_mode, ScaleMode.COVER)
 
 
 class ThumbnailLayoutTests(TestCase):
