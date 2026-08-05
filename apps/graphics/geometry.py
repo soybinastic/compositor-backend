@@ -5,6 +5,9 @@ from __future__ import annotations
 from typing import Any
 
 from apps.graphics.constants import (
+    BANNER_BAR_GAP,
+    BANNER_BOTTOM_INSET,
+    BANNER_TICKER_GAP,
     BANNER_X,
     CHAT_EDGE_MARGIN,
     CHAT_PANEL_HEIGHT,
@@ -137,21 +140,46 @@ def overlay_geometry(
     return 0, 0, canvas_w, canvas_h
 
 
-def banner_geometry(
+def banner_bottom_inset(
+    *,
+    bottom_ticker_active: bool,
+    chat_active: bool,
+    ticker_bar_height: int,
+) -> int:
+    """Pixels from canvas bottom to the banner block bottom edge."""
+    if not bottom_ticker_active:
+        return BANNER_BOTTOM_INSET
+    nudge = TICKER_CHAT_Y_NUDGE if chat_active else 0
+    return ticker_bar_height + nudge + BANNER_TICKER_GAP
+
+
+def banner_layout(
     canvas_w: int,
     canvas_h: int,
     *,
-    primary: bool,
+    bar_width: int,
+    primary_height: int,
+    secondary_height: int,
     font_size: int,
-    bar_height: int,
-) -> tuple[int, int, int, int]:
+    has_secondary: bool,
+    bottom_inset: int | None = None,
+) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int] | None]:
+    """Return (primary_geom, secondary_geom) for stacked lower-third bars."""
     extra = 40 if font_size >= 70 else 0
-    if primary:
-        y = canvas_h - bar_height * 2 - 96 - extra
-    else:
-        y = canvas_h - bar_height - 40 - extra
-    w = max(1, canvas_w - BANNER_X * 2)
-    return BANNER_X, max(0, y), w, bar_height
+    inset = BANNER_BOTTOM_INSET if bottom_inset is None else bottom_inset
+    x = BANNER_X
+    w = max(1, min(bar_width, canvas_w - BANNER_X * 2))
+
+    if has_secondary:
+        secondary_y = canvas_h - secondary_height - inset - extra
+        primary_y = secondary_y - BANNER_BAR_GAP - primary_height
+        return (
+            (x, max(0, primary_y), w, primary_height),
+            (x, max(0, secondary_y), w, secondary_height),
+        )
+
+    primary_y = canvas_h - primary_height - inset - extra
+    return (x, max(0, primary_y), w, primary_height), None
 
 
 def ticker_geometry(

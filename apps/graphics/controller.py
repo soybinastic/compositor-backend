@@ -21,11 +21,13 @@ from apps.graphics.constants import (
     LAYER_OVERLAY,
     LAYER_QR,
     LAYER_TICKER,
+    LAYER_TICKER_BACKGROUND,
     LOGO_MAX_HEIGHT,
     LOGO_MAX_WIDTH,
 )
 from apps.graphics.geometry import (
-    banner_geometry,
+    banner_bottom_inset,
+    banner_layout,
     chat_geometry,
     countdown_geometry,
     logo_geometry,
@@ -50,10 +52,14 @@ from apps.graphics.post_mixer_overlays import (
     compose_static_stack,
 )
 from apps.graphics.renderers.pil_overlays import (
+    banner_bar_height,
+    banner_content_width,
     render_banner_bar,
     render_chat_panel,
     render_countdown_overlay,
-    render_ticker_bar,
+    render_ticker_background,
+    render_ticker_text_strip,
+    ticker_bar_height,
 )
 from apps.graphics.visibility import (
     background_should_show,
@@ -72,6 +78,14 @@ if TYPE_CHECKING:
     from apps.compositor.compositor_pipeline import CompositorPipeline
 
 logger = logging.getLogger(__name__)
+
+_DIRECT_OVERLAY_LAYERS = frozenset(
+    {
+        LAYER_TICKER,
+        LAYER_TICKER_BACKGROUND,
+        LAYER_COUNTDOWN,
+    }
+)
 
 
 class GraphicsController:
@@ -158,6 +172,7 @@ class GraphicsController:
             )
             # Ticker Y may shift when chat presence changes, but chat itself is unchanged.
             self._reposition_ticker_if_present(layout)
+            self._reposition_banner_if_present()
             return
 
         self._apply_background(
@@ -228,24 +243,94 @@ class GraphicsController:
             self._rebuild_graphics_stack()
 
     def _reposition_ticker_if_present(self, _layout: str) -> None:
-        state = self._pixbuf_layers.get(LAYER_TICKER)
+        text_state = self._pixbuf_layers.get(LAYER_TICKER)
         config = self._pending_state.get(LAYER_TICKER)
-        if state is None or not config or not state.visible:
+        if text_state is None or not config or not text_state.visible:
             return
         chat_active = chat_should_show(self._pending_state.get(LAYER_CHAT))
-        bar_h = state.geometry[3]
-        geom = ticker_geometry(
+        bar_h = text_state.geometry[3]
+        bar_geom = ticker_geometry(
             self._owner.width,
             self._owner.height,
             position=str(config.get('tickerPosition') or 'bottom'),
             bar_height=bar_h,
             chat_active=chat_active,
         )
-        state.geometry = geom
-        element = self._owner._post_mixer_overlays.get(LAYER_TICKER)
-        if element is not None:
-            element.set_property('offset-x', int(geom[0]))
-            element.set_property('offset-y', int(geom[1]))
+        bg_state = self._pixbuf_layers.get(LAYER_TICKER_BACKGROUND)
+        if bg_state is not None:
+            bg_state.geometry = bar_geom
+            bg_element = self._owner._post_mixer_overlays.get(LAYER_TICKER_BACKGROUND)
+            if bg_element is not None:
+                bg_element.set_property('offset-x', int(bar_geom[0]))
+                bg_element.set_property('offset-y', int(bar_geom[1]))
+
+        strip_w = text_state.geometry[2]
+        text_geom = (text_state.geometry[0], bar_geom[1], strip_w, bar_h)
+        text_state.geometry = text_geom
+        text_element = self._owner._post_mixer_overlays.get(LAYER_TICKER)
+        if text_element is not None:
+            text_element.set_property('offset-y', int(bar_geom[1]))
+        self._reposition_banner_if_present()
+
+    def _resolve_banner_bottom_inset(self) -> int:
+        ticker_config = self._pending_state.get(LAYER_TICKER)
+        chat_active = chat_should_show(self._pending_state.get(LAYER_CHAT))
+        bottom_ticker_active = bool(
+            ticker_should_show(ticker_config)
+            and str((ticker_config or {}).get('tickerPosition') or 'bottom').lower() != 'top'
+        )
+        return banner_bottom_inset(
+            bottom_ticker_active=bottom_ticker_active,
+            chat_active=chat_active,
+            ticker_bar_height=ticker_bar_height(),
+        )
+
+    def _banner_layout_geometries(
+        self,
+        config: dict[str, Any],
+    ) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int] | None]:
+        title, description = banner_text_parts(config)
+        font_size = int(config.get('font_size') or 36)
+        canvas_w = self._owner.width
+        canvas_h = self._owner.height
+        bar_width = banner_content_width(
+            title,
+            description,
+            font_size,
+            canvas_w=canvas_w,
+        )
+        primary_height = banner_bar_height(font_size)
+        desc_font_size = max(16, font_size - 8)
+        secondary_height = banner_bar_height(desc_font_size) if description else 0
+        return banner_layout(
+            canvas_w,
+            canvas_h,
+            bar_width=bar_width,
+            primary_height=primary_height,
+            secondary_height=secondary_height,
+            font_size=font_size,
+            has_secondary=bool(description),
+            bottom_inset=self._resolve_banner_bottom_inset(),
+        )
+
+    def _reposition_banner_if_present(self) -> None:
+        config = self._pending_state.get(LAYER_BANNER)
+        if not banner_should_show(config):
+            return
+        assert config is not None
+        primary_geom, secondary_geom = self._banner_layout_geometries(config)
+        changed = False
+        primary_state = self._pixbuf_layers.get('banner_primary')
+        if primary_state is not None and primary_state.visible:
+            primary_state.geometry = primary_geom
+            changed = True
+        if secondary_geom is not None:
+            secondary_state = self._pixbuf_layers.get('banner_secondary')
+            if secondary_state is not None and secondary_state.visible:
+                secondary_state.geometry = secondary_geom
+                changed = True
+        if changed:
+            self._rebuild_graphics_stack()
 
     # --- per-layer apply -------------------------------------------------
 
@@ -420,6 +505,7 @@ class GraphicsController:
         primary = str(config.get('primary') or '')
         secondary = str(config.get('secondary') or '')
         accent = str(config.get('accent') or '')
+        bottom_inset = self._resolve_banner_bottom_inset()
         sig = content_signature(
             {
                 'title': title,
@@ -429,6 +515,7 @@ class GraphicsController:
                 'primary': primary,
                 'secondary': secondary,
                 'accent': accent,
+                'bottom_inset': bottom_inset,
                 'layer': LAYER_BANNER,
             }
         )
@@ -439,11 +526,13 @@ class GraphicsController:
         self._clear_pixbuf_layer('banner_primary')
         self._clear_pixbuf_layer('banner_secondary')
 
-        canvas_w = self._owner.width
-        canvas_h = self._owner.height
+        primary_geom, secondary_geom = self._banner_layout_geometries(config)
+        bar_width = primary_geom[2]
+        desc_font_size = max(16, font_size - 8)
+
         if title:
             img = render_banner_bar(
-                width=max(1, canvas_w - 80),
+                width=bar_width,
                 title=title,
                 theme=theme,
                 primary=primary,
@@ -452,49 +541,35 @@ class GraphicsController:
                 font_size=font_size,
                 is_primary=True,
             )
-            geom = banner_geometry(
-                canvas_w,
-                canvas_h,
-                primary=True,
-                font_size=font_size,
-                bar_height=img.height,
-            )
             self._set_pixbuf_layer(
                 'banner_primary',
                 img,
-                geometry=geom,
+                geometry=primary_geom,
                 signature=sig,
             )
 
-        if description:
+        if description and secondary_geom is not None:
             img = render_banner_bar(
-                width=max(1, canvas_w - 80),
+                width=bar_width,
                 title=description,
                 theme=theme,
                 primary=primary,
                 secondary=secondary,
                 accent=accent,
-                font_size=max(16, font_size - 8),
+                font_size=desc_font_size,
                 is_primary=False,
-            )
-            geom = banner_geometry(
-                canvas_w,
-                canvas_h,
-                primary=False,
-                font_size=font_size,
-                bar_height=img.height,
             )
             self._set_pixbuf_layer(
                 'banner_secondary',
                 img,
-                geometry=geom,
+                geometry=secondary_geom,
                 signature=sig + ':sec',
             )
 
     def _apply_ticker(self, config: dict[str, Any] | None, *, chat_active: bool) -> None:
         if not ticker_should_show(config):
-            self._stop_ticker_animation()
-            self._clear_pixbuf_layer(LAYER_TICKER)
+            self._clear_ticker_layers()
+            self._reposition_banner_if_present()
             return
         assert config is not None
         text = ticker_text(config)
@@ -521,37 +596,57 @@ class GraphicsController:
         )
         existing = self._pixbuf_layers.get(LAYER_TICKER)
         if existing and existing.signature == sig and existing.visible:
+            self._reposition_banner_if_present()
             return
 
-        img = render_ticker_bar(
-            canvas_width=self._owner.width,
-            text=text,
+        canvas_w = self._owner.width
+        canvas_h = self._owner.height
+        bg_img = render_ticker_background(
+            canvas_width=canvas_w,
             primary=primary,
+        )
+        text_img = render_ticker_text_strip(
+            canvas_width=canvas_w,
+            text=text,
             secondary=secondary,
         )
-        geom = ticker_geometry(
-            self._owner.width,
-            self._owner.height,
+        bar_geom = ticker_geometry(
+            canvas_w,
+            canvas_h,
             position=position,
-            bar_height=img.height,
+            bar_height=bg_img.height,
             chat_active=chat_active,
         )
-        state = self._set_pixbuf_layer(
-            LAYER_TICKER,
-            img,
-            geometry=geom,
+        self._set_pixbuf_layer(
+            LAYER_TICKER_BACKGROUND,
+            bg_img,
+            geometry=bar_geom,
             signature=sig,
         )
-        state.ticker_width = img.width
+        text_geom = (0, bar_geom[1], text_img.width, text_img.height)
+        state = self._set_pixbuf_layer(
+            LAYER_TICKER,
+            text_img,
+            geometry=text_geom,
+            signature=sig,
+        )
+        state.ticker_width = text_img.width
         state.ticker_direction = direction
         state.ticker_speed = speed
         self._start_ticker_animation(state)
+        self._reposition_banner_if_present()
+
+    def _clear_ticker_layers(self) -> None:
+        self._stop_ticker_animation()
+        self._clear_pixbuf_layer(LAYER_TICKER)
+        self._clear_pixbuf_layer(LAYER_TICKER_BACKGROUND)
 
     def _apply_chat(self, config: dict[str, Any] | None) -> None:
         if not chat_should_show(config):
             self._clear_pixbuf_layer(LAYER_CHAT)
             # Reposition ticker if chat turned off.
             self._reposition_ticker_if_present('')
+            self._reposition_banner_if_present()
             return
         assert config is not None
         messages = config.get('messages') or []
@@ -563,6 +658,7 @@ class GraphicsController:
         img = render_chat_panel(width=geom[2], height=geom[3], messages=list(messages))
         self._set_pixbuf_layer(LAYER_CHAT, img, geometry=geom, signature=sig)
         self._reposition_ticker_if_present('')
+        self._reposition_banner_if_present()
 
     def start_countdown(self, *, started_at_epoch: float, duration_seconds: int) -> None:
         self._countdown_started_at = started_at_epoch
@@ -618,18 +714,17 @@ class GraphicsController:
         state._image = image.convert('RGBA') if hasattr(image, 'convert') else image
         self._pixbuf_layers[layer_key] = state
 
-        if layer_key == LAYER_TICKER:
-            element = self._owner._post_mixer_overlays.get(LAYER_TICKER)
+        if layer_key in _DIRECT_OVERLAY_LAYERS:
+            element = self._owner._post_mixer_overlays.get(layer_key)
             if element is None:
-                raise RuntimeError('Post-mixer overlay element missing for ticker')
-            apply_pixbuf_to_overlay(element, state._image, geometry, state=state)
-            return state
-
-        if layer_key == LAYER_COUNTDOWN:
-            element = self._owner._post_mixer_overlays.get(LAYER_COUNTDOWN)
-            if element is None:
-                raise RuntimeError('Post-mixer overlay element missing for countdown')
-            apply_pixbuf_to_overlay(element, state._image, geometry, state=state)
+                raise RuntimeError(f'Post-mixer overlay element missing for {layer_key}')
+            apply_pixbuf_to_overlay(
+                element,
+                state._image,
+                geometry,
+                state=state,
+                preserve_image_size=(layer_key == LAYER_TICKER),
+            )
             return state
 
         if rebuild:
@@ -648,32 +743,24 @@ class GraphicsController:
             return
         state.geometry = geometry
         state.visible = True
-        if layer_key == LAYER_TICKER:
-            element = self._owner._post_mixer_overlays.get(LAYER_TICKER)
+        if layer_key in _DIRECT_OVERLAY_LAYERS:
+            element = self._owner._post_mixer_overlays.get(layer_key)
             if element is None:
                 return
-            apply_pixbuf_to_overlay(element, state._image, geometry, state=state)
-            return
-        if layer_key == LAYER_COUNTDOWN:
-            element = self._owner._post_mixer_overlays.get(LAYER_COUNTDOWN)
-            if element is None:
-                return
-            apply_pixbuf_to_overlay(element, state._image, geometry, state=state)
+            apply_pixbuf_to_overlay(
+                element,
+                state._image,
+                geometry,
+                state=state,
+                preserve_image_size=(layer_key == LAYER_TICKER),
+            )
             return
         self._rebuild_graphics_stack()
 
     def _clear_pixbuf_layer(self, layer_key: str) -> None:
         state = self._pixbuf_layers.pop(layer_key, None)
-        if layer_key == LAYER_TICKER:
-            element = self._owner._post_mixer_overlays.get(LAYER_TICKER)
-            if element is not None:
-                clear_pixbuf_overlay(
-                    element,
-                    state or PixbufLayerState(layer_key=layer_key),
-                )
-            return
-        if layer_key == LAYER_COUNTDOWN:
-            element = self._owner._post_mixer_overlays.get(LAYER_COUNTDOWN)
+        if layer_key in _DIRECT_OVERLAY_LAYERS:
+            element = self._owner._post_mixer_overlays.get(layer_key)
             if element is not None:
                 clear_pixbuf_overlay(
                     element,
@@ -763,11 +850,11 @@ class GraphicsController:
             return
 
         def _run() -> None:
-            xpos = state.geometry[0]
             canvas_w = owner.width
             strip_w = state.ticker_width or canvas_w
             direction = state.ticker_direction
             speed = max(0.1, state.ticker_speed)
+            ticker_y = state.geometry[1]
             # pixels per frame
             step = max(1, int(speed * 2))
             if direction == 'rtl':
@@ -786,6 +873,7 @@ class GraphicsController:
                         xpos = -strip_w
                 try:
                     element.set_property('offset-x', int(xpos))
+                    element.set_property('offset-y', int(ticker_y))
                 except Exception:
                     break
                 time.sleep(1.0 / fps)
