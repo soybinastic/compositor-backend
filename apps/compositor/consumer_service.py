@@ -304,15 +304,22 @@ class ConsumerService:
             video_consumer['rtpParameters']
         )
 
-        self._compositor_pipeline.replace_participant_video_rtp(
-            participant.participant_peer_id,
-            video_port=ports.video.rtp_port,
-            video_rtcp_port=ports.video.rtcp_port,
-            video_payload_type=video_wire_pt,
-            video_mediasoup_transport=_plain_transport_tuple(video_transport),
-            rtcp_mux=False,
-            display_name=name,
-        )
+        try:
+            self._compositor_pipeline.replace_participant_video_rtp(
+                participant.participant_peer_id,
+                video_port=ports.video.rtp_port,
+                video_rtcp_port=ports.video.rtcp_port,
+                video_payload_type=video_wire_pt,
+                video_mediasoup_transport=_plain_transport_tuple(video_transport),
+                rtcp_mux=False,
+                display_name=name,
+            )
+        except Exception:
+            # Pipeline may have fallen back to a placeholder seat after a failed link.
+            participant.video_producer_id = None
+            participant.video_consumer_id = None
+            participant.video_mode = 'placeholder'
+            raise
 
         self._client.resume_consumer(
             self._room_id,

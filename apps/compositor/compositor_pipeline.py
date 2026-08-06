@@ -799,6 +799,27 @@ class CompositorPipeline:
             else:
                 kept_handlers.append((element, handler_id))
 
+        sink_pad = branch.compositor_sink_pad
+        peer_pad = sink_pad.get_peer()
+        if peer_pad is not None:
+            peer_pad.unlink(sink_pad)
+
+        # Free UDP ports + element names before building the replacement chain.
+        # Adding a new udpsrc on the same ports while the old one is still in the
+        # pipeline makes pad linking / negotiation fail (scene camera switch).
+        for element in old_video:
+            element.set_state(Gst.State.NULL)
+            self._pipeline.remove(element)
+
+        remaining = [element for element in branch.elements if id(element) not in old_ids]
+        branch.elements = remaining
+        branch.video_elements = []
+        branch.signal_handlers = kept_handlers
+        branch.video_scale = None
+
+        sink_pad.send_event(Gst.Event.new_flush_start())
+        sink_pad.send_event(Gst.Event.new_flush_stop(True))
+
         video_chain = self._build_video_ingest_chain(
             participant_peer_id=participant_peer_id,
             rtp_port=video_port,
@@ -810,32 +831,45 @@ class CompositorPipeline:
 
         for element in video_chain.elements:
             self._pipeline.add(element)
-        self._link_sequential(
-            video_chain.media_elements,
-            label=f'video-restore-{participant_peer_id}',
-        )
-        for upstream, downstream in video_chain.rtcp_links:
-            if not upstream.link(downstream):
+        try:
+            self._link_sequential(
+                video_chain.media_elements,
+                label=f'video-restore-{participant_peer_id}',
+            )
+            for upstream, downstream in video_chain.rtcp_links:
+                if not upstream.link(downstream):
+                    raise RuntimeError(
+                        f'Failed to link RTCP drain while restoring video for {participant_peer_id}'
+                    )
+
+            video_src_pad = video_chain.output.get_static_pad('src')
+            link_ret = (
+                Gst.PadLinkReturn.WRONG_HIERARCHY
+                if video_src_pad is None
+                else video_src_pad.link(sink_pad)
+            )
+            if link_ret != Gst.PadLinkReturn.OK:
                 raise RuntimeError(
-                    f'Failed to link RTCP drain while restoring video for {participant_peer_id}'
+                    f'Failed to link restored video to compositor for {participant_peer_id} '
+                    f'(pad_link={int(link_ret)})'
                 )
-
-        peer_pad = branch.compositor_sink_pad.get_peer()
-        if peer_pad is not None:
-            peer_pad.unlink(branch.compositor_sink_pad)
-
-        sink_pad = branch.compositor_sink_pad
-        sink_pad.send_event(Gst.Event.new_flush_start())
-        sink_pad.send_event(Gst.Event.new_flush_stop(True))
-
-        video_src_pad = video_chain.output.get_static_pad('src')
-        if video_src_pad is None or video_src_pad.link(sink_pad) != Gst.PadLinkReturn.OK:
+        except Exception:
             for element in video_chain.elements:
                 element.set_state(Gst.State.NULL)
                 self._pipeline.remove(element)
-            raise RuntimeError(
-                f'Failed to link restored video to compositor for {participant_peer_id}'
-            )
+            # Keep the layout seat fed so RTMP does not see an unlinked pad.
+            branch.video_mode = 'rtp'
+            try:
+                self._set_participant_video_placeholder_unlocked(
+                    participant_peer_id,
+                    display_name=display_name or branch.display_name or participant_peer_id,
+                )
+            except Exception:
+                logger.exception(
+                    'Failed to install placeholder after video restore failure for %s',
+                    participant_peer_id,
+                )
+            raise
 
         for element in reversed(video_chain.elements):
             if not element.sync_state_with_parent():
@@ -845,11 +879,6 @@ class CompositorPipeline:
                     participant_peer_id,
                 )
 
-        for element in old_video:
-            element.set_state(Gst.State.NULL)
-            self._pipeline.remove(element)
-
-        remaining = [element for element in branch.elements if id(element) not in old_ids]
         video_scale = next(
             (
                 element
@@ -860,6 +889,7 @@ class CompositorPipeline:
             None,
         )
 
+        assert video_src_pad is not None
         if video_chain.rtp_probe_pad is not None:
             video_chain.rtp_probe_pad.add_probe(
                 Gst.PadProbeType.BUFFER,
