@@ -259,8 +259,10 @@ class ConsumerService:
         display_name: str = '',
     ) -> None:
         """
-        Restore live webcam after soft-disable without requiring a mic producer.
+        Restore or replace live webcam without requiring a mic producer.
 
+        Used after soft-disable (placeholder) and for scene camera switches where
+        the video producer id changes while the mic is muted (still rtp mode).
         Reuses the participant's existing video RTP ports and keeps the audio
         branch on stage (silent/inactive when the mic is muted).
         """

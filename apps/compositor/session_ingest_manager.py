@@ -193,8 +193,9 @@ class SessionIngestManager:
         Attach / soft-disable / detach based on producers + room presence.
 
         Sticky peers (still joined) keep their layout seat when webcam closes.
-        Missing video becomes an initials placeholder immediately (grace default 0).
-        Re-enable uses full re-attach when a video producer returns.
+        Missing video becomes an initials placeholder (grace default 0).
+        Video producer changes (scene camera switch) replace live video even when
+        the mic is muted. Re-enable / restore uses soft-enable or full re-attach.
         """
         if self._stopped:
             return
@@ -264,32 +265,59 @@ class SessionIngestManager:
                 if video_id:
                     self._video_missing_since.pop(peer_id, None)
 
-                    # Cam back after soft-disable: restore video only so a muted
-                    # mic (no audio producer) cannot block leaving the placeholder.
-                    if current.video_mode == 'placeholder':
-                        try:
-                            self._consumer_service.soft_enable_video(
-                                current,
-                                video_id,
-                                display_name=display_name,
-                            )
-                            if audio_id:
-                                current.audio_producer_id = audio_id
-                        except Exception:
-                            logger.exception(
-                                'Failed to soft-enable video for participant %s',
+                    video_changed = (
+                        current.video_mode == 'placeholder'
+                        or current.video_producer_id != video_id
+                    )
+                    audio_changed = current.audio_producer_id != audio_id
+
+                    if video_changed:
+                        # Scene camera switch often returns a new video producer while
+                        # still in rtp mode (before grace soft-disable). With mic muted
+                        # there is no audio_id — soft-enable replaces the dead/old
+                        # video pad without requiring a full A/V re-attach.
+                        if (
+                            audio_id
+                            and current.video_mode != 'placeholder'
+                        ):
+                            logger.info(
+                                'Re-attaching ingest for %s (live video restore/replace)',
                                 peer_id,
                             )
+                            self._consumer_service.detach_participant(current)
+                            del self._participants[peer_id]
+                            try:
+                                participant = self._consumer_service.attach_participant(
+                                    peer_id,
+                                    audio_id,
+                                    video_id,
+                                )
+                                participant.display_name = display_name
+                                self._participants[peer_id] = participant
+                            except Exception:
+                                logger.exception(
+                                    'Failed to re-attach ingest for participant %s',
+                                    peer_id,
+                                )
+                        else:
+                            try:
+                                self._consumer_service.soft_enable_video(
+                                    current,
+                                    video_id,
+                                    display_name=display_name,
+                                )
+                                if audio_id:
+                                    current.audio_producer_id = audio_id
+                            except Exception:
+                                logger.exception(
+                                    'Failed to soft-enable video for participant %s',
+                                    peer_id,
+                                )
                         continue
 
-                    needs_reattach = (
-                        current.audio_producer_id != audio_id
-                        or current.video_producer_id != video_id
-                        or audio_id is None
-                    )
-                    if needs_reattach and audio_id and video_id:
+                    if audio_changed and audio_id:
                         logger.info(
-                            'Re-attaching ingest for %s (live video restore/replace)',
+                            'Re-attaching ingest for %s (audio producer changed)',
                             peer_id,
                         )
                         self._consumer_service.detach_participant(current)
