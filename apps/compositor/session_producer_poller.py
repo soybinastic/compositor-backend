@@ -14,7 +14,8 @@ from integrations.mediasoup.exceptions import MediasoupApiError
 
 logger = logging.getLogger(__name__)
 
-SyncProducersCallback = Callable[[list[dict[str, Any]]], None]
+# (peer_producers_infos, joined_peers)
+SyncProducersCallback = Callable[[list[dict[str, Any]], list[dict[str, Any]]], None]
 
 
 class SessionProducerPoller:
@@ -79,7 +80,8 @@ class SessionProducerPoller:
         try:
             response = self._client.get_producers(self.room_id)
             peer_producers_infos = response.get('peerProducersInfos', [])
-            self._sync_producers(peer_producers_infos)
+            joined_peers = response.get('joinedPeers', [])
+            self._sync_producers(peer_producers_infos, joined_peers)
         except MediasoupApiError as exc:
             logger.warning(
                 'Producer poll failed for session %s: %s',
@@ -100,6 +102,10 @@ class SessionProducerPollerRegistry:
         self._pollers: dict[str, SessionProducerPoller] = {}
         self._lock = threading.Lock()
 
+    def count(self) -> int:
+        with self._lock:
+            return len(self._pollers)
+
     def attach(self, session_id: str, poller: SessionProducerPoller) -> None:
         with self._lock:
             self._pollers[session_id] = poller
@@ -107,10 +113,6 @@ class SessionProducerPollerRegistry:
     def pop(self, session_id: str) -> SessionProducerPoller | None:
         with self._lock:
             return self._pollers.pop(session_id, None)
-
-    def count(self) -> int:
-        with self._lock:
-            return len(self._pollers)
 
     def shutdown_all(self) -> None:
         with self._lock:

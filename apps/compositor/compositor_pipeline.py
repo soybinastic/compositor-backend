@@ -18,6 +18,7 @@ from gi.repository import Gst  # noqa: E402
 
 from apps.compositor.ingest_branch import IngestStats
 from apps.compositor.pipeline_bus_monitor import PipelineBusMonitor
+from apps.compositor.video_placeholder import build_participant_placeholder_chain
 from apps.compositor.video_mix_backend import (
     VideoMixBackend,
     get_video_mix_backend,
@@ -82,10 +83,16 @@ class ParticipantBranch:
     compositor_sink_pad: Gst.Pad
     mixer_sink_pad: Gst.Pad | None
     elements: list[Gst.Element] = field(default_factory=list)
+    video_elements: list[Gst.Element] = field(default_factory=list)
+    audio_elements: list[Gst.Element] = field(default_factory=list)
     stats: IngestStats = field(default_factory=IngestStats)
     signal_handlers: list[tuple[Gst.Element, int]] = field(default_factory=list)
     source_url: str | None = None
     video_scale: Gst.Element | None = None
+    video_mode: str = 'rtp'  # 'rtp' | 'placeholder'
+    display_name: str = ''
+    # GdkPixbuf pixel buffer must outlive the overlay element.
+    placeholder_keep_alive: object | None = None
 
 
 @dataclass
@@ -624,6 +631,316 @@ class CompositorPipeline:
             self._remove_participant_unlocked(participant_peer_id)
             self._host_owned_source_ids.discard(participant_peer_id)
             self._apply_layout_unlocked()
+
+    def set_participant_video_placeholder(
+        self,
+        participant_peer_id: str,
+        *,
+        display_name: str = '',
+    ) -> None:
+        """
+        Soft-disable: keep layout pad + audio, replace live RTP video with initials plate.
+        """
+        with self._lock:
+            self._set_participant_video_placeholder_unlocked(
+                participant_peer_id,
+                display_name=display_name,
+            )
+
+    def _set_participant_video_placeholder_unlocked(
+        self,
+        participant_peer_id: str,
+        *,
+        display_name: str = '',
+    ) -> None:
+        if self._pipeline is None or self._video_mix_backend is None:
+            raise RuntimeError('Compositor pipeline is not started')
+
+        branch = self._participants.get(participant_peer_id)
+        if branch is None:
+            return
+        if branch.video_mode == 'placeholder':
+            if display_name and display_name != branch.display_name:
+                branch.display_name = display_name
+            return
+
+        video_elements = list(branch.video_elements) or [
+            element
+            for element in branch.elements
+            if (element.get_name() or '').startswith('video_')
+        ]
+        video_ids = {id(element) for element in video_elements}
+        kept_handlers: list[tuple[Gst.Element, int]] = []
+        for element, handler_id in branch.signal_handlers:
+            if id(element) in video_ids:
+                element.disconnect(handler_id)
+            else:
+                kept_handlers.append((element, handler_id))
+
+        # Build + link the placeholder graph before tearing down RTP so the
+        # compositor sink is idle for the shortest possible window.
+        ingest_tail = self._video_mix_backend.build_ingest_tail(
+            f'ph_{participant_peer_id}'
+        )
+        placeholder_elements, output, keep_alive = build_participant_placeholder_chain(
+            peer_id=participant_peer_id,
+            display_name=display_name or branch.display_name or participant_peer_id,
+            width=self.width,
+            height=self.height,
+            fps=self.fps,
+            ingest_tail=ingest_tail,
+        )
+
+        for element in placeholder_elements:
+            self._pipeline.add(element)
+        self._link_sequential(
+            placeholder_elements,
+            label=f'placeholder-{participant_peer_id}',
+        )
+
+        peer_pad = branch.compositor_sink_pad.get_peer()
+        if peer_pad is not None:
+            peer_pad.unlink(branch.compositor_sink_pad)
+
+        # Flush so force-live compositor does not wait on the old pad's running time.
+        sink_pad = branch.compositor_sink_pad
+        sink_pad.send_event(Gst.Event.new_flush_start())
+        sink_pad.send_event(Gst.Event.new_flush_stop(True))
+
+        src_pad = output.get_static_pad('src')
+        if src_pad is None or src_pad.link(sink_pad) != Gst.PadLinkReturn.OK:
+            for element in placeholder_elements:
+                element.set_state(Gst.State.NULL)
+                self._pipeline.remove(element)
+            raise RuntimeError(
+                f'Failed to link placeholder to compositor for {participant_peer_id}'
+            )
+
+        for element in reversed(placeholder_elements):
+            if not element.sync_state_with_parent():
+                logger.warning(
+                    'Placeholder element %s failed to sync for peer %s',
+                    element.get_name(),
+                    participant_peer_id,
+                )
+
+        for element in video_elements:
+            element.set_state(Gst.State.NULL)
+            self._pipeline.remove(element)
+
+        remaining = [element for element in branch.elements if id(element) not in video_ids]
+        video_scale = next(
+            (
+                element
+                for element in placeholder_elements
+                if element.get_factory() is not None
+                and element.get_factory().get_name() == 'videoscale'
+            ),
+            None,
+        )
+
+        branch.video_elements = list(placeholder_elements)
+        branch.elements = remaining + placeholder_elements
+        branch.signal_handlers = kept_handlers
+        branch.video_scale = video_scale
+        branch.video_mode = 'placeholder'
+        branch.display_name = display_name or branch.display_name or participant_peer_id
+        branch.placeholder_keep_alive = keep_alive
+        logger.info(
+            'Soft-disabled video for peer %s (placeholder display_name=%s)',
+            participant_peer_id,
+            branch.display_name,
+        )
+
+    def replace_participant_video_rtp(
+        self,
+        participant_peer_id: str,
+        *,
+        video_port: int,
+        video_rtcp_port: int,
+        video_payload_type: int,
+        video_mediasoup_transport: MediasoupTransportTuple,
+        rtcp_mux: bool = False,
+        display_name: str = '',
+    ) -> None:
+        """Soft-enable: swap initials placeholder back to live RTP video; keep audio."""
+        with self._lock:
+            self._replace_participant_video_rtp_unlocked(
+                participant_peer_id,
+                video_port=video_port,
+                video_rtcp_port=video_rtcp_port,
+                video_payload_type=video_payload_type,
+                video_mediasoup_transport=video_mediasoup_transport,
+                rtcp_mux=rtcp_mux,
+                display_name=display_name,
+            )
+
+    def _replace_participant_video_rtp_unlocked(
+        self,
+        participant_peer_id: str,
+        *,
+        video_port: int,
+        video_rtcp_port: int,
+        video_payload_type: int,
+        video_mediasoup_transport: MediasoupTransportTuple,
+        rtcp_mux: bool,
+        display_name: str,
+    ) -> None:
+        if self._pipeline is None or self._video_mix_backend is None:
+            raise RuntimeError('Compositor pipeline is not started')
+
+        branch = self._participants.get(participant_peer_id)
+        if branch is None:
+            raise RuntimeError(f'Participant {participant_peer_id} is not on stage')
+
+        old_video = list(branch.video_elements)
+        old_ids = {id(element) for element in old_video}
+        kept_handlers: list[tuple[Gst.Element, int]] = []
+        for element, handler_id in branch.signal_handlers:
+            if id(element) in old_ids:
+                element.disconnect(handler_id)
+            else:
+                kept_handlers.append((element, handler_id))
+
+        sink_pad = branch.compositor_sink_pad
+        peer_pad = sink_pad.get_peer()
+        if peer_pad is not None:
+            peer_pad.unlink(sink_pad)
+
+        # Free UDP ports + element names before building the replacement chain.
+        # Adding a new udpsrc on the same ports while the old one is still in the
+        # pipeline makes pad linking / negotiation fail (scene camera switch).
+        for element in old_video:
+            element.set_state(Gst.State.NULL)
+            self._pipeline.remove(element)
+
+        remaining = [element for element in branch.elements if id(element) not in old_ids]
+        branch.elements = remaining
+        branch.video_elements = []
+        branch.signal_handlers = kept_handlers
+        branch.video_scale = None
+        branch.placeholder_keep_alive = None
+
+        sink_pad.send_event(Gst.Event.new_flush_start())
+        sink_pad.send_event(Gst.Event.new_flush_stop(True))
+
+        video_chain = self._build_video_ingest_chain(
+            participant_peer_id=participant_peer_id,
+            rtp_port=video_port,
+            rtcp_port=video_rtcp_port,
+            payload_type=video_payload_type,
+            mediasoup_transport=video_mediasoup_transport,
+            rtcp_mux=rtcp_mux,
+        )
+
+        for element in video_chain.elements:
+            self._pipeline.add(element)
+        try:
+            self._link_sequential(
+                video_chain.media_elements,
+                label=f'video-restore-{participant_peer_id}',
+            )
+            for upstream, downstream in video_chain.rtcp_links:
+                if not upstream.link(downstream):
+                    raise RuntimeError(
+                        f'Failed to link RTCP drain while restoring video for {participant_peer_id}'
+                    )
+
+            video_src_pad = video_chain.output.get_static_pad('src')
+            link_ret = (
+                Gst.PadLinkReturn.WRONG_HIERARCHY
+                if video_src_pad is None
+                else video_src_pad.link(sink_pad)
+            )
+            if link_ret != Gst.PadLinkReturn.OK:
+                raise RuntimeError(
+                    f'Failed to link restored video to compositor for {participant_peer_id} '
+                    f'(pad_link={int(link_ret)})'
+                )
+        except Exception:
+            for element in video_chain.elements:
+                element.set_state(Gst.State.NULL)
+                self._pipeline.remove(element)
+            # Keep the layout seat fed so RTMP does not see an unlinked pad.
+            branch.video_mode = 'rtp'
+            try:
+                self._set_participant_video_placeholder_unlocked(
+                    participant_peer_id,
+                    display_name=display_name or branch.display_name or participant_peer_id,
+                )
+            except Exception:
+                logger.exception(
+                    'Failed to install placeholder after video restore failure for %s',
+                    participant_peer_id,
+                )
+            raise
+
+        for element in reversed(video_chain.elements):
+            if not element.sync_state_with_parent():
+                logger.warning(
+                    'Restored video element %s failed to sync for peer %s',
+                    element.get_name(),
+                    participant_peer_id,
+                )
+
+        video_scale = next(
+            (
+                element
+                for element in video_chain.media_elements
+                if element.get_factory() is not None
+                and element.get_factory().get_name() == 'videoscale'
+            ),
+            None,
+        )
+
+        assert video_src_pad is not None
+        if video_chain.rtp_probe_pad is not None:
+            video_chain.rtp_probe_pad.add_probe(
+                Gst.PadProbeType.BUFFER,
+                self._make_rtp_video_probe(branch),
+                None,
+            )
+        if video_chain.rtcp_probe_pad is not None:
+            video_chain.rtcp_probe_pad.add_probe(
+                Gst.PadProbeType.BUFFER,
+                self._make_rtcp_video_probe(branch),
+                None,
+            )
+        if len(video_chain.media_elements) >= 4:
+            for index, key in ((1, 'video_jb'), (2, 'video_depay'), (3, 'video_dec')):
+                pad = video_chain.media_elements[index].get_static_pad('src')
+                if pad is not None:
+                    pad.add_probe(
+                        Gst.PadProbeType.BUFFER,
+                        self._make_count_probe(branch, key),
+                        None,
+                    )
+        video_src_pad.add_probe(
+            Gst.PadProbeType.BUFFER,
+            self._make_running_time_offset_probe(),
+            None,
+        )
+        video_src_pad.add_probe(
+            Gst.PadProbeType.BUFFER,
+            self._make_video_probe(branch),
+            None,
+        )
+
+        branch.video_elements = list(video_chain.elements)
+        branch.elements = remaining + video_chain.elements
+        branch.signal_handlers = kept_handlers + list(video_chain.signal_handlers)
+        branch.video_scale = video_scale
+        branch.video_mode = 'rtp'
+        if display_name:
+            branch.display_name = display_name
+        branch.stats.video_buffers = 0
+        branch.stats.rtp_video_packets = 0
+        branch.stats.rtcp_video_packets = 0
+        logger.info(
+            'Restored live RTP video for peer %s (display_name=%s)',
+            participant_peer_id,
+            branch.display_name or participant_peer_id,
+        )
 
     def add_rtmp_source(self, source_id: str, *, url: str, display_name: str = '') -> IngestStats:
         with self._lock:
@@ -1164,9 +1481,12 @@ class CompositorPipeline:
             compositor_sink_pad=compositor_sink_pad,
             mixer_sink_pad=mixer_pad,
             elements=all_elements,
+            video_elements=list(video_chain.elements),
+            audio_elements=list(audio_chain.elements),
             stats=IngestStats(),
             signal_handlers=video_chain.signal_handlers + audio_chain.signal_handlers,
             video_scale=video_scale,
+            video_mode='rtp',
         )
 
         if video_chain.rtp_probe_pad is not None:
@@ -1468,6 +1788,8 @@ class CompositorPipeline:
 
         for element, handler_id in branch.signal_handlers:
             element.disconnect(handler_id)
+
+        branch.placeholder_keep_alive = None
 
         if self._compositor is not None:
             self._compositor.release_request_pad(branch.compositor_sink_pad)

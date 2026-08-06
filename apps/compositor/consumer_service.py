@@ -27,10 +27,12 @@ logger = logging.getLogger(__name__)
 class ParticipantIngest:
     participant_peer_id: str
     audio_producer_id: str
-    video_producer_id: str
+    video_producer_id: str | None
     ports: ParticipantPorts
     audio_consumer_id: str
-    video_consumer_id: str
+    video_consumer_id: str | None
+    video_mode: str = 'rtp'  # 'rtp' | 'placeholder'
+    display_name: str = ''
 
 
 class ConsumerService:
@@ -202,6 +204,7 @@ class ConsumerService:
             ports=ports,
             audio_consumer_id=audio_consumer['consumerId'],
             video_consumer_id=video_consumer['consumerId'],
+            video_mode='rtp',
         )
         self._schedule_video_keyframe_retries(participant)
 
@@ -226,6 +229,117 @@ class ConsumerService:
 
         return participant
 
+    def soft_disable_video(
+        self,
+        participant: ParticipantIngest,
+        *,
+        display_name: str = '',
+    ) -> None:
+        """Keep peer on stage; replace live video pad feed with initials placeholder."""
+        name = display_name or participant.display_name or participant.participant_peer_id
+        self._compositor_pipeline.set_participant_video_placeholder(
+            participant.participant_peer_id,
+            display_name=name,
+        )
+        participant.video_producer_id = None
+        participant.video_consumer_id = None
+        participant.video_mode = 'placeholder'
+        participant.display_name = name
+        logger.info(
+            'Soft-disabled video ingest for participant %s in room %s',
+            participant.participant_peer_id,
+            self._room_id,
+        )
+
+    def soft_enable_video(
+        self,
+        participant: ParticipantIngest,
+        video_producer_id: str,
+        *,
+        display_name: str = '',
+    ) -> None:
+        """
+        Restore or replace live webcam without requiring a mic producer.
+
+        Used after soft-disable (placeholder) and for scene camera switches where
+        the video producer id changes while the mic is muted (still rtp mode).
+        Reuses the participant's existing video RTP ports and keeps the audio
+        branch on stage (silent/inactive when the mic is muted).
+        """
+        name = display_name or participant.display_name or participant.participant_peer_id
+        ports = participant.ports
+
+        video_transport = self._client.create_plain_transport(
+            self._room_id,
+            self._compositor_peer_id,
+            rtcp_mux=False,
+        )
+        self._client.connect_plain_transport(
+            self._room_id,
+            self._compositor_peer_id,
+            video_transport['transportId'],
+            ip=self._rtp_host,
+            port=ports.video.rtp_port,
+            rtcp_port=ports.video.rtcp_port,
+            rtcp_mux=False,
+        )
+
+        self._ensure_joined()
+
+        video_consumer = self._client.create_consumer(
+            self._room_id,
+            self._compositor_peer_id,
+            transport_id=video_transport['transportId'],
+            producer_id=video_producer_id,
+            rtp_capabilities=build_video_rtp_capabilities(self._video_payload_type),
+            paused=True,
+        )
+        if 'rtpParameters' not in video_consumer:
+            raise RuntimeError(
+                'mediasoup consume response missing rtpParameters for soft-enable video '
+                f'(keys={list(video_consumer.keys())})'
+            )
+
+        video_wire_pt = get_payload_type_from_rtp_parameters(
+            video_consumer['rtpParameters']
+        )
+
+        try:
+            self._compositor_pipeline.replace_participant_video_rtp(
+                participant.participant_peer_id,
+                video_port=ports.video.rtp_port,
+                video_rtcp_port=ports.video.rtcp_port,
+                video_payload_type=video_wire_pt,
+                video_mediasoup_transport=_plain_transport_tuple(video_transport),
+                rtcp_mux=False,
+                display_name=name,
+            )
+        except Exception:
+            # Pipeline may have fallen back to a placeholder seat after a failed link.
+            participant.video_producer_id = None
+            participant.video_consumer_id = None
+            participant.video_mode = 'placeholder'
+            raise
+
+        self._client.resume_consumer(
+            self._room_id,
+            self._compositor_peer_id,
+            video_consumer['consumerId'],
+        )
+
+        participant.video_producer_id = video_producer_id
+        participant.video_consumer_id = video_consumer['consumerId']
+        participant.video_mode = 'rtp'
+        participant.display_name = name
+        self._schedule_video_keyframe_retries(participant)
+
+        logger.info(
+            'Soft-enabled video ingest for participant %s in room %s (video=%s)',
+            participant.participant_peer_id,
+            self._room_id,
+            video_producer_id,
+        )
+
     def _schedule_video_keyframe_retries(self, participant: ParticipantIngest) -> None:
         """
         Re-hit resume (mediasoup requests a PLI/keyframe) until video decodes.
@@ -241,6 +355,8 @@ class ConsumerService:
                 if stats is None:
                     return
                 if stats.video_buffers > 0:
+                    return
+                if not participant.video_consumer_id:
                     return
                 try:
                     self._client.resume_consumer(

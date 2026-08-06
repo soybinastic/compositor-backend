@@ -182,6 +182,11 @@ COMPOSITOR_RTP_HOST = os.getenv('COMPOSITOR_RTP_HOST', '127.0.0.1')
 COMPOSITOR_RTP_PORT_MIN = int(os.getenv('COMPOSITOR_RTP_PORT_MIN', '50000'))
 COMPOSITOR_RTP_PORT_MAX = int(os.getenv('COMPOSITOR_RTP_PORT_MAX', '50999'))
 PRODUCER_POLL_INTERVAL = float(os.getenv('PRODUCER_POLL_INTERVAL', '2'))
+# Seconds to wait after webcam producer disappears before initials placeholder.
+# Default 0: swap immediately so the live mix never freezes on a dead RTP pad
+# (which can stall RTMP without a GStreamer ERROR). Raise only if scene camera
+# switch briefly flashes placeholder (video returns on the next poll).
+VIDEO_SOFT_DISABLE_GRACE_SEC = float(os.getenv('VIDEO_SOFT_DISABLE_GRACE_SEC', '0'))
 
 CANVAS_WIDTH = int(os.getenv('CANVAS_WIDTH', '1920'))
 CANVAS_HEIGHT = int(os.getenv('CANVAS_HEIGHT', '1080'))

@@ -70,7 +70,10 @@ def dispatch_command(ingest_manager: SessionIngestManager, command: SessionComma
         return None
 
     if isinstance(command, SyncProducersCommand):
-        ingest_manager.sync_producers(command.peer_producers_infos)
+        ingest_manager.sync_producers(
+            command.peer_producers_infos,
+            joined_peers=command.joined_peers,
+        )
         return None
 
     if isinstance(command, GetStatusCommand):

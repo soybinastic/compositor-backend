@@ -48,6 +48,7 @@ _COMMAND_TYPES: dict[CommandType, type[SessionCommand]] = {
 
 _PATH_FIELDS = frozenset({'file_path', 'output_dir'})
 _LIST_FIELDS = frozenset({'destination_urls'})
+_EMPTY_LIST_FIELDS = frozenset({'joined_peers', 'hidden_source_ids'})
 
 
 def encode_command(command: SessionCommand) -> dict[str, Any]:
@@ -66,6 +67,8 @@ def decode_command(payload: dict[str, Any]) -> SessionCommand:
             decoded[field.name] = Path(raw) if raw is not None else None
         elif field.name in _LIST_FIELDS:
             decoded[field.name] = list(raw) if raw is not None else None
+        elif field.name in _EMPTY_LIST_FIELDS:
+            decoded[field.name] = list(raw) if raw is not None else []
         else:
             decoded[field.name] = raw
     return command_cls(**decoded)

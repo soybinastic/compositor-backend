@@ -1,10 +1,11 @@
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-from django.test import TestCase
+from django.test import TestCase, override_settings
 
 from apps.compositor.consumer_service import ConsumerService
 from apps.compositor.ports import PortAllocator
 from apps.compositor.session_ingest_manager import SessionIngestManager
+from apps.compositor.video_placeholder import placeholder_initials
 from apps.sessions.models import StudioSession
 from integrations.mediasoup.rtp import (
     build_audio_rtp_capabilities,
@@ -12,6 +13,30 @@ from integrations.mediasoup.rtp import (
 )
 
 
+class VideoPlaceholderHelpersTests(TestCase):
+    def test_placeholder_initials(self):
+        self.assertEqual(placeholder_initials('Jane Doe'), 'JD')
+        self.assertEqual(placeholder_initials('Host (You)'), 'H')
+        self.assertEqual(placeholder_initials(''), '?')
+
+    def test_render_participant_placeholder_image_size_and_opaque(self):
+        from apps.compositor.video_placeholder import render_participant_placeholder_image
+
+        image = render_participant_placeholder_image(
+            display_name='Jane Doe',
+            width=320,
+            height=180,
+        )
+        self.assertEqual(image.size, (320, 180))
+        self.assertEqual(image.mode, 'RGBA')
+        # Sample near the left edge of the avatar circle (away from initials).
+        short = min(320, 180)
+        diameter = max(48, int(short * 0.22))
+        cx, cy = 160, int(180 * 0.44)
+        edge_x = cx - diameter // 2 + 4
+        self.assertEqual(image.getpixel((edge_x, cy))[:3], (63, 63, 70))
+        # Corner stays zinc-800 background.
+        self.assertEqual(image.getpixel((2, 2))[:3], (39, 39, 42))
 class PortAllocatorTests(TestCase):
     def test_allocates_non_overlapping_ports(self):
         allocator = PortAllocator(min_port=50000, max_port=50020)
@@ -75,6 +100,17 @@ class RtpCapabilitiesTests(TestCase):
         )
 
 
+def _av_peer(peer_id: str, audio_id: str, video_id: str, display_name: str = '') -> dict:
+    return {
+        'peerId': peer_id,
+        'displayName': display_name or peer_id,
+        'producers': [
+            {'producerId': audio_id, 'kind': 'audio', 'source': 'audio'},
+            {'producerId': video_id, 'kind': 'video', 'source': 'video'},
+        ],
+    }
+
+
 class SessionIngestManagerTests(TestCase):
     def test_sync_producers_attaches_and_detaches(self):
         session = StudioSession.objects.create(
@@ -99,23 +135,8 @@ class SessionIngestManagerTests(TestCase):
         )
 
         manager.sync_producers(
-            [
-                {
-                    'peerId': 'guest-1',
-                    'producers': [
-                        {
-                            'producerId': 'audio-1',
-                            'kind': 'audio',
-                            'source': 'audio',
-                        },
-                        {
-                            'producerId': 'video-1',
-                            'kind': 'video',
-                            'source': 'video',
-                        },
-                    ],
-                }
-            ]
+            [_av_peer('guest-1', 'audio-1', 'video-1', 'Guest')],
+            joined_peers=[{'peerId': 'guest-1', 'displayName': 'Guest'}],
         )
 
         mock_consumer_service.attach_participant.assert_called_once_with(
@@ -124,7 +145,7 @@ class SessionIngestManagerTests(TestCase):
             'video-1',
         )
 
-        manager.sync_producers([])
+        manager.sync_producers([], joined_peers=[])
         mock_consumer_service.detach_participant.assert_called_once_with(mock_participant)
 
     def test_sync_producers_reattaches_when_producer_ids_change(self):
@@ -134,10 +155,12 @@ class SessionIngestManagerTests(TestCase):
         first.participant_peer_id = 'guest-1'
         first.audio_producer_id = 'audio-1'
         first.video_producer_id = 'video-1'
+        first.video_mode = 'rtp'
         second = MagicMock()
         second.participant_peer_id = 'guest-1'
         second.audio_producer_id = 'audio-2'
         second.video_producer_id = 'video-2'
+        second.video_mode = 'rtp'
         mock_consumer_service.attach_participant.return_value = second
         mock_compositor_pipeline = MagicMock()
 
@@ -151,15 +174,10 @@ class SessionIngestManagerTests(TestCase):
         )
         manager._participants['guest-1'] = first
 
-        peer_producers = {
-            'peerId': 'guest-1',
-            'producers': [
-                {'producerId': 'audio-2', 'kind': 'audio', 'source': 'audio'},
-                {'producerId': 'video-2', 'kind': 'video', 'source': 'video'},
-            ],
-        }
-
-        manager.sync_producers([peer_producers])
+        manager.sync_producers(
+            [_av_peer('guest-1', 'audio-2', 'video-2')],
+            joined_peers=[{'peerId': 'guest-1', 'displayName': 'Guest'}],
+        )
 
         mock_consumer_service.detach_participant.assert_called_once_with(first)
         mock_consumer_service.attach_participant.assert_called_once_with(
@@ -168,6 +186,217 @@ class SessionIngestManagerTests(TestCase):
             'video-2',
         )
         self.assertIs(manager._participants['guest-1'], second)
+
+    @override_settings(VIDEO_SOFT_DISABLE_GRACE_SEC=0)
+    def test_sync_soft_disables_when_webcam_missing_but_still_joined(self):
+        mock_consumer_service = MagicMock(spec=ConsumerService)
+        mock_consumer_service.joined = True
+        current = MagicMock()
+        current.participant_peer_id = 'guest-1'
+        current.audio_producer_id = 'audio-1'
+        current.video_producer_id = 'video-1'
+        current.video_mode = 'rtp'
+        mock_compositor_pipeline = MagicMock()
+
+        manager = SessionIngestManager(
+            session_id='session-1',
+            room_id='session-1',
+            compositor_peer_id='compositor-session-1',
+            layout='CONTAIN',
+            consumer_service=mock_consumer_service,
+            compositor_pipeline=mock_compositor_pipeline,
+        )
+        manager._participants['guest-1'] = current
+
+        audio_only = {
+            'peerId': 'guest-1',
+            'displayName': 'Guest',
+            'producers': [
+                {'producerId': 'audio-1', 'kind': 'audio', 'source': 'audio'},
+            ],
+        }
+
+        manager.sync_producers(
+            [audio_only],
+            joined_peers=[{'peerId': 'guest-1', 'displayName': 'Guest'}],
+        )
+
+        mock_consumer_service.soft_disable_video.assert_called_once()
+        mock_consumer_service.detach_participant.assert_not_called()
+        self.assertIn('guest-1', manager._participants)
+
+    @override_settings(VIDEO_SOFT_DISABLE_GRACE_SEC=0)
+    def test_sync_soft_enables_video_when_webcam_returns_without_mic(self):
+        """Mic-muted guests must leave placeholder when webcam alone returns."""
+        mock_consumer_service = MagicMock(spec=ConsumerService)
+        current = MagicMock()
+        current.participant_peer_id = 'guest-1'
+        current.audio_producer_id = 'audio-1'
+        current.video_producer_id = None
+        current.video_mode = 'placeholder'
+        manager = SessionIngestManager(
+            session_id='session-1',
+            room_id='session-1',
+            compositor_peer_id='compositor-session-1',
+            layout='CONTAIN',
+            consumer_service=mock_consumer_service,
+            compositor_pipeline=MagicMock(),
+        )
+        manager._participants['guest-1'] = current
+
+        video_only = {
+            'peerId': 'guest-1',
+            'displayName': 'Guest',
+            'producers': [
+                {'producerId': 'video-2', 'kind': 'video', 'source': 'video'},
+            ],
+        }
+
+        manager.sync_producers(
+            [video_only],
+            joined_peers=[{'peerId': 'guest-1', 'displayName': 'Guest'}],
+        )
+
+        mock_consumer_service.soft_enable_video.assert_called_once_with(
+            current,
+            'video-2',
+            display_name='Guest',
+        )
+        mock_consumer_service.attach_participant.assert_not_called()
+        mock_consumer_service.detach_participant.assert_not_called()
+
+    def test_sync_soft_enables_when_scene_camera_changes_while_mic_muted(self):
+        """Scene switch: new video id while still rtp + no mic must not stay frozen."""
+        mock_consumer_service = MagicMock(spec=ConsumerService)
+        current = MagicMock()
+        current.participant_peer_id = 'host-1'
+        current.audio_producer_id = 'audio-old'
+        current.video_producer_id = 'video-old'
+        current.video_mode = 'rtp'
+        manager = SessionIngestManager(
+            session_id='session-1',
+            room_id='session-1',
+            compositor_peer_id='compositor-session-1',
+            layout='CONTAIN',
+            consumer_service=mock_consumer_service,
+            compositor_pipeline=MagicMock(),
+        )
+        manager._participants['host-1'] = current
+
+        video_only = {
+            'peerId': 'host-1',
+            'displayName': 'Host',
+            'producers': [
+                {'producerId': 'video-new', 'kind': 'video', 'source': 'video'},
+            ],
+        }
+
+        manager.sync_producers(
+            [video_only],
+            joined_peers=[{'peerId': 'host-1', 'displayName': 'Host'}],
+        )
+
+        mock_consumer_service.soft_enable_video.assert_called_once_with(
+            current,
+            'video-new',
+            display_name='Host',
+        )
+        mock_consumer_service.detach_participant.assert_not_called()
+        mock_consumer_service.attach_participant.assert_not_called()
+
+    def test_sync_reattaches_when_scene_camera_changes_with_mic(self):
+        mock_consumer_service = MagicMock(spec=ConsumerService)
+        current = MagicMock()
+        current.participant_peer_id = 'host-1'
+        current.audio_producer_id = 'audio-1'
+        current.video_producer_id = 'video-old'
+        current.video_mode = 'rtp'
+        replacement = MagicMock()
+        mock_consumer_service.attach_participant.return_value = replacement
+        manager = SessionIngestManager(
+            session_id='session-1',
+            room_id='session-1',
+            compositor_peer_id='compositor-session-1',
+            layout='CONTAIN',
+            consumer_service=mock_consumer_service,
+            compositor_pipeline=MagicMock(),
+        )
+        manager._participants['host-1'] = current
+
+        manager.sync_producers(
+            [
+                {
+                    'peerId': 'host-1',
+                    'displayName': 'Host',
+                    'producers': [
+                        {'producerId': 'audio-1', 'kind': 'audio', 'source': 'audio'},
+                        {'producerId': 'video-new', 'kind': 'video', 'source': 'video'},
+                    ],
+                }
+            ],
+            joined_peers=[{'peerId': 'host-1', 'displayName': 'Host'}],
+        )
+
+        mock_consumer_service.detach_participant.assert_called_once_with(current)
+        mock_consumer_service.attach_participant.assert_called_once_with(
+            'host-1',
+            'audio-1',
+            'video-new',
+        )
+        mock_consumer_service.soft_enable_video.assert_not_called()
+        self.assertIs(manager._participants['host-1'], replacement)
+
+    @override_settings(VIDEO_SOFT_DISABLE_GRACE_SEC=5)
+    def test_sync_respects_soft_disable_grace_when_configured(self):
+        mock_consumer_service = MagicMock(spec=ConsumerService)
+        current = MagicMock()
+        current.participant_peer_id = 'guest-1'
+        current.audio_producer_id = 'audio-1'
+        current.video_producer_id = 'video-1'
+        current.video_mode = 'rtp'
+        manager = SessionIngestManager(
+            session_id='session-1',
+            room_id='session-1',
+            compositor_peer_id='compositor-session-1',
+            layout='CONTAIN',
+            consumer_service=mock_consumer_service,
+            compositor_pipeline=MagicMock(),
+        )
+        manager._participants['guest-1'] = current
+
+        audio_only = {
+            'peerId': 'guest-1',
+            'displayName': 'Guest',
+            'producers': [
+                {'producerId': 'audio-1', 'kind': 'audio', 'source': 'audio'},
+            ],
+        }
+
+        manager.sync_producers(
+            [audio_only],
+            joined_peers=[{'peerId': 'guest-1', 'displayName': 'Guest'}],
+        )
+        mock_consumer_service.soft_disable_video.assert_not_called()
+        self.assertIn('guest-1', manager._video_missing_since)
+
+    def test_sync_hard_detaches_when_peer_leaves(self):
+        mock_consumer_service = MagicMock(spec=ConsumerService)
+        current = MagicMock()
+        current.video_mode = 'placeholder'
+        mock_compositor_pipeline = MagicMock()
+        manager = SessionIngestManager(
+            session_id='session-1',
+            room_id='session-1',
+            compositor_peer_id='compositor-session-1',
+            layout='CONTAIN',
+            consumer_service=mock_consumer_service,
+            compositor_pipeline=mock_compositor_pipeline,
+        )
+        manager._participants['guest-1'] = current
+
+        manager.sync_producers([], joined_peers=[])
+        mock_consumer_service.detach_participant.assert_called_once_with(current)
+        self.assertNotIn('guest-1', manager._participants)
 
     def test_set_layout_updates_compositor_pipeline(self):
         mock_consumer_service = MagicMock(spec=ConsumerService)
@@ -202,12 +431,8 @@ class SessionIngestManagerTests(TestCase):
         )
 
         manager.sync_producers(
-            [
-                {
-                    'peerId': 'compositor-session-1',
-                    'producers': [],
-                }
-            ]
+            [{'peerId': 'compositor-session-1', 'producers': []}],
+            joined_peers=[{'peerId': 'compositor-session-1', 'displayName': 'Compositor'}],
         )
 
         mock_consumer_service.attach_participant.assert_not_called()
