@@ -749,6 +749,165 @@ class CompositorPipeline:
             branch.display_name,
         )
 
+    def replace_participant_video_rtp(
+        self,
+        participant_peer_id: str,
+        *,
+        video_port: int,
+        video_rtcp_port: int,
+        video_payload_type: int,
+        video_mediasoup_transport: MediasoupTransportTuple,
+        rtcp_mux: bool = False,
+        display_name: str = '',
+    ) -> None:
+        """Soft-enable: swap initials placeholder back to live RTP video; keep audio."""
+        with self._lock:
+            self._replace_participant_video_rtp_unlocked(
+                participant_peer_id,
+                video_port=video_port,
+                video_rtcp_port=video_rtcp_port,
+                video_payload_type=video_payload_type,
+                video_mediasoup_transport=video_mediasoup_transport,
+                rtcp_mux=rtcp_mux,
+                display_name=display_name,
+            )
+
+    def _replace_participant_video_rtp_unlocked(
+        self,
+        participant_peer_id: str,
+        *,
+        video_port: int,
+        video_rtcp_port: int,
+        video_payload_type: int,
+        video_mediasoup_transport: MediasoupTransportTuple,
+        rtcp_mux: bool,
+        display_name: str,
+    ) -> None:
+        if self._pipeline is None or self._video_mix_backend is None:
+            raise RuntimeError('Compositor pipeline is not started')
+
+        branch = self._participants.get(participant_peer_id)
+        if branch is None:
+            raise RuntimeError(f'Participant {participant_peer_id} is not on stage')
+
+        old_video = list(branch.video_elements)
+        old_ids = {id(element) for element in old_video}
+        kept_handlers: list[tuple[Gst.Element, int]] = []
+        for element, handler_id in branch.signal_handlers:
+            if id(element) in old_ids:
+                element.disconnect(handler_id)
+            else:
+                kept_handlers.append((element, handler_id))
+
+        video_chain = self._build_video_ingest_chain(
+            participant_peer_id=participant_peer_id,
+            rtp_port=video_port,
+            rtcp_port=video_rtcp_port,
+            payload_type=video_payload_type,
+            mediasoup_transport=video_mediasoup_transport,
+            rtcp_mux=rtcp_mux,
+        )
+
+        for element in video_chain.elements:
+            self._pipeline.add(element)
+        self._link_sequential(
+            video_chain.media_elements,
+            label=f'video-restore-{participant_peer_id}',
+        )
+        for upstream, downstream in video_chain.rtcp_links:
+            if not upstream.link(downstream):
+                raise RuntimeError(
+                    f'Failed to link RTCP drain while restoring video for {participant_peer_id}'
+                )
+
+        peer_pad = branch.compositor_sink_pad.get_peer()
+        if peer_pad is not None:
+            peer_pad.unlink(branch.compositor_sink_pad)
+
+        sink_pad = branch.compositor_sink_pad
+        sink_pad.send_event(Gst.Event.new_flush_start())
+        sink_pad.send_event(Gst.Event.new_flush_stop(True))
+
+        video_src_pad = video_chain.output.get_static_pad('src')
+        if video_src_pad is None or video_src_pad.link(sink_pad) != Gst.PadLinkReturn.OK:
+            for element in video_chain.elements:
+                element.set_state(Gst.State.NULL)
+                self._pipeline.remove(element)
+            raise RuntimeError(
+                f'Failed to link restored video to compositor for {participant_peer_id}'
+            )
+
+        for element in reversed(video_chain.elements):
+            if not element.sync_state_with_parent():
+                logger.warning(
+                    'Restored video element %s failed to sync for peer %s',
+                    element.get_name(),
+                    participant_peer_id,
+                )
+
+        for element in old_video:
+            element.set_state(Gst.State.NULL)
+            self._pipeline.remove(element)
+
+        remaining = [element for element in branch.elements if id(element) not in old_ids]
+        video_scale = next(
+            (
+                element
+                for element in video_chain.media_elements
+                if element.get_factory() is not None
+                and element.get_factory().get_name() == 'videoscale'
+            ),
+            None,
+        )
+
+        if video_chain.rtp_probe_pad is not None:
+            video_chain.rtp_probe_pad.add_probe(
+                Gst.PadProbeType.BUFFER,
+                self._make_rtp_video_probe(branch),
+                None,
+            )
+        if video_chain.rtcp_probe_pad is not None:
+            video_chain.rtcp_probe_pad.add_probe(
+                Gst.PadProbeType.BUFFER,
+                self._make_rtcp_video_probe(branch),
+                None,
+            )
+        if len(video_chain.media_elements) >= 4:
+            for index, key in ((1, 'video_jb'), (2, 'video_depay'), (3, 'video_dec')):
+                pad = video_chain.media_elements[index].get_static_pad('src')
+                if pad is not None:
+                    pad.add_probe(
+                        Gst.PadProbeType.BUFFER,
+                        self._make_count_probe(branch, key),
+                        None,
+                    )
+        video_src_pad.add_probe(
+            Gst.PadProbeType.BUFFER,
+            self._make_running_time_offset_probe(),
+            None,
+        )
+        video_src_pad.add_probe(
+            Gst.PadProbeType.BUFFER,
+            self._make_video_probe(branch),
+            None,
+        )
+
+        branch.video_elements = list(video_chain.elements)
+        branch.elements = remaining + video_chain.elements
+        branch.signal_handlers = kept_handlers + list(video_chain.signal_handlers)
+        branch.video_scale = video_scale
+        branch.video_mode = 'rtp'
+        if display_name:
+            branch.display_name = display_name
+        branch.stats.video_buffers = 0
+        branch.stats.rtp_video_packets = 0
+        branch.stats.rtcp_video_packets = 0
+        logger.info(
+            'Restored live RTP video for peer %s (display_name=%s)',
+            participant_peer_id,
+            branch.display_name or participant_peer_id,
+        )
+
     def add_rtmp_source(self, source_id: str, *, url: str, display_name: str = '') -> IngestStats:
         with self._lock:
             if self._pipeline is None:

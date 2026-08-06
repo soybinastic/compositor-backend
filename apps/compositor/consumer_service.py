@@ -251,6 +251,86 @@ class ConsumerService:
             self._room_id,
         )
 
+    def soft_enable_video(
+        self,
+        participant: ParticipantIngest,
+        video_producer_id: str,
+        *,
+        display_name: str = '',
+    ) -> None:
+        """
+        Restore live webcam after soft-disable without requiring a mic producer.
+
+        Reuses the participant's existing video RTP ports and keeps the audio
+        branch on stage (silent/inactive when the mic is muted).
+        """
+        name = display_name or participant.display_name or participant.participant_peer_id
+        ports = participant.ports
+
+        video_transport = self._client.create_plain_transport(
+            self._room_id,
+            self._compositor_peer_id,
+            rtcp_mux=False,
+        )
+        self._client.connect_plain_transport(
+            self._room_id,
+            self._compositor_peer_id,
+            video_transport['transportId'],
+            ip=self._rtp_host,
+            port=ports.video.rtp_port,
+            rtcp_port=ports.video.rtcp_port,
+            rtcp_mux=False,
+        )
+
+        self._ensure_joined()
+
+        video_consumer = self._client.create_consumer(
+            self._room_id,
+            self._compositor_peer_id,
+            transport_id=video_transport['transportId'],
+            producer_id=video_producer_id,
+            rtp_capabilities=build_video_rtp_capabilities(self._video_payload_type),
+            paused=True,
+        )
+        if 'rtpParameters' not in video_consumer:
+            raise RuntimeError(
+                'mediasoup consume response missing rtpParameters for soft-enable video '
+                f'(keys={list(video_consumer.keys())})'
+            )
+
+        video_wire_pt = get_payload_type_from_rtp_parameters(
+            video_consumer['rtpParameters']
+        )
+
+        self._compositor_pipeline.replace_participant_video_rtp(
+            participant.participant_peer_id,
+            video_port=ports.video.rtp_port,
+            video_rtcp_port=ports.video.rtcp_port,
+            video_payload_type=video_wire_pt,
+            video_mediasoup_transport=_plain_transport_tuple(video_transport),
+            rtcp_mux=False,
+            display_name=name,
+        )
+
+        self._client.resume_consumer(
+            self._room_id,
+            self._compositor_peer_id,
+            video_consumer['consumerId'],
+        )
+
+        participant.video_producer_id = video_producer_id
+        participant.video_consumer_id = video_consumer['consumerId']
+        participant.video_mode = 'rtp'
+        participant.display_name = name
+        self._schedule_video_keyframe_retries(participant)
+
+        logger.info(
+            'Soft-enabled video ingest for participant %s in room %s (video=%s)',
+            participant.participant_peer_id,
+            self._room_id,
+            video_producer_id,
+        )
+
     def _schedule_video_keyframe_retries(self, participant: ParticipantIngest) -> None:
         """
         Re-hit resume (mediasoup requests a PLI/keyframe) until video decodes.

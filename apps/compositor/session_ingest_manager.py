@@ -263,10 +263,28 @@ class SessionIngestManager:
                 # Already attached — live video present (webcam or screenshare).
                 if video_id:
                     self._video_missing_since.pop(peer_id, None)
+
+                    # Cam back after soft-disable: restore video only so a muted
+                    # mic (no audio producer) cannot block leaving the placeholder.
+                    if current.video_mode == 'placeholder':
+                        try:
+                            self._consumer_service.soft_enable_video(
+                                current,
+                                video_id,
+                                display_name=display_name,
+                            )
+                            if audio_id:
+                                current.audio_producer_id = audio_id
+                        except Exception:
+                            logger.exception(
+                                'Failed to soft-enable video for participant %s',
+                                peer_id,
+                            )
+                        continue
+
                     needs_reattach = (
                         current.audio_producer_id != audio_id
                         or current.video_producer_id != video_id
-                        or current.video_mode == 'placeholder'
                         or audio_id is None
                     )
                     if needs_reattach and audio_id and video_id:
