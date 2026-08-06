@@ -662,10 +662,6 @@ class CompositorPipeline:
                 branch.display_name = display_name
             return
 
-        peer_pad = branch.compositor_sink_pad.get_peer()
-        if peer_pad is not None:
-            peer_pad.unlink(branch.compositor_sink_pad)
-
         video_elements = list(branch.video_elements) or [
             element
             for element in branch.elements
@@ -679,11 +675,8 @@ class CompositorPipeline:
             else:
                 kept_handlers.append((element, handler_id))
 
-        for element in video_elements:
-            element.set_state(Gst.State.NULL)
-            self._pipeline.remove(element)
-
-        remaining = [element for element in branch.elements if id(element) not in video_ids]
+        # Build + link the placeholder graph before tearing down RTP so the
+        # compositor sink is idle for the shortest possible window.
         ingest_tail = self._video_mix_backend.build_ingest_tail(
             f'ph_{participant_peer_id}'
         )
@@ -692,7 +685,7 @@ class CompositorPipeline:
             display_name=display_name or branch.display_name or participant_peer_id,
             width=self.width,
             height=self.height,
-            fps=min(self.fps, 15),
+            fps=self.fps,
             ingest_tail=ingest_tail,
         )
 
@@ -703,15 +696,37 @@ class CompositorPipeline:
             label=f'placeholder-{participant_peer_id}',
         )
 
+        peer_pad = branch.compositor_sink_pad.get_peer()
+        if peer_pad is not None:
+            peer_pad.unlink(branch.compositor_sink_pad)
+
+        # Flush so force-live compositor does not wait on the old pad's running time.
+        sink_pad = branch.compositor_sink_pad
+        sink_pad.send_event(Gst.Event.new_flush_start())
+        sink_pad.send_event(Gst.Event.new_flush_stop(True))
+
         src_pad = output.get_static_pad('src')
-        if src_pad is None or src_pad.link(branch.compositor_sink_pad) != Gst.PadLinkReturn.OK:
+        if src_pad is None or src_pad.link(sink_pad) != Gst.PadLinkReturn.OK:
+            for element in placeholder_elements:
+                element.set_state(Gst.State.NULL)
+                self._pipeline.remove(element)
             raise RuntimeError(
                 f'Failed to link placeholder to compositor for {participant_peer_id}'
             )
 
         for element in reversed(placeholder_elements):
-            element.sync_state_with_parent()
+            if not element.sync_state_with_parent():
+                logger.warning(
+                    'Placeholder element %s failed to sync for peer %s',
+                    element.get_name(),
+                    participant_peer_id,
+                )
 
+        for element in video_elements:
+            element.set_state(Gst.State.NULL)
+            self._pipeline.remove(element)
+
+        remaining = [element for element in branch.elements if id(element) not in video_ids]
         video_scale = next(
             (
                 element

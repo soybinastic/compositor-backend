@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 def _video_soft_disable_grace_sec() -> float:
-    return float(getattr(settings, 'VIDEO_SOFT_DISABLE_GRACE_SEC', 3.0))
+    return float(getattr(settings, 'VIDEO_SOFT_DISABLE_GRACE_SEC', 0.0))
 
 
 @dataclass
@@ -193,7 +193,7 @@ class SessionIngestManager:
         Attach / soft-disable / detach based on producers + room presence.
 
         Sticky peers (still joined) keep their layout seat when webcam closes.
-        After a short grace, missing video becomes an initials placeholder.
+        Missing video becomes an initials placeholder immediately (grace default 0).
         Re-enable uses full re-attach when a video producer returns.
         """
         if self._stopped:
@@ -295,18 +295,24 @@ class SessionIngestManager:
                 if current.video_mode == 'placeholder':
                     continue
 
+                # Soft-disable as soon as the webcam producer is gone so the mix
+                # never freezes on a dead RTP pad (grace only delays the swap and
+                # starved the RTMP encoder). Scene camera switch may flash a
+                # placeholder for one poll interval, then re-attach when video
+                # returns.
+                grace = _video_soft_disable_grace_sec()
                 missing_since = self._video_missing_since.get(peer_id)
                 now = time.monotonic()
                 if missing_since is None:
                     self._video_missing_since[peer_id] = now
-                    logger.info(
-                        'Webcam missing for sticky peer %s; grace %.1fs before placeholder',
-                        peer_id,
-                        _video_soft_disable_grace_sec(),
-                    )
-                    continue
-
-                if now - missing_since < _video_soft_disable_grace_sec():
+                    if grace > 0:
+                        logger.info(
+                            'Webcam missing for sticky peer %s; grace %.1fs before placeholder',
+                            peer_id,
+                            grace,
+                        )
+                        continue
+                elif grace > 0 and now - missing_since < grace:
                     continue
 
                 try:

@@ -51,10 +51,15 @@ def build_participant_placeholder_chain(
 
     src.set_property('is-live', True)
     src.set_property('pattern', 2)  # black
+    # Align timestamps with the pipeline clock so the live compositor/encoder
+    # keep flowing after a mid-stream pad swap (avoids silent RTMP stalls).
+    if src.find_property('do-timestamp') is not None:
+        src.set_property('do-timestamp', True)
     caps.set_property(
         'caps',
         Gst.Caps.from_string(
-            f'video/x-raw,width={max(2, width)},height={max(2, height)},framerate={fps}/1'
+            f'video/x-raw,format=I420,width={max(2, width)},height={max(2, height)},'
+            f'framerate={fps}/1'
         ),
     )
     text.set_property('text', overlay_text)

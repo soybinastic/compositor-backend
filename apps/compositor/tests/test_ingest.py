@@ -200,20 +200,47 @@ class SessionIngestManagerTests(TestCase):
             ],
         }
 
-        # First poll starts grace (even with 0, missing_since is set then next check).
-        manager.sync_producers(
-            [audio_only],
-            joined_peers=[{'peerId': 'guest-1', 'displayName': 'Guest'}],
-        )
-        # Second poll past grace → soft disable.
         manager.sync_producers(
             [audio_only],
             joined_peers=[{'peerId': 'guest-1', 'displayName': 'Guest'}],
         )
 
-        mock_consumer_service.soft_disable_video.assert_called()
+        mock_consumer_service.soft_disable_video.assert_called_once()
         mock_consumer_service.detach_participant.assert_not_called()
         self.assertIn('guest-1', manager._participants)
+
+    @override_settings(VIDEO_SOFT_DISABLE_GRACE_SEC=5)
+    def test_sync_respects_soft_disable_grace_when_configured(self):
+        mock_consumer_service = MagicMock(spec=ConsumerService)
+        current = MagicMock()
+        current.participant_peer_id = 'guest-1'
+        current.audio_producer_id = 'audio-1'
+        current.video_producer_id = 'video-1'
+        current.video_mode = 'rtp'
+        manager = SessionIngestManager(
+            session_id='session-1',
+            room_id='session-1',
+            compositor_peer_id='compositor-session-1',
+            layout='CONTAIN',
+            consumer_service=mock_consumer_service,
+            compositor_pipeline=MagicMock(),
+        )
+        manager._participants['guest-1'] = current
+
+        audio_only = {
+            'peerId': 'guest-1',
+            'displayName': 'Guest',
+            'producers': [
+                {'producerId': 'audio-1', 'kind': 'audio', 'source': 'audio'},
+            ],
+        }
+
+        manager.sync_producers(
+            [audio_only],
+            joined_peers=[{'peerId': 'guest-1', 'displayName': 'Guest'}],
+        )
+        mock_consumer_service.soft_disable_video.assert_not_called()
+        self.assertIn('guest-1', manager._video_missing_since)
 
     def test_sync_hard_detaches_when_peer_leaves(self):
         mock_consumer_service = MagicMock(spec=ConsumerService)
