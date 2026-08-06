@@ -33,9 +33,9 @@ class SessionProducerPollerTests(TestCase):
             'joinedPeers': [{'peerId': 'guest-1', 'displayName': 'Guest'}],
         }
 
-        def sync_producers(infos):
+        def sync_producers(infos, joined_peers=None):
             with lock:
-                synced.append(infos)
+                synced.append((infos, joined_peers or []))
 
         poller = SessionProducerPoller(
             'session-1',
@@ -56,7 +56,8 @@ class SessionProducerPollerTests(TestCase):
             poller.stop()
 
         self.assertEqual(len(synced), 1)
-        self.assertEqual(synced[0][0]['peerId'], 'guest-1')
+        self.assertEqual(synced[0][0][0]['peerId'], 'guest-1')
+        self.assertEqual(synced[0][1][0]['peerId'], 'guest-1')
         client.get_producers.assert_called_with('room-1')
 
     def test_start_and_stop_registry_helpers(self):
@@ -66,7 +67,7 @@ class SessionProducerPollerTests(TestCase):
         start_session_producer_poller(
             session_id,
             session_id,
-            sync_producers=lambda _infos: calls.append(session_id),
+            sync_producers=lambda _infos, _joined=None: calls.append(session_id),
             client=MagicMock(get_producers=MagicMock(return_value={
                 'peerProducersInfos': [],
                 'joinedPeers': [],

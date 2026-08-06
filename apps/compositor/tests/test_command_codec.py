@@ -68,12 +68,15 @@ class CommandCodecTests(TestCase):
 
     def test_sync_producers_roundtrip(self):
         peers = [{'peerId': 'guest-1', 'producers': []}]
+        joined = [{'peerId': 'guest-1', 'displayName': 'Guest'}]
         command = SyncProducersCommand(
             session_id='session-1',
             peer_producers_infos=peers,
+            joined_peers=joined,
         )
         restored = decode_command(encode_command(command))
         self.assertEqual(restored.peer_producers_infos, peers)
+        self.assertEqual(restored.joined_peers, joined)
 
     def test_set_tile_order_roundtrip(self):
         command = SetTileOrderCommand(

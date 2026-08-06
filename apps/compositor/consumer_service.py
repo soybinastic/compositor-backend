@@ -27,10 +27,12 @@ logger = logging.getLogger(__name__)
 class ParticipantIngest:
     participant_peer_id: str
     audio_producer_id: str
-    video_producer_id: str
+    video_producer_id: str | None
     ports: ParticipantPorts
     audio_consumer_id: str
-    video_consumer_id: str
+    video_consumer_id: str | None
+    video_mode: str = 'rtp'  # 'rtp' | 'placeholder'
+    display_name: str = ''
 
 
 class ConsumerService:
@@ -202,6 +204,7 @@ class ConsumerService:
             ports=ports,
             audio_consumer_id=audio_consumer['consumerId'],
             video_consumer_id=video_consumer['consumerId'],
+            video_mode='rtp',
         )
         self._schedule_video_keyframe_retries(participant)
 
@@ -226,6 +229,28 @@ class ConsumerService:
 
         return participant
 
+    def soft_disable_video(
+        self,
+        participant: ParticipantIngest,
+        *,
+        display_name: str = '',
+    ) -> None:
+        """Keep peer on stage; replace live video pad feed with initials placeholder."""
+        name = display_name or participant.display_name or participant.participant_peer_id
+        self._compositor_pipeline.set_participant_video_placeholder(
+            participant.participant_peer_id,
+            display_name=name,
+        )
+        participant.video_producer_id = None
+        participant.video_consumer_id = None
+        participant.video_mode = 'placeholder'
+        participant.display_name = name
+        logger.info(
+            'Soft-disabled video ingest for participant %s in room %s',
+            participant.participant_peer_id,
+            self._room_id,
+        )
+
     def _schedule_video_keyframe_retries(self, participant: ParticipantIngest) -> None:
         """
         Re-hit resume (mediasoup requests a PLI/keyframe) until video decodes.
@@ -241,6 +266,8 @@ class ConsumerService:
                 if stats is None:
                     return
                 if stats.video_buffers > 0:
+                    return
+                if not participant.video_consumer_id:
                     return
                 try:
                     self._client.resume_consumer(

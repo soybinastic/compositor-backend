@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -19,11 +20,15 @@ from integrations.mediasoup.client import MediasoupHttpClient
 logger = logging.getLogger(__name__)
 
 
+def _video_soft_disable_grace_sec() -> float:
+    return float(getattr(settings, 'VIDEO_SOFT_DISABLE_GRACE_SEC', 3.0))
+
+
 @dataclass
 class ParticipantIngestStatus:
     participant_peer_id: str
     audio_producer_id: str
-    video_producer_id: str
+    video_producer_id: str | None
     audio_port: int
     video_port: int
     audio_buffers: int
@@ -88,6 +93,9 @@ class SessionIngestManager:
         self._rtmp_sources: dict[str, dict[str, str]] = {}
         self._lock = threading.Lock()
         self._stopped = False
+        # peer_id → monotonic time when video producer first went missing
+        self._video_missing_since: dict[str, float] = {}
+        self._display_names: dict[str, str] = {}
 
     @classmethod
     def create(
@@ -176,64 +184,145 @@ class SessionIngestManager:
     def stop_countdown(self) -> None:
         self._compositor_pipeline.stop_countdown()
 
-    def sync_producers(self, peer_producers_infos: list[dict[str, Any]]) -> None:
-        """Attach or detach participants based on mediasoup producer state."""
+    def sync_producers(
+        self,
+        peer_producers_infos: list[dict[str, Any]],
+        joined_peers: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """
+        Attach / soft-disable / detach based on producers + room presence.
+
+        Sticky peers (still joined) keep their layout seat when webcam closes.
+        After a short grace, missing video becomes an initials placeholder.
+        Re-enable uses full re-attach when a video producer returns.
+        """
         if self._stopped:
             return
 
-        desired: dict[str, tuple[str, str]] = {}
-
+        joined_peers = joined_peers or []
+        producers_by_peer: dict[str, dict[str, Any]] = {}
         for peer_info in peer_producers_infos:
-            participant_peer_id = peer_info['peerId']
-
-            if participant_peer_id == self.compositor_peer_id:
+            peer_id = peer_info.get('peerId')
+            if not peer_id or not isinstance(peer_id, str):
                 continue
-            if participant_peer_id.startswith('compositor-'):
+            if self._is_compositor_peer(peer_id):
                 continue
+            producers_by_peer[peer_id] = peer_info
+            display_name = peer_info.get('displayName')
+            if isinstance(display_name, str) and display_name.strip():
+                self._display_names[peer_id] = display_name.strip()
 
-            audio_id, video_id = self._extract_av_producers(peer_info)
-            if audio_id and video_id:
-                desired[participant_peer_id] = (audio_id, video_id)
+        stage_roster: set[str] = set()
+        for peer in joined_peers:
+            peer_id = peer.get('peerId') if isinstance(peer, dict) else None
+            if not peer_id or not isinstance(peer_id, str):
+                continue
+            if self._is_compositor_peer(peer_id):
+                continue
+            stage_roster.add(peer_id)
+            display_name = peer.get('displayName')
+            if isinstance(display_name, str) and display_name.strip():
+                self._display_names[peer_id] = display_name.strip()
+
+        # Fallback when older mediasoup builds omit joinedPeers: keep anyone with producers.
+        if not joined_peers:
+            stage_roster |= set(producers_by_peer.keys())
 
         with self._lock:
-            for participant_peer_id in list(self._participants.keys()):
-                if participant_peer_id not in desired:
+            # Hard detach peers that left the room.
+            for peer_id in list(self._participants.keys()):
+                if peer_id not in stage_roster:
+                    participant = self._participants.pop(peer_id)
+                    self._video_missing_since.pop(peer_id, None)
+                    self._consumer_service.detach_participant(participant)
+
+            for peer_id in stage_roster:
+                peer_info = producers_by_peer.get(peer_id, {'peerId': peer_id, 'producers': []})
+                audio_id, video_id = self._extract_av_producers(peer_info)
+                display_name = self._display_names.get(peer_id, peer_id)
+                current = self._participants.get(peer_id)
+
+                if current is None:
+                    if audio_id and video_id:
+                        try:
+                            participant = self._consumer_service.attach_participant(
+                                peer_id,
+                                audio_id,
+                                video_id,
+                            )
+                            participant.display_name = display_name
+                            self._participants[peer_id] = participant
+                            self._video_missing_since.pop(peer_id, None)
+                        except Exception:
+                            logger.exception(
+                                'Failed to attach ingest for participant %s',
+                                peer_id,
+                            )
                     continue
 
-                audio_id, video_id = desired[participant_peer_id]
-                current = self._participants[participant_peer_id]
-                if (
-                    current.audio_producer_id != audio_id
-                    or current.video_producer_id != video_id
-                ):
+                # Already attached — live video present (webcam or screenshare).
+                if video_id:
+                    self._video_missing_since.pop(peer_id, None)
+                    needs_reattach = (
+                        current.audio_producer_id != audio_id
+                        or current.video_producer_id != video_id
+                        or current.video_mode == 'placeholder'
+                        or audio_id is None
+                    )
+                    if needs_reattach and audio_id and video_id:
+                        logger.info(
+                            'Re-attaching ingest for %s (live video restore/replace)',
+                            peer_id,
+                        )
+                        self._consumer_service.detach_participant(current)
+                        del self._participants[peer_id]
+                        try:
+                            participant = self._consumer_service.attach_participant(
+                                peer_id,
+                                audio_id,
+                                video_id,
+                            )
+                            participant.display_name = display_name
+                            self._participants[peer_id] = participant
+                        except Exception:
+                            logger.exception(
+                                'Failed to re-attach ingest for participant %s',
+                                peer_id,
+                            )
+                    continue
+
+                # No video producer while sticky (webcam disabled).
+                if current.video_mode == 'placeholder':
+                    continue
+
+                missing_since = self._video_missing_since.get(peer_id)
+                now = time.monotonic()
+                if missing_since is None:
+                    self._video_missing_since[peer_id] = now
                     logger.info(
-                        'Re-attaching ingest for %s (producer ids changed)',
-                        participant_peer_id,
+                        'Webcam missing for sticky peer %s; grace %.1fs before placeholder',
+                        peer_id,
+                        _video_soft_disable_grace_sec(),
                     )
-                    self._consumer_service.detach_participant(current)
-                    del self._participants[participant_peer_id]
+                    continue
 
-            current_ids = set(self._participants.keys())
-            desired_ids = set(desired.keys())
+                if now - missing_since < _video_soft_disable_grace_sec():
+                    continue
 
-            for participant_peer_id in desired_ids - current_ids:
-                audio_id, video_id = desired[participant_peer_id]
                 try:
-                    participant = self._consumer_service.attach_participant(
-                        participant_peer_id,
-                        audio_id,
-                        video_id,
+                    self._consumer_service.soft_disable_video(
+                        current,
+                        display_name=display_name,
                     )
-                    self._participants[participant_peer_id] = participant
+                    self._video_missing_since.pop(peer_id, None)
                 except Exception:
                     logger.exception(
-                        'Failed to attach ingest for participant %s',
-                        participant_peer_id,
+                        'Failed to soft-disable video for participant %s',
+                        peer_id,
                     )
 
-            for participant_peer_id in current_ids - desired_ids:
-                participant = self._participants.pop(participant_peer_id)
-                self._consumer_service.detach_participant(participant)
+    def _is_compositor_peer(self, peer_id: str) -> bool:
+        return peer_id == self.compositor_peer_id or peer_id.startswith('compositor-')
 
     def add_rtmp_source(
         self,

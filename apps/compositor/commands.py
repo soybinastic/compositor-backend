@@ -124,6 +124,7 @@ class GetStatusCommand(SessionCommand):
 @dataclass(frozen=True, kw_only=True)
 class SyncProducersCommand(SessionCommand):
     peer_producers_infos: list[dict[str, Any]]
+    joined_peers: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def command_type(self) -> CommandType:

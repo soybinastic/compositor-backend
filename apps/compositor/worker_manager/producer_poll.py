@@ -15,11 +15,15 @@ def attach_producer_poller(
     *,
     client: MediasoupHttpClient | None = None,
 ) -> None:
-    def sync_producers(peer_producers_infos: list) -> None:
+    def sync_producers(
+        peer_producers_infos: list,
+        joined_peers: list | None = None,
+    ) -> None:
         executor.submit_command(
             SyncProducersCommand(
                 session_id=session_id,
                 peer_producers_infos=peer_producers_infos,
+                joined_peers=list(joined_peers or []),
             )
         )
 
