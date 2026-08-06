@@ -19,8 +19,24 @@ class VideoPlaceholderHelpersTests(TestCase):
         self.assertEqual(placeholder_initials('Host (You)'), 'H')
         self.assertEqual(placeholder_initials(''), '?')
 
+    def test_render_participant_placeholder_image_size_and_opaque(self):
+        from apps.compositor.video_placeholder import render_participant_placeholder_image
 
-
+        image = render_participant_placeholder_image(
+            display_name='Jane Doe',
+            width=320,
+            height=180,
+        )
+        self.assertEqual(image.size, (320, 180))
+        self.assertEqual(image.mode, 'RGBA')
+        # Sample near the left edge of the avatar circle (away from initials).
+        short = min(320, 180)
+        diameter = max(48, int(short * 0.22))
+        cx, cy = 160, int(180 * 0.44)
+        edge_x = cx - diameter // 2 + 4
+        self.assertEqual(image.getpixel((edge_x, cy))[:3], (63, 63, 70))
+        # Corner stays zinc-800 background.
+        self.assertEqual(image.getpixel((2, 2))[:3], (39, 39, 42))
 class PortAllocatorTests(TestCase):
     def test_allocates_non_overlapping_ports(self):
         allocator = PortAllocator(min_port=50000, max_port=50020)

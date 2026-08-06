@@ -91,6 +91,8 @@ class ParticipantBranch:
     video_scale: Gst.Element | None = None
     video_mode: str = 'rtp'  # 'rtp' | 'placeholder'
     display_name: str = ''
+    # GdkPixbuf pixel buffer must outlive the overlay element.
+    placeholder_keep_alive: object | None = None
 
 
 @dataclass
@@ -680,7 +682,7 @@ class CompositorPipeline:
         ingest_tail = self._video_mix_backend.build_ingest_tail(
             f'ph_{participant_peer_id}'
         )
-        placeholder_elements, output = build_participant_placeholder_chain(
+        placeholder_elements, output, keep_alive = build_participant_placeholder_chain(
             peer_id=participant_peer_id,
             display_name=display_name or branch.display_name or participant_peer_id,
             width=self.width,
@@ -743,6 +745,7 @@ class CompositorPipeline:
         branch.video_scale = video_scale
         branch.video_mode = 'placeholder'
         branch.display_name = display_name or branch.display_name or participant_peer_id
+        branch.placeholder_keep_alive = keep_alive
         logger.info(
             'Soft-disabled video for peer %s (placeholder display_name=%s)',
             participant_peer_id,
@@ -816,6 +819,7 @@ class CompositorPipeline:
         branch.video_elements = []
         branch.signal_handlers = kept_handlers
         branch.video_scale = None
+        branch.placeholder_keep_alive = None
 
         sink_pad.send_event(Gst.Event.new_flush_start())
         sink_pad.send_event(Gst.Event.new_flush_stop(True))
@@ -1784,6 +1788,8 @@ class CompositorPipeline:
 
         for element, handler_id in branch.signal_handlers:
             element.disconnect(handler_id)
+
+        branch.placeholder_keep_alive = None
 
         if self._compositor is not None:
             self._compositor.release_request_pad(branch.compositor_sink_pad)
