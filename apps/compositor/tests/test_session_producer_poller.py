@@ -23,7 +23,14 @@ class SessionProducerPollerTests(TestCase):
         lock = threading.Lock()
         client = MagicMock()
         client.get_producers.return_value = {
-            'peerProducersInfos': [{'peerId': 'guest-1', 'producers': []}],
+            'peerProducersInfos': [
+                {
+                    'peerId': 'guest-1',
+                    'displayName': 'Guest',
+                    'producers': [],
+                }
+            ],
+            'joinedPeers': [{'peerId': 'guest-1', 'displayName': 'Guest'}],
         }
 
         def sync_producers(infos):
@@ -60,7 +67,10 @@ class SessionProducerPollerTests(TestCase):
             session_id,
             session_id,
             sync_producers=lambda _infos: calls.append(session_id),
-            client=MagicMock(get_producers=MagicMock(return_value={'peerProducersInfos': []})),
+            client=MagicMock(get_producers=MagicMock(return_value={
+                'peerProducersInfos': [],
+                'joinedPeers': [],
+            })),
         )
         self.assertEqual(get_poller_registry().count(), 1)
 

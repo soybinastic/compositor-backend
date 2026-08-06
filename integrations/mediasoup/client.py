@@ -48,9 +48,29 @@ class MediasoupHttpClient:
         return result if isinstance(result, dict) else {}
 
     def get_producers(self, room_id: str) -> dict[str, Any]:
-        """List all active producers in a room."""
+        """
+        List active producers and joined WebRTC peers in a room.
+
+        Response shape (additive fields are safe for older callers):
+          {
+            "peerProducersInfos": [
+              {
+                "peerId": "...",
+                "displayName": "...",
+                "producers": [...]
+              }
+            ],
+            "joinedPeers": [
+              {"peerId": "...", "displayName": "..."}
+            ]
+          }
+        """
         result = self._request('GET', f'/rooms/{room_id}/producers')
-        return result if isinstance(result, dict) else {'peerProducersInfos': []}
+        if not isinstance(result, dict):
+            return {'peerProducersInfos': [], 'joinedPeers': []}
+        result.setdefault('peerProducersInfos', [])
+        result.setdefault('joinedPeers', [])
+        return result
 
     def create_broadcaster(
         self,
