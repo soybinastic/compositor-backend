@@ -35,6 +35,10 @@ ALL_LAYERS = (
     LAYER_CHAT,
 )
 
+# Scene-level style scalars stored alongside layers in graphics_config.
+STYLE_FONTS = 'fonts'
+GRAPHICS_STYLE_KEYS = (STYLE_FONTS,)
+
 # Background only visible on these layouts (CONTAIN=0 / FULLSCREEN=6 in legacy enums).
 BACKGROUND_VISIBLE_LAYOUTS = frozenset({'CONTAIN', 'FULLSCREEN'})
 

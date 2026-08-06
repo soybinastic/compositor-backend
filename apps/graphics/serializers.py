@@ -115,6 +115,9 @@ class BulkGraphicsSerializer(serializers.Serializer):
     banner = BannerSerializer(required=False, allow_null=True)
     ticker = TickerSerializer(required=False, allow_null=True)
     chat = ChatSerializer(required=False, allow_null=True)
+    # Scene-level typography (sibling of layers; not a clearable graphic pad).
+    fonts = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    fontFamily = serializers.CharField(required=False, allow_null=True, allow_blank=True)
 
 
 class GraphicsStateSerializer(serializers.Serializer):
@@ -125,3 +128,5 @@ class GraphicsStateSerializer(serializers.Serializer):
     banner = serializers.JSONField(allow_null=True, required=False)
     ticker = serializers.JSONField(allow_null=True, required=False)
     chat = serializers.JSONField(allow_null=True, required=False)
+    fonts = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    fontFamily = serializers.CharField(required=False, allow_null=True, allow_blank=True)

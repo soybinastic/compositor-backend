@@ -88,3 +88,33 @@ class StateMergeTests(SimpleTestCase):
         current['overlay'] = {'url': 'https://x/o.png', 'is_active': True}
         merged = merge_graphics_state(current, {'overlay': None})
         self.assertIsNone(merged['overlay'])
+
+    def test_merge_preserves_fonts_when_patching_banner(self):
+        current = empty_graphics_state()
+        current['fonts'] = 'Rubik'
+        current['banner'] = {'title': 'Old', 'is_display': True}
+        merged = merge_graphics_state(current, {'banner': {'title': 'New', 'is_display': True}})
+        self.assertEqual(merged['fonts'], 'Rubik')
+        self.assertEqual(merged['banner']['title'], 'New')
+
+    def test_merge_sets_and_clears_fonts(self):
+        current = empty_graphics_state()
+        merged = merge_graphics_state(current, {'fonts': 'Montserrat'})
+        self.assertEqual(merged['fonts'], 'Montserrat')
+        cleared = merge_graphics_state(merged, {'fonts': None})
+        self.assertIsNone(cleared['fonts'])
+
+    def test_merge_accepts_fontFamily_alias(self):
+        current = empty_graphics_state()
+        merged = merge_graphics_state(current, {'fontFamily': 'Open Sans'})
+        self.assertEqual(merged['fonts'], 'Open Sans')
+        self.assertNotIn('fontFamily', merged)
+
+    def test_snapshot_preserves_fonts(self):
+        from apps.graphics.state import snapshot_graphics_state
+
+        snap = snapshot_graphics_state({'fonts': 'Geologica', 'banner': {'title': 'Hi'}})
+        self.assertEqual(snap['fonts'], 'Geologica')
+        self.assertEqual(snap['banner']['title'], 'Hi')
+        self.assertIsNone(snap['ticker'])
+

@@ -61,6 +61,11 @@ from apps.graphics.renderers.pil_overlays import (
     render_ticker_text_strip,
     ticker_bar_height,
 )
+from apps.graphics.typography import (
+    FontFaceLoader,
+    SceneTypographyPolicy,
+    create_default_font_loader,
+)
 from apps.graphics.visibility import (
     background_should_show,
     banner_should_show,
@@ -91,7 +96,13 @@ _DIRECT_OVERLAY_LAYERS = frozenset(
 class GraphicsController:
     """Owns graphic mixer pads for one CompositorPipeline (caller holds pipeline lock)."""
 
-    def __init__(self, owner: CompositorPipeline) -> None:
+    def __init__(
+        self,
+        owner: CompositorPipeline,
+        *,
+        font_loader: FontFaceLoader | None = None,
+        typography_policy: SceneTypographyPolicy | None = None,
+    ) -> None:
         self._owner = owner
         # Legacy compositor-pad branches (unused for backgrounds; kept for teardown).
         self._branches: dict[str, GraphicBranch] = {}
@@ -106,6 +117,14 @@ class GraphicsController:
         self._countdown_duration = 0
         self._pending_state: dict[str, Any] = {}
         self._stack_fingerprint: object | None = None
+        self._font_loader = font_loader or create_default_font_loader()
+        self._typography = typography_policy or SceneTypographyPolicy(
+            catalog=self._font_loader.catalog,
+        )
+
+    def _scene_font_family(self) -> str | None:
+        """Canonical scene font for burn-in, or None for legacy Arial/DejaVu."""
+        return self._typography.engine_family(self._pending_state)
 
     @property
     def branches(self) -> dict[str, GraphicBranch]:
@@ -293,11 +312,14 @@ class GraphicsController:
         font_size = int(config.get('font_size') or 36)
         canvas_w = self._owner.width
         canvas_h = self._owner.height
+        font_family = self._scene_font_family()
         bar_width = banner_content_width(
             title,
             description,
             font_size,
             canvas_w=canvas_w,
+            font_family=font_family,
+            font_loader=self._font_loader,
         )
         primary_height = banner_bar_height(font_size)
         desc_font_size = max(16, font_size - 8)
@@ -505,6 +527,7 @@ class GraphicsController:
         primary = str(config.get('primary') or '')
         secondary = str(config.get('secondary') or '')
         accent = str(config.get('accent') or '')
+        font_family = self._scene_font_family()
         bottom_inset = self._resolve_banner_bottom_inset()
         sig = content_signature(
             {
@@ -515,6 +538,7 @@ class GraphicsController:
                 'primary': primary,
                 'secondary': secondary,
                 'accent': accent,
+                'fonts': font_family,
                 'bottom_inset': bottom_inset,
                 'layer': LAYER_BANNER,
             }
@@ -540,6 +564,8 @@ class GraphicsController:
                 accent=accent,
                 font_size=font_size,
                 is_primary=True,
+                font_family=font_family,
+                font_loader=self._font_loader,
             )
             self._set_pixbuf_layer(
                 'banner_primary',
@@ -558,6 +584,8 @@ class GraphicsController:
                 accent=accent,
                 font_size=desc_font_size,
                 is_primary=False,
+                font_family=font_family,
+                font_loader=self._font_loader,
             )
             self._set_pixbuf_layer(
                 'banner_secondary',
@@ -582,6 +610,7 @@ class GraphicsController:
         if style:
             primary = str(style.get('primary') or primary)
             secondary = str(style.get('secondary') or secondary)
+        font_family = self._scene_font_family()
         sig = content_signature(
             {
                 'text': text,
@@ -590,6 +619,7 @@ class GraphicsController:
                 'position': position,
                 'primary': primary,
                 'secondary': secondary,
+                'fonts': font_family,
                 'chat_active': chat_active,
                 'layer': LAYER_TICKER,
             }
@@ -609,6 +639,8 @@ class GraphicsController:
             canvas_width=canvas_w,
             text=text,
             secondary=secondary,
+            font_family=font_family,
+            font_loader=self._font_loader,
         )
         bar_geom = ticker_geometry(
             canvas_w,
@@ -650,12 +682,26 @@ class GraphicsController:
             return
         assert config is not None
         messages = config.get('messages') or []
-        sig = content_signature({'enabled': True, 'messages': messages, 'layer': LAYER_CHAT})
+        font_family = self._scene_font_family()
+        sig = content_signature(
+            {
+                'enabled': True,
+                'messages': messages,
+                'fonts': font_family,
+                'layer': LAYER_CHAT,
+            }
+        )
         existing = self._pixbuf_layers.get(LAYER_CHAT)
         if existing and existing.signature == sig and existing.visible:
             return
         geom = chat_geometry(self._owner.width, self._owner.height)
-        img = render_chat_panel(width=geom[2], height=geom[3], messages=list(messages))
+        img = render_chat_panel(
+            width=geom[2],
+            height=geom[3],
+            messages=list(messages),
+            font_family=font_family,
+            font_loader=self._font_loader,
+        )
         self._set_pixbuf_layer(LAYER_CHAT, img, geometry=geom, signature=sig)
         self._reposition_ticker_if_present('')
         self._reposition_banner_if_present()
@@ -678,10 +724,13 @@ class GraphicsController:
 
     def _render_countdown_frame(self) -> None:
         remaining = self._countdown_seconds_remaining()
+        font_family = self._scene_font_family()
         img = render_countdown_overlay(
             canvas_width=self._owner.width,
             canvas_height=self._owner.height,
             seconds_remaining=remaining,
+            font_family=font_family,
+            font_loader=self._font_loader,
         )
         geom = countdown_geometry(
             self._owner.width,
