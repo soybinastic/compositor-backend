@@ -20,8 +20,6 @@ FONT_FAMILY_FILES: dict[str, str] = {
     'Fira Mono': 'FiraMono-Bold.ttf',
     'Permanent Marker': 'PermanentMarker-Regular.ttf',
     'Geologica': 'Geologica_Auto-Bold.ttf',
-    'Graphik': 'Graphik-Bold.ttf',
-    'Dyna Puff': 'DynaPuff-Regular.ttf',
     'Departure Mono': 'FiraMono-Bold.ttf',
 }
 
