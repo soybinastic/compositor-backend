@@ -11,16 +11,17 @@ from apps.graphics.constants import (
     BANNER_MIN_WIDTH,
     BANNER_X,
 )
+from apps.graphics.typography import FontFaceLoader, create_default_font_loader
 
 
-def _font(size: int) -> ImageFont.ImageFont:
-    try:
-        return ImageFont.truetype('/System/Library/Fonts/Supplemental/Arial.ttf', size)
-    except OSError:
-        try:
-            return ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', size)
-        except OSError:
-            return ImageFont.load_default()
+def _resolve_font(
+    size: int,
+    *,
+    font_family: str | None = None,
+    font_loader: FontFaceLoader | None = None,
+) -> ImageFont.ImageFont:
+    loader = font_loader or create_default_font_loader()
+    return loader.load(font_family, size)
 
 
 def _parse_color(value: str | None, default: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
@@ -57,10 +58,16 @@ def banner_bar_height(font_size: int) -> int:
     return max(48, font_size + 24)
 
 
-def banner_text_width(text: str, font_size: int) -> int:
+def banner_text_width(
+    text: str,
+    font_size: int,
+    *,
+    font_family: str | None = None,
+    font_loader: FontFaceLoader | None = None,
+) -> int:
     if not text.strip():
         return 0
-    font = _font(font_size)
+    font = _resolve_font(font_size, font_family=font_family, font_loader=font_loader)
     probe = Image.new('RGBA', (1, 1))
     draw = ImageDraw.Draw(probe)
     bbox = draw.textbbox((0, 0), text, font=font)
@@ -73,10 +80,22 @@ def banner_content_width(
     font_size: int,
     *,
     canvas_w: int,
+    font_family: str | None = None,
+    font_loader: FontFaceLoader | None = None,
 ) -> int:
-    title_width = banner_text_width(title, font_size)
+    title_width = banner_text_width(
+        title,
+        font_size,
+        font_family=font_family,
+        font_loader=font_loader,
+    )
     desc_font_size = max(16, font_size - 8)
-    desc_width = banner_text_width(description, desc_font_size)
+    desc_width = banner_text_width(
+        description,
+        desc_font_size,
+        font_family=font_family,
+        font_loader=font_loader,
+    )
     content_width = max(title_width, desc_width, BANNER_MIN_WIDTH)
     max_width = max(1, canvas_w - BANNER_X * 2)
     return min(content_width, max_width)
@@ -128,6 +147,8 @@ def render_banner_bar(
     accent: str = '',
     font_size: int = 36,
     is_primary: bool = True,
+    font_family: str | None = None,
+    font_loader: FontFaceLoader | None = None,
 ) -> Image.Image:
     height = banner_bar_height(font_size)
     img = Image.new('RGBA', (width, height), (0, 0, 0, 0))
@@ -150,7 +171,7 @@ def render_banner_bar(
         accent=accent_color,
     )
 
-    font = _font(font_size)
+    font = _resolve_font(font_size, font_family=font_family, font_loader=font_loader)
     draw.text((20, (height - font_size) // 2), title, font=font, fill=fg)
     return img
 
@@ -162,6 +183,8 @@ def render_ticker_bar(
     primary: str = '',
     secondary: str = '',
     font_size: int = 28,
+    font_family: str | None = None,
+    font_loader: FontFaceLoader | None = None,
 ) -> Image.Image:
     """Legacy single-strip renderer (background + text). Prefer split renderers."""
     height = ticker_bar_height(font_size)
@@ -171,6 +194,8 @@ def render_ticker_bar(
         text=text,
         secondary=secondary,
         font_size=font_size,
+        font_family=font_family,
+        font_loader=font_loader,
     )
     combined = bg.copy()
     combined.alpha_composite(text_strip, dest=(0, 0))
@@ -198,9 +223,11 @@ def render_ticker_text_strip(
     text: str,
     secondary: str = '',
     font_size: int = 28,
+    font_family: str | None = None,
+    font_loader: FontFaceLoader | None = None,
 ) -> Image.Image:
     height = ticker_bar_height(font_size)
-    font = _font(font_size)
+    font = _resolve_font(font_size, font_family=font_family, font_loader=font_loader)
     probe = Image.new('RGBA', (1, 1))
     draw = ImageDraw.Draw(probe)
     bbox = draw.textbbox((0, 0), text, font=font)
@@ -223,6 +250,8 @@ def render_countdown_overlay(
     canvas_width: int,
     canvas_height: int,
     seconds_remaining: int,
+    font_family: str | None = None,
+    font_loader: FontFaceLoader | None = None,
 ) -> Image.Image:
     label = format_countdown_label(seconds_remaining)
     box_w = min(420, max(220, canvas_width // 4))
@@ -231,7 +260,7 @@ def render_countdown_overlay(
     draw = ImageDraw.Draw(img)
     draw.rounded_rectangle([0, 0, box_w - 1, box_h - 1], radius=16, fill=(0, 0, 0, 200))
     font_size = max(36, min(96, box_h // 2))
-    font = _font(font_size)
+    font = _resolve_font(font_size, font_family=font_family, font_loader=font_loader)
     bbox = draw.textbbox((0, 0), label, font=font)
     text_w = bbox[2] - bbox[0]
     text_h = bbox[3] - bbox[1]
@@ -249,10 +278,12 @@ def render_chat_panel(
     width: int,
     height: int,
     messages: list[dict[str, Any]],
+    font_family: str | None = None,
+    font_loader: FontFaceLoader | None = None,
 ) -> Image.Image:
     img = Image.new('RGBA', (width, height), (10, 10, 14, 180))
     draw = ImageDraw.Draw(img)
-    font = _font(22)
+    font = _resolve_font(22, font_family=font_family, font_loader=font_loader)
     y = 16
     for message in messages[-20:]:
         author = str(message.get('author') or '')
