@@ -212,12 +212,21 @@ def merge_sources_config(
         merged.update(existing)
         if 'assignments' not in merged:
             merged['assignments'] = {}
+        if 'items' not in merged:
+            merged['items'] = []
     if not incoming:
         return merged
     if 'version' in incoming and isinstance(incoming['version'], int):
         merged['version'] = incoming['version']
     if 'sources' in incoming and isinstance(incoming['sources'], list):
         merged['sources'] = incoming['sources']
+    if 'items' in incoming and isinstance(incoming['items'], list):
+        merged['items'] = incoming['items']
+        if merged.get('version', 1) < 2:
+            merged['version'] = 2
+        # When items are provided without explicit assignments, derive slots.
+        if 'assignments' not in incoming:
+            merged['assignments'] = assignments_from_scene_items(incoming['items'])
     if 'assignments' in incoming:
         raw_assignments = incoming.get('assignments')
         if raw_assignments == {}:
@@ -227,3 +236,25 @@ def merge_sources_config(
             combined.update(sanitize_assignments_for_storage(raw_assignments))
             merged['assignments'] = combined
     return merged
+
+
+def assignments_from_scene_items(items: list | None) -> dict[str, str]:
+    """Build slot assignments from visible SceneItems ordered by zIndex."""
+    if not items:
+        return {}
+    ordered: list[dict] = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        if raw.get('visible', True) is False:
+            continue
+        source_id = raw.get('sourceId') or raw.get('source_id')
+        if not source_id:
+            continue
+        try:
+            z_index = int(raw.get('zIndex', raw.get('z_index', 0)))
+        except (TypeError, ValueError):
+            z_index = 0
+        ordered.append({'sourceId': str(source_id), 'zIndex': z_index})
+    ordered.sort(key=lambda item: item['zIndex'])
+    return {str(index): item['sourceId'] for index, item in enumerate(ordered)}

@@ -11,9 +11,19 @@ from apps.streaming.views import (
     SessionStreamStopView,
 )
 from apps.sources.views import (
+    SceneSourceAttachView,
+    SceneSourceDetachView,
+    SceneSourceReorderView,
+    SceneSourceVisibilityView,
     SessionRtmpSourceCreateView,
     SessionRtmpSourceDeleteView,
     SessionRtmpSourceListView,
+    SessionSourceDetailView,
+    SessionSourceListCreateView,
+    SessionSourcePauseView,
+    SessionSourcePlayView,
+    SessionSourceSeekView,
+    SessionSourceStopView,
 )
 from apps.scenes.views import (
     SessionSceneActivateView,
@@ -94,6 +104,56 @@ urlpatterns = [
         'sessions/<uuid:session_id>/rtmp-sources/<str:source_id>/',
         SessionRtmpSourceDeleteView.as_view(),
         name='session-rtmp-source-delete',
+    ),
+    path(
+        'sessions/<uuid:session_id>/sources/',
+        SessionSourceListCreateView.as_view(),
+        name='session-source-list-create',
+    ),
+    path(
+        'sessions/<uuid:session_id>/sources/<str:source_id>/',
+        SessionSourceDetailView.as_view(),
+        name='session-source-detail',
+    ),
+    path(
+        'sessions/<uuid:session_id>/sources/<str:source_id>/play/',
+        SessionSourcePlayView.as_view(),
+        name='session-source-play',
+    ),
+    path(
+        'sessions/<uuid:session_id>/sources/<str:source_id>/pause/',
+        SessionSourcePauseView.as_view(),
+        name='session-source-pause',
+    ),
+    path(
+        'sessions/<uuid:session_id>/sources/<str:source_id>/stop/',
+        SessionSourceStopView.as_view(),
+        name='session-source-stop',
+    ),
+    path(
+        'sessions/<uuid:session_id>/sources/<str:source_id>/seek/',
+        SessionSourceSeekView.as_view(),
+        name='session-source-seek',
+    ),
+    path(
+        'sessions/<uuid:session_id>/scenes/<uuid:scene_id>/sources/attach/',
+        SceneSourceAttachView.as_view(),
+        name='scene-source-attach',
+    ),
+    path(
+        'sessions/<uuid:session_id>/scenes/<uuid:scene_id>/sources/<str:source_id>/',
+        SceneSourceDetachView.as_view(),
+        name='scene-source-detach',
+    ),
+    path(
+        'sessions/<uuid:session_id>/scenes/<uuid:scene_id>/sources/<str:source_id>/visibility/',
+        SceneSourceVisibilityView.as_view(),
+        name='scene-source-visibility',
+    ),
+    path(
+        'sessions/<uuid:session_id>/scenes/<uuid:scene_id>/sources/reorder/',
+        SceneSourceReorderView.as_view(),
+        name='scene-source-reorder',
     ),
     path(
         'sessions/<uuid:session_id>/scenes/',

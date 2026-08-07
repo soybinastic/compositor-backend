@@ -144,6 +144,32 @@ class MediasoupHttpClient:
             body,
         )
 
+    def create_producer(
+        self,
+        room_id: str,
+        peer_id: str,
+        *,
+        transport_id: str,
+        kind: str,
+        rtp_parameters: dict[str, Any],
+        app_data: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Create a mediasoup Producer on a BroadcasterPeer PlainTransport."""
+        result = self._request(
+            'POST',
+            f'/rooms/{room_id}/broadcasters/{peer_id}/producers',
+            {
+                'transportId': transport_id,
+                'kind': kind,
+                'rtpParameters': rtp_parameters,
+                'appData': app_data,
+            },
+        )
+        return result if isinstance(result, dict) else {}
+
+    # Alias used by SFU egress helpers.
+    produce = create_producer
+
     def create_consumer(
         self,
         room_id: str,

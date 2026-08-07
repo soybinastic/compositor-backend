@@ -26,13 +26,17 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ParticipantIngest:
     participant_peer_id: str
-    audio_producer_id: str
+    audio_producer_id: str | None
     video_producer_id: str | None
     ports: ParticipantPorts
-    audio_consumer_id: str
+    audio_consumer_id: str | None
     video_consumer_id: str | None
     video_mode: str = 'rtp'  # 'rtp' | 'placeholder'
     display_name: str = ''
+    # Owning WebRTC peer (peer_id). Equals seat id for legacy primary seats.
+    owner_peer_id: str = ''
+    # Set when this seat is keyed by a studio Source id (camera-/screen-/…).
+    source_id: str | None = None
 
 
 class ConsumerService:
@@ -94,6 +98,10 @@ class ConsumerService:
         participant_peer_id: str,
         audio_producer_id: str,
         video_producer_id: str,
+        *,
+        owner_peer_id: str | None = None,
+        source_id: str | None = None,
+        host_owned: bool = False,
     ) -> ParticipantIngest:
         ports = self._port_allocator.allocate_participant_ports(participant_peer_id)
 
@@ -184,6 +192,7 @@ class ConsumerService:
             audio_mediasoup_transport=_plain_transport_tuple(audio_transport),
             video_mediasoup_transport=_plain_transport_tuple(video_transport),
             rtcp_mux=False,
+            host_owned=host_owned,
         )
 
         self._client.resume_consumer(
@@ -197,6 +206,7 @@ class ConsumerService:
             video_consumer['consumerId'],
         )
 
+        owner = owner_peer_id or participant_peer_id
         participant = ParticipantIngest(
             participant_peer_id=participant_peer_id,
             audio_producer_id=audio_producer_id,
@@ -205,6 +215,8 @@ class ConsumerService:
             audio_consumer_id=audio_consumer['consumerId'],
             video_consumer_id=video_consumer['consumerId'],
             video_mode='rtp',
+            owner_peer_id=owner,
+            source_id=source_id,
         )
         self._schedule_video_keyframe_retries(participant)
 
@@ -227,6 +239,95 @@ class ConsumerService:
             video_producer_id,
         )
 
+        return participant
+
+    def attach_video_seat(
+        self,
+        seat_id: str,
+        video_producer_id: str,
+        *,
+        owner_peer_id: str,
+        source_id: str,
+        display_name: str = '',
+        host_owned: bool = True,
+    ) -> ParticipantIngest:
+        """Attach an extra video-only seat (multi-camera / screen Source)."""
+        ports = self._port_allocator.allocate_participant_ports(seat_id)
+
+        video_transport = self._client.create_plain_transport(
+            self._room_id,
+            self._compositor_peer_id,
+            rtcp_mux=False,
+        )
+        self._client.connect_plain_transport(
+            self._room_id,
+            self._compositor_peer_id,
+            video_transport['transportId'],
+            ip=self._rtp_host,
+            port=ports.video.rtp_port,
+            rtcp_port=ports.video.rtcp_port,
+            rtcp_mux=False,
+        )
+
+        self._ensure_joined()
+
+        video_consumer = self._client.create_consumer(
+            self._room_id,
+            self._compositor_peer_id,
+            transport_id=video_transport['transportId'],
+            producer_id=video_producer_id,
+            rtp_capabilities=build_video_rtp_capabilities(self._video_payload_type),
+            paused=True,
+        )
+        if 'rtpParameters' not in video_consumer:
+            raise RuntimeError(
+                'mediasoup consume response missing rtpParameters for video seat '
+                f'(keys={list(video_consumer.keys())})'
+            )
+
+        video_wire_pt = get_payload_type_from_rtp_parameters(
+            video_consumer['rtpParameters']
+        )
+
+        self._compositor_pipeline.add_video_only_participant(
+            seat_id,
+            video_port=ports.video.rtp_port,
+            video_rtcp_port=ports.video.rtcp_port,
+            video_payload_type=video_wire_pt,
+            video_mediasoup_transport=_plain_transport_tuple(video_transport),
+            rtcp_mux=False,
+            host_owned=host_owned,
+            display_name=display_name,
+        )
+
+        self._client.resume_consumer(
+            self._room_id,
+            self._compositor_peer_id,
+            video_consumer['consumerId'],
+        )
+
+        participant = ParticipantIngest(
+            participant_peer_id=seat_id,
+            audio_producer_id=None,
+            video_producer_id=video_producer_id,
+            ports=ports,
+            audio_consumer_id=None,
+            video_consumer_id=video_consumer['consumerId'],
+            video_mode='rtp',
+            display_name=display_name,
+            owner_peer_id=owner_peer_id,
+            source_id=source_id,
+        )
+        self._schedule_video_keyframe_retries(participant)
+
+        logger.info(
+            'Attached video-only seat %s (owner=%s source=%s video=%s) in room %s',
+            seat_id,
+            owner_peer_id,
+            source_id,
+            video_producer_id,
+            self._room_id,
+        )
         return participant
 
     def soft_disable_video(

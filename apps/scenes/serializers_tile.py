@@ -21,7 +21,18 @@ class AssignmentsField(serializers.Field):
         return sanitize_assignments_for_storage(data)
 
 
+class SceneItemSerializer(serializers.Serializer):
+    """Scene attachment for a global Source (layout owns geometry)."""
+
+    id = serializers.CharField(max_length=64)
+    sceneId = serializers.CharField(max_length=64, required=False, allow_blank=True, default='')
+    sourceId = serializers.CharField(max_length=64)
+    visible = serializers.BooleanField(default=True)
+    zIndex = serializers.IntegerField(default=0)
+
+
 class SourcesConfigSerializer(serializers.Serializer):
     version = serializers.IntegerField(required=False, min_value=1)
+    items = SceneItemSerializer(many=True, required=False)
     sources = serializers.ListField(required=False)
     assignments = AssignmentsField(required=False)

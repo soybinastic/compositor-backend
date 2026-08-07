@@ -8,6 +8,12 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
+from urllib.parse import urlparse
+
+if TYPE_CHECKING:
+    from apps.compositor.sfu_source_egress import SfuSourceEgress
+    from integrations.mediasoup.client import MediasoupHttpClient
 
 from django.conf import settings
 
@@ -93,6 +99,10 @@ class ParticipantBranch:
     display_name: str = ''
     # GdkPixbuf pixel buffer must outlive the overlay element.
     placeholder_keep_alive: object | None = None
+    # URI / RTMP decode controls (optional).
+    uri_src: Gst.Element | None = None
+    audio_volume: Gst.Element | None = None
+    playback_paused: bool = False
 
 
 @dataclass
@@ -117,6 +127,33 @@ class CompositorPipelineStatus:
 _AUDIO_INGEST_VOLUME = 0.7
 # High-pass rumble/proximity boom below voice fundamentals.
 _AUDIO_HIGHPASS_CUTOFF_HZ = 100.0
+
+_NAMED_SOURCE_PREFIXES = (
+    'camera-',
+    'screen-',
+    'prerecorded-',
+    'rtmp-',
+    'uri-',
+    'image-',
+    'audio-',
+    'pdf-',
+)
+
+
+def _is_named_source_id(source_id: str) -> bool:
+    return source_id.startswith(_NAMED_SOURCE_PREFIXES)
+
+
+def _validate_uri_video_url(url: str) -> None:
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or '').lower()
+    if scheme in ('http', 'https', 'file'):
+        return
+    if scheme == '' and url.startswith('/'):
+        return
+    raise ValueError(
+        f'URI video source requires http(s) or file URL, got scheme={scheme!r}'
+    )
 
 
 def _make_ingest_volume_element(name: str, volume: float = _AUDIO_INGEST_VOLUME) -> Gst.Element:
@@ -197,6 +234,11 @@ class CompositorPipeline:
         self._video_tee: Gst.Element | None = None
         self._audio_tee: Gst.Element | None = None
         self._participants: dict[str, ParticipantBranch] = {}
+        self._uri_source_ids: set[str] = set()
+        self._sfu_egress: dict[str, SfuSourceEgress] = {}
+        self._sfu_client: MediasoupHttpClient | None = None
+        self._sfu_room_id: str | None = None
+        self._sfu_compositor_peer_id: str | None = None
         self._recording: RecordingBranch | None = None
         self._streaming_branches: list[StreamingBranch] = []
         self._streaming_config: tuple[str, list[str], Path | None] | None = None
@@ -468,6 +510,19 @@ class CompositorPipeline:
                         )
                     self._recording = None
 
+            for source_id in list(self._sfu_egress.keys()):
+                egress = self._sfu_egress.pop(source_id, None)
+                if egress is not None:
+                    try:
+                        egress.stop()
+                    except Exception:
+                        logger.exception(
+                            'Failed to stop SFU egress for %s while stopping session %s',
+                            source_id,
+                            self.session_id,
+                        )
+            self._uri_source_ids.clear()
+
             for participant_id in list(self._participants.keys()):
                 self._remove_participant_unlocked(participant_id)
 
@@ -585,6 +640,18 @@ class CompositorPipeline:
         with self._lock:
             return bool(self._streaming_branches)
 
+    def set_sfu_context(
+        self,
+        client: MediasoupHttpClient,
+        *,
+        room_id: str,
+        compositor_peer_id: str,
+    ) -> None:
+        """Wire mediasoup client used by URI source SFU produce stubs."""
+        self._sfu_client = client
+        self._sfu_room_id = room_id
+        self._sfu_compositor_peer_id = compositor_peer_id
+
     def add_participant(
         self,
         participant_peer_id: str,
@@ -598,6 +665,7 @@ class CompositorPipeline:
         audio_mediasoup_transport: MediasoupTransportTuple,
         video_mediasoup_transport: MediasoupTransportTuple,
         rtcp_mux: bool = False,
+        host_owned: bool = False,
     ) -> IngestStats:
         with self._lock:
             if self._pipeline is None:
@@ -620,9 +688,46 @@ class CompositorPipeline:
             )
             self._participants[participant_peer_id] = branch
 
-            if self._host_peer_id is None and not participant_peer_id.startswith('rtmp-'):
+            if host_owned:
+                self._host_owned_source_ids.add(participant_peer_id)
+            elif self._host_peer_id is None and not _is_named_source_id(participant_peer_id):
                 self._host_peer_id = participant_peer_id
 
+            self._apply_layout_unlocked()
+            return branch.stats
+
+    def add_video_only_participant(
+        self,
+        participant_peer_id: str,
+        *,
+        video_port: int,
+        video_rtcp_port: int,
+        video_payload_type: int,
+        video_mediasoup_transport: MediasoupTransportTuple,
+        rtcp_mux: bool = False,
+        host_owned: bool = True,
+        display_name: str = '',
+    ) -> IngestStats:
+        """Add an extra video seat without an audio mixer branch."""
+        with self._lock:
+            if self._pipeline is None:
+                raise RuntimeError('Compositor pipeline is not started')
+
+            if participant_peer_id in self._participants:
+                return self._participants[participant_peer_id].stats
+
+            branch = self._build_video_only_participant_branch(
+                participant_peer_id=participant_peer_id,
+                video_port=video_port,
+                video_rtcp_port=video_rtcp_port,
+                video_payload_type=video_payload_type,
+                video_mediasoup_transport=video_mediasoup_transport,
+                rtcp_mux=rtcp_mux,
+                display_name=display_name,
+            )
+            self._participants[participant_peer_id] = branch
+            if host_owned:
+                self._host_owned_source_ids.add(participant_peer_id)
             self._apply_layout_unlocked()
             return branch.stats
 
@@ -977,6 +1082,180 @@ class CompositorPipeline:
         if branch is None or not source_id.startswith('rtmp-'):
             return None
         return branch.stats
+
+    def add_uri_video_source(
+        self,
+        source_id: str,
+        *,
+        url: str,
+        display_name: str = '',
+        produce_to_sfu: bool = True,
+    ) -> IngestStats:
+        _validate_uri_video_url(url)
+        with self._lock:
+            if self._pipeline is None:
+                raise RuntimeError('Compositor pipeline is not started')
+
+            if source_id in self._participants:
+                return self._participants[source_id].stats
+
+            branch = self._build_uri_source_branch(
+                source_id=source_id,
+                url=url,
+                display_name=display_name,
+            )
+            self._participants[source_id] = branch
+            self._host_owned_source_ids.add(source_id)
+            self._uri_source_ids.add(source_id)
+            self._apply_layout_unlocked()
+            logger.info(
+                'URI video source added for session %s (source=%s url=%s produce_to_sfu=%s)',
+                self.session_id,
+                source_id,
+                url,
+                produce_to_sfu,
+            )
+
+        if produce_to_sfu:
+            self._start_uri_sfu_egress(source_id)
+
+        return branch.stats
+
+    def remove_uri_video_source(self, source_id: str) -> None:
+        self._stop_uri_sfu_egress(source_id)
+        with self._lock:
+            self._remove_participant_unlocked(source_id)
+            self._host_owned_source_ids.discard(source_id)
+            self._uri_source_ids.discard(source_id)
+            self._apply_layout_unlocked()
+
+    def update_uri_video_playback(
+        self,
+        source_id: str,
+        *,
+        action: str,
+        position_ms: float | None = None,
+        loop: bool | None = None,
+        volume: float | None = None,
+        muted: bool | None = None,
+    ) -> None:
+        """Best-effort play/pause/seek/volume for a URI decode branch."""
+        with self._lock:
+            branch = self._participants.get(source_id)
+            if branch is None or source_id not in self._uri_source_ids:
+                logger.warning('URI playback update ignored; unknown source %s', source_id)
+                return
+
+            normalized = (action or '').strip().lower()
+            src = branch.uri_src
+
+            if volume is not None and branch.audio_volume is not None:
+                try:
+                    branch.audio_volume.set_property('volume', max(0.0, float(volume)))
+                except Exception:
+                    logger.exception('Failed to set URI volume for %s', source_id)
+
+            if muted is not None and branch.audio_volume is not None:
+                try:
+                    branch.audio_volume.set_property('mute', bool(muted))
+                except Exception:
+                    logger.exception('Failed to set URI mute for %s', source_id)
+
+            if loop is not None and src is not None:
+                # uridecodebin itself has no loop; noted for follow-up player element.
+                logger.debug('URI loop=%s requested for %s (not yet wired)', loop, source_id)
+
+            if normalized == 'pause' and src is not None:
+                try:
+                    src.set_state(Gst.State.PAUSED)
+                    branch.playback_paused = True
+                except Exception:
+                    logger.exception('Failed to pause URI source %s', source_id)
+                return
+
+            if normalized == 'play' and src is not None:
+                try:
+                    src.set_state(Gst.State.PLAYING)
+                    branch.playback_paused = False
+                except Exception:
+                    logger.exception('Failed to play URI source %s', source_id)
+                return
+
+            if normalized == 'seek' and position_ms is not None and src is not None:
+                try:
+                    # Best-effort seek on the decodebin; may no-op depending on demuxer.
+                    rate = 1.0
+                    start = max(0, int(float(position_ms) * Gst.MSECOND))
+                    seeked = src.seek(
+                        rate,
+                        Gst.Format.TIME,
+                        Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
+                        Gst.SeekType.SET,
+                        start,
+                        Gst.SeekType.NONE,
+                        0,
+                    )
+                    if not seeked and self._pipeline is not None:
+                        self._pipeline.seek(
+                            rate,
+                            Gst.Format.TIME,
+                            Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
+                            Gst.SeekType.SET,
+                            start,
+                            Gst.SeekType.NONE,
+                            0,
+                        )
+                except Exception:
+                    logger.exception(
+                        'URI seek not available/failed for %s (position_ms=%s)',
+                        source_id,
+                        position_ms,
+                    )
+                return
+
+            if normalized not in ('pause', 'play', 'seek'):
+                logger.warning('Unknown URI playback action %r for %s', action, source_id)
+
+    def get_uri_source_stats(self, source_id: str) -> IngestStats | None:
+        branch = self._participants.get(source_id)
+        if branch is None or source_id not in self._uri_source_ids:
+            return None
+        return branch.stats
+
+    def _start_uri_sfu_egress(self, source_id: str) -> None:
+        if source_id in self._sfu_egress:
+            return
+        client = self._sfu_client
+        room_id = self._sfu_room_id
+        peer_id = self._sfu_compositor_peer_id
+        if client is None or not room_id or not peer_id:
+            logger.warning(
+                'URI SFU produce skipped for %s (mediasoup context not configured)',
+                source_id,
+            )
+            return
+        try:
+            from apps.compositor.sfu_source_egress import SfuSourceEgress
+
+            egress = SfuSourceEgress(
+                client=client,
+                room_id=room_id,
+                compositor_peer_id=peer_id,
+                source_id=source_id,
+            )
+            egress.start()
+            self._sfu_egress[source_id] = egress
+        except Exception:
+            logger.exception('Failed to start SFU egress for URI source %s', source_id)
+
+    def _stop_uri_sfu_egress(self, source_id: str) -> None:
+        egress = self._sfu_egress.pop(source_id, None)
+        if egress is None:
+            return
+        try:
+            egress.stop()
+        except Exception:
+            logger.exception('Failed to stop SFU egress for URI source %s', source_id)
 
     def set_tile_order(
         self,
@@ -1885,6 +2164,8 @@ class CompositorPipeline:
             stats=IngestStats(),
             source_url=url,
             video_scale=video_scale,
+            uri_src=src,
+            audio_volume=audio_volume,
         )
         video_src_pad.add_probe(
             Gst.PadProbeType.BUFFER,
@@ -1938,6 +2219,255 @@ class CompositorPipeline:
         branch.signal_handlers.append((src, handler_id))
 
         for element in elements:
+            element.sync_state_with_parent()
+
+        return branch
+
+    def _build_uri_source_branch(
+        self,
+        *,
+        source_id: str,
+        url: str,
+        display_name: str,
+    ) -> ParticipantBranch:
+        assert self._pipeline is not None
+        assert self._compositor is not None
+        assert self._audiomixer is not None
+        if self._video_mix_backend is None:
+            raise RuntimeError('Video mix backend is not initialized')
+
+        _ = display_name
+        src = Gst.ElementFactory.make('uridecodebin', f'uri_src_{source_id}')
+        video_convert = Gst.ElementFactory.make('videoconvert', f'uri_v_convert_{source_id}')
+        ingest_tail = self._video_mix_backend.build_ingest_tail(source_id)
+        audio_convert = Gst.ElementFactory.make('audioconvert', f'uri_a_convert_{source_id}')
+        audio_resample = Gst.ElementFactory.make('audioresample', f'uri_a_resample_{source_id}')
+        audio_highpass = _make_voice_highpass_element(f'uri_a_highpass_{source_id}')
+        audio_volume = _make_ingest_volume_element(f'uri_a_volume_{source_id}')
+        audio_queue = Gst.ElementFactory.make('queue', f'uri_a_queue_{source_id}')
+
+        if not all(
+            [
+                src,
+                video_convert,
+                *ingest_tail,
+                audio_convert,
+                audio_resample,
+                audio_highpass,
+                audio_volume,
+                audio_queue,
+            ]
+        ):
+            raise RuntimeError(f'Failed to create URI ingest elements for {source_id}')
+
+        src.set_property('uri', url)
+        video_scale = next(
+            (
+                element
+                for element in ingest_tail
+                if element.get_factory() is not None
+                and element.get_factory().get_name() == 'videoscale'
+            ),
+            None,
+        )
+        if video_scale is not None:
+            video_scale.set_property('add-borders', True)
+
+        video_chain = [video_convert, *ingest_tail]
+        elements = [
+            src,
+            *video_chain,
+            audio_convert,
+            audio_resample,
+            audio_highpass,
+            audio_volume,
+            audio_queue,
+        ]
+        self._link_sequential(
+            video_chain,
+            label=f'uri-video-{source_id}',
+        )
+        self._link_sequential(
+            [audio_convert, audio_resample, audio_highpass, audio_volume, audio_queue],
+            label=f'uri-audio-{source_id}',
+        )
+
+        for element in elements:
+            self._pipeline.add(element)
+
+        compositor_sink_pad = self._compositor.get_request_pad('sink_%u')
+        if compositor_sink_pad is None:
+            raise RuntimeError(f'Failed to request compositor sink pad for {source_id}')
+
+        video_src_pad = ingest_tail[-1].get_static_pad('src')
+        if video_src_pad is None or video_src_pad.link(compositor_sink_pad) != Gst.PadLinkReturn.OK:
+            raise RuntimeError(f'Failed to link URI video branch to compositor for {source_id}')
+
+        branch = ParticipantBranch(
+            participant_peer_id=source_id,
+            compositor_sink_pad=compositor_sink_pad,
+            mixer_sink_pad=None,
+            elements=elements,
+            stats=IngestStats(),
+            source_url=url,
+            video_scale=video_scale,
+            display_name=display_name,
+            uri_src=src,
+            audio_volume=audio_volume,
+        )
+        video_src_pad.add_probe(
+            Gst.PadProbeType.BUFFER,
+            self._make_video_probe(branch),
+            None,
+        )
+        link_state = {'audio': False}
+
+        def on_pad_added(_element: Gst.Element, pad: Gst.Pad, _user_data) -> None:
+            caps = pad.get_current_caps()
+            if caps is None:
+                caps = pad.query_caps(None)
+            if caps is None:
+                return
+
+            structure = caps.get_structure(0)
+            if structure is None:
+                return
+
+            media_name = structure.get_name()
+            if media_name.startswith('video/'):
+                sink_pad = video_convert.get_static_pad('sink')
+                if sink_pad is None or sink_pad.is_linked():
+                    return
+                if pad.link(sink_pad) != Gst.PadLinkReturn.OK:
+                    raise RuntimeError(f'Failed to link URI video pad for {source_id}')
+            elif media_name.startswith('audio/') and not link_state['audio']:
+                mixer_pad = self._audiomixer.get_request_pad('sink_%u')
+                if mixer_pad is None:
+                    raise RuntimeError(f'Failed to request audiomixer sink pad for {source_id}')
+
+                sink_pad = audio_convert.get_static_pad('sink')
+                if sink_pad is None or sink_pad.is_linked():
+                    return
+                if pad.link(sink_pad) != Gst.PadLinkReturn.OK:
+                    raise RuntimeError(f'Failed to link URI audio pad for {source_id}')
+
+                audio_src_pad = audio_queue.get_static_pad('src')
+                if audio_src_pad is None or audio_src_pad.link(mixer_pad) != Gst.PadLinkReturn.OK:
+                    raise RuntimeError(f'Failed to link URI audio branch to audiomixer for {source_id}')
+
+                branch.mixer_sink_pad = mixer_pad
+                link_state['audio'] = True
+                audio_src_pad.add_probe(
+                    Gst.PadProbeType.BUFFER,
+                    self._make_audio_probe(branch),
+                    None,
+                )
+
+        handler_id = src.connect('pad-added', on_pad_added, None)
+        branch.signal_handlers.append((src, handler_id))
+
+        for element in elements:
+            element.sync_state_with_parent()
+
+        return branch
+
+    def _build_video_only_participant_branch(
+        self,
+        *,
+        participant_peer_id: str,
+        video_port: int,
+        video_rtcp_port: int,
+        video_payload_type: int,
+        video_mediasoup_transport: MediasoupTransportTuple,
+        rtcp_mux: bool,
+        display_name: str = '',
+    ) -> ParticipantBranch:
+        assert self._pipeline is not None
+        assert self._compositor is not None
+
+        video_chain = self._build_video_ingest_chain(
+            participant_peer_id=participant_peer_id,
+            rtp_port=video_port,
+            rtcp_port=video_rtcp_port,
+            payload_type=video_payload_type,
+            mediasoup_transport=video_mediasoup_transport,
+            rtcp_mux=rtcp_mux,
+        )
+        all_elements = list(video_chain.elements)
+
+        for element in all_elements:
+            self._pipeline.add(element)
+
+        self._link_sequential(
+            video_chain.media_elements,
+            label=f'video-{participant_peer_id}',
+        )
+        for upstream, downstream in video_chain.rtcp_links:
+            if not upstream.link(downstream):
+                raise RuntimeError(
+                    f'Failed to link RTCP drain for {participant_peer_id}'
+                )
+
+        compositor_sink_pad = self._compositor.get_request_pad('sink_%u')
+        if compositor_sink_pad is None:
+            raise RuntimeError(
+                f'Failed to request compositor sink pad for {participant_peer_id}'
+            )
+
+        video_src_pad = video_chain.output.get_static_pad('src')
+        if video_src_pad is None or video_src_pad.link(compositor_sink_pad) != Gst.PadLinkReturn.OK:
+            raise RuntimeError(
+                f'Failed to link video branch to compositor for {participant_peer_id}'
+            )
+
+        video_scale = next(
+            (
+                element
+                for element in video_chain.media_elements
+                if element.get_factory() is not None
+                and element.get_factory().get_name() == 'videoscale'
+            ),
+            None,
+        )
+        branch = ParticipantBranch(
+            participant_peer_id=participant_peer_id,
+            compositor_sink_pad=compositor_sink_pad,
+            mixer_sink_pad=None,
+            elements=all_elements,
+            video_elements=list(video_chain.elements),
+            audio_elements=[],
+            stats=IngestStats(),
+            signal_handlers=list(video_chain.signal_handlers),
+            video_scale=video_scale,
+            video_mode='rtp',
+            display_name=display_name,
+        )
+
+        if video_chain.rtp_probe_pad is not None:
+            video_chain.rtp_probe_pad.add_probe(
+                Gst.PadProbeType.BUFFER,
+                self._make_rtp_video_probe(branch),
+                None,
+            )
+        if video_chain.rtcp_probe_pad is not None:
+            video_chain.rtcp_probe_pad.add_probe(
+                Gst.PadProbeType.BUFFER,
+                self._make_rtcp_video_probe(branch),
+                None,
+            )
+
+        video_src_pad.add_probe(
+            Gst.PadProbeType.BUFFER,
+            self._make_running_time_offset_probe(),
+            None,
+        )
+        video_src_pad.add_probe(
+            Gst.PadProbeType.BUFFER,
+            self._make_video_probe(branch),
+            None,
+        )
+
+        for element in reversed(all_elements):
             element.sync_state_with_parent()
 
         return branch

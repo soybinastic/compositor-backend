@@ -143,6 +143,7 @@ class SessionIngestManagerTests(TestCase):
             'guest-1',
             'audio-1',
             'video-1',
+            owner_peer_id='guest-1',
         )
 
         manager.sync_producers([], joined_peers=[])
@@ -184,6 +185,7 @@ class SessionIngestManagerTests(TestCase):
             'guest-1',
             'audio-2',
             'video-2',
+            owner_peer_id='guest-1',
         )
         self.assertIs(manager._participants['guest-1'], second)
 
@@ -342,6 +344,7 @@ class SessionIngestManagerTests(TestCase):
             'host-1',
             'audio-1',
             'video-new',
+            owner_peer_id='host-1',
         )
         mock_consumer_service.soft_enable_video.assert_not_called()
         self.assertIs(manager._participants['host-1'], replacement)
@@ -436,3 +439,104 @@ class SessionIngestManagerTests(TestCase):
         )
 
         mock_consumer_service.attach_participant.assert_not_called()
+
+    def test_sync_attaches_extra_seats_for_source_id_videos(self):
+        mock_consumer_service = MagicMock(spec=ConsumerService)
+        primary = MagicMock()
+        primary.participant_peer_id = 'host-1'
+        primary.audio_producer_id = 'audio-1'
+        primary.video_producer_id = 'video-main'
+        primary.video_mode = 'rtp'
+        primary.owner_peer_id = 'host-1'
+        primary.source_id = None
+        extra = MagicMock()
+        extra.participant_peer_id = 'camera-abc'
+        extra.owner_peer_id = 'host-1'
+        extra.source_id = 'camera-abc'
+        extra.video_producer_id = 'video-cam'
+        extra.video_mode = 'rtp'
+        mock_consumer_service.attach_participant.return_value = primary
+        mock_consumer_service.attach_video_seat.return_value = extra
+        manager = SessionIngestManager(
+            session_id='session-1',
+            room_id='session-1',
+            compositor_peer_id='compositor-session-1',
+            layout='CONTAIN',
+            consumer_service=mock_consumer_service,
+            compositor_pipeline=MagicMock(),
+        )
+
+        manager.sync_producers(
+            [
+                {
+                    'peerId': 'host-1',
+                    'displayName': 'Host',
+                    'producers': [
+                        {'producerId': 'audio-1', 'kind': 'audio', 'source': 'audio'},
+                        {'producerId': 'video-main', 'kind': 'video', 'source': 'video'},
+                        {
+                            'producerId': 'video-cam',
+                            'kind': 'video',
+                            'source': 'video',
+                            'sourceId': 'camera-abc',
+                        },
+                        {
+                            'producerId': 'video-screen',
+                            'kind': 'video',
+                            'source': 'screensharing',
+                            'sourceId': 'screen-xyz',
+                        },
+                    ],
+                }
+            ],
+            joined_peers=[{'peerId': 'host-1', 'displayName': 'Host'}],
+        )
+
+        mock_consumer_service.attach_participant.assert_called_once_with(
+            'host-1',
+            'audio-1',
+            'video-main',
+            owner_peer_id='host-1',
+        )
+        self.assertEqual(mock_consumer_service.attach_video_seat.call_count, 2)
+        mock_consumer_service.attach_video_seat.assert_any_call(
+            'camera-abc',
+            'video-cam',
+            owner_peer_id='host-1',
+            source_id='camera-abc',
+            display_name='Host',
+            host_owned=True,
+        )
+        mock_consumer_service.attach_video_seat.assert_any_call(
+            'screen-xyz',
+            'video-screen',
+            owner_peer_id='host-1',
+            source_id='screen-xyz',
+            display_name='Host',
+            host_owned=True,
+        )
+
+    def test_extract_av_producers_keeps_all_videos_with_source_id(self):
+        audio_id, videos = SessionIngestManager._extract_av_producers(
+            {
+                'peerId': 'host-1',
+                'producers': [
+                    {'producerId': 'a1', 'kind': 'audio', 'source': 'audio'},
+                    {'producerId': 'v1', 'kind': 'video', 'source': 'video'},
+                    {
+                        'producerId': 'v2',
+                        'kind': 'video',
+                        'source': 'video',
+                        'sourceId': 'camera-1',
+                    },
+                ],
+            }
+        )
+        self.assertEqual(audio_id, 'a1')
+        self.assertEqual(len(videos), 2)
+        primary, extras = SessionIngestManager._split_primary_and_extra(videos)
+        self.assertIsNotNone(primary)
+        assert primary is not None
+        self.assertEqual(primary.producer_id, 'v1')
+        self.assertEqual(len(extras), 1)
+        self.assertEqual(extras[0].source_id, 'camera-1')

@@ -9,7 +9,8 @@ DEFAULT_DEVICES_CONFIG: dict = {
 }
 
 DEFAULT_SOURCES_CONFIG: dict = {
-    'version': 1,
+    'version': 2,
+    'items': [],
     'sources': [],
     'assignments': {},
 }

@@ -20,6 +20,9 @@ class CommandType(str, Enum):
     STOP_STREAM = 'StopStream'
     ADD_RTMP_SOURCE = 'AddRtmpSource'
     REMOVE_RTMP_SOURCE = 'RemoveRtmpSource'
+    ADD_URI_VIDEO_SOURCE = 'AddUriVideoSource'
+    REMOVE_URI_VIDEO_SOURCE = 'RemoveUriVideoSource'
+    UPDATE_URI_VIDEO_PLAYBACK = 'UpdateUriVideoPlayback'
     GET_STATUS = 'GetStatus'
     SYNC_PRODUCERS = 'SyncProducers'
     START_COUNTDOWN = 'StartCountdown'
@@ -112,6 +115,41 @@ class RemoveRtmpSourceCommand(SessionCommand):
     @property
     def command_type(self) -> CommandType:
         return CommandType.REMOVE_RTMP_SOURCE
+
+
+@dataclass(frozen=True, kw_only=True)
+class AddUriVideoSourceCommand(SessionCommand):
+    source_id: str
+    url: str
+    display_name: str = ''
+    produce_to_sfu: bool = True
+
+    @property
+    def command_type(self) -> CommandType:
+        return CommandType.ADD_URI_VIDEO_SOURCE
+
+
+@dataclass(frozen=True, kw_only=True)
+class RemoveUriVideoSourceCommand(SessionCommand):
+    source_id: str
+
+    @property
+    def command_type(self) -> CommandType:
+        return CommandType.REMOVE_URI_VIDEO_SOURCE
+
+
+@dataclass(frozen=True, kw_only=True)
+class UpdateUriVideoPlaybackCommand(SessionCommand):
+    source_id: str
+    action: str
+    position_ms: float | None = None
+    loop: bool | None = None
+    volume: float | None = None
+    muted: bool | None = None
+
+    @property
+    def command_type(self) -> CommandType:
+        return CommandType.UPDATE_URI_VIDEO_PLAYBACK
 
 
 @dataclass(frozen=True, kw_only=True)
