@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from apps.compositor.commands import SetTileOrderCommand
 from apps.compositor.compositor_pipeline import CompositorPipeline
-from apps.compositor.tile_order import resolve_effective_assignments
+from apps.compositor.tile_order import (
+    hidden_source_ids_from_scene_items,
+    merge_hidden_source_ids,
+    resolve_effective_assignments,
+)
 from apps.scenes.models import StudioScene
 from apps.sessions.models import StudioSession
 
@@ -26,9 +30,10 @@ def build_set_tile_order_command(
     *,
     scene: StudioScene | None = None,
 ) -> SetTileOrderCommand:
+    scene_config = _resolve_scene_config(session, scene)
     effective = resolve_effective_assignments(
         session.tile_order_config,
-        _resolve_scene_config(session, scene),
+        scene_config,
     )
     slot_assignments = None
     if effective:
@@ -36,11 +41,19 @@ def build_set_tile_order_command(
             str(slot): source_id for slot, source_id in sorted(effective.items())
         }
 
+    scene_hidden = hidden_source_ids_from_scene_items(
+        (scene_config or {}).get('items') if isinstance(scene_config, dict) else None
+    )
+    effective_hidden = merge_hidden_source_ids(
+        list(session.hidden_source_ids or []),
+        scene_hidden,
+    )
+
     return SetTileOrderCommand(
         session_id=str(session.id),
         host_peer_id=session.host_peer_id,
         slot_assignments=slot_assignments,
-        hidden_source_ids=list(session.hidden_source_ids or []),
+        hidden_source_ids=effective_hidden,
     )
 
 

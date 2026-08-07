@@ -177,6 +177,41 @@ def sanitize_hidden_source_ids(raw: list | None) -> list[str]:
     return result
 
 
+def hidden_source_ids_from_scene_items(items: list | None) -> list[str]:
+    """Source ids with SceneItem.visible == false (program out must hide these)."""
+    if not items:
+        return []
+    hidden: list[str] = []
+    seen: set[str] = set()
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        if raw.get('visible', True) is not False:
+            continue
+        source_id = raw.get('sourceId') or raw.get('source_id')
+        if not isinstance(source_id, str):
+            continue
+        source_id = source_id.strip()
+        if not source_id or source_id in seen:
+            continue
+        seen.add(source_id)
+        hidden.append(source_id)
+    return hidden
+
+
+def merge_hidden_source_ids(*groups: list[str] | None) -> list[str]:
+    """Union of hidden id lists, stable order (first occurrence wins)."""
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for source_id in sanitize_hidden_source_ids(group):
+            if source_id in seen:
+                continue
+            seen.add(source_id)
+            merged.append(source_id)
+    return merged
+
+
 def merge_tile_order_config(
     incoming: dict | None,
     existing: dict | None = None,

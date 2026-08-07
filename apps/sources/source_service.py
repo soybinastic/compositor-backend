@@ -310,6 +310,17 @@ class SourceService:
         )
         scene.sources_config = config
         scene.save(update_fields=['sources_config', 'updated_at'])
+
+        # Push scene visibility / assignments into the live mixer.
+        try:
+            from apps.compositor.tile_order_sync import send_tile_order_command
+
+            session = scene.session
+            if session is not None:
+                send_tile_order_command(session, scene=scene)
+        except Exception:
+            pass
+
         return config
 
     def _detach_from_all_scenes(self, session_id: uuid.UUID, source_id: str) -> None:
