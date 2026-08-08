@@ -177,6 +177,26 @@ def sanitize_hidden_source_ids(raw: list | None) -> list[str]:
     return result
 
 
+def attached_source_ids_from_scene_items(items: list | None) -> list[str]:
+    """Source ids present on a scene (visible or hidden SceneItems)."""
+    if not items:
+        return []
+    attached: list[str] = []
+    seen: set[str] = set()
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        source_id = raw.get('sourceId') or raw.get('source_id')
+        if not isinstance(source_id, str):
+            continue
+        source_id = source_id.strip()
+        if not source_id or source_id in seen:
+            continue
+        seen.add(source_id)
+        attached.append(source_id)
+    return attached
+
+
 def hidden_source_ids_from_scene_items(items: list | None) -> list[str]:
     """Source ids with SceneItem.visible == false (program out must hide these)."""
     if not items:
@@ -197,6 +217,24 @@ def hidden_source_ids_from_scene_items(items: list | None) -> list[str]:
         seen.add(source_id)
         hidden.append(source_id)
     return hidden
+
+
+def hidden_session_sources_not_on_scene(
+    session_source_ids: list[str] | None,
+    items: list | None,
+) -> list[str]:
+    """
+    Session-registry Source ids that are not attached to the active scene.
+
+    Still-producing Sources from another scene must stay off program out when
+    the active scene does not list them (produce may continue; mix hides them).
+    """
+    attached = set(attached_source_ids_from_scene_items(items))
+    return [
+        source_id
+        for source_id in sanitize_hidden_source_ids(session_source_ids)
+        if source_id not in attached
+    ]
 
 
 def merge_hidden_source_ids(*groups: list[str] | None) -> list[str]:

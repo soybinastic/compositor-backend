@@ -8,6 +8,7 @@ from apps.scenes.models import SceneType, StudioScene
 from apps.sessions.constants import DEFAULT_TILE_ORDER_CONFIG
 from apps.sessions.models import LayoutType, SessionStatus, StudioSession
 from apps.sessions.services.invite_service import InviteService
+from apps.sources.models import SessionSource, SourceState, SourceType
 
 
 class BuildSetTileOrderCommandTests(TestCase):
@@ -61,3 +62,113 @@ class BuildSetTileOrderCommandTests(TestCase):
 
         command = build_set_tile_order_command(self.session, scene=self.scene)
         self.assertIsNone(command.slot_assignments)
+
+    def test_hides_session_sources_not_on_active_scene(self):
+        SessionSource.objects.create(
+            session=self.session,
+            source_id='camera-a',
+            type=SourceType.CAMERA,
+            name='Cam A',
+            state=SourceState.ACTIVE,
+        )
+        SessionSource.objects.create(
+            session=self.session,
+            source_id='camera-b',
+            type=SourceType.CAMERA,
+            name='Cam B',
+            state=SourceState.ACTIVE,
+        )
+        self.scene.sources_config = {
+            'version': 2,
+            'items': [
+                {
+                    'id': 'item-a',
+                    'sceneId': str(self.scene.id),
+                    'sourceId': 'camera-a',
+                    'visible': True,
+                    'zIndex': 0,
+                },
+            ],
+            'assignments': {'0': 'camera-a'},
+        }
+        self.scene.save(update_fields=['sources_config'])
+
+        command = build_set_tile_order_command(self.session, scene=self.scene)
+        self.assertEqual(command.slot_assignments, {'0': 'camera-a'})
+        self.assertEqual(
+            command.hidden_source_ids,
+            ['guest-hidden', 'camera-b'],
+        )
+
+    def test_hides_invisible_attached_and_unattached_sources(self):
+        SessionSource.objects.create(
+            session=self.session,
+            source_id='camera-a',
+            type=SourceType.CAMERA,
+            name='Cam A',
+            state=SourceState.ACTIVE,
+        )
+        SessionSource.objects.create(
+            session=self.session,
+            source_id='camera-b',
+            type=SourceType.CAMERA,
+            name='Cam B',
+            state=SourceState.ACTIVE,
+        )
+        SessionSource.objects.create(
+            session=self.session,
+            source_id='camera-c',
+            type=SourceType.CAMERA,
+            name='Cam C',
+            state=SourceState.ACTIVE,
+        )
+        self.scene.sources_config = {
+            'version': 2,
+            'items': [
+                {
+                    'id': 'item-a',
+                    'sceneId': str(self.scene.id),
+                    'sourceId': 'camera-a',
+                    'visible': True,
+                    'zIndex': 0,
+                },
+                {
+                    'id': 'item-b',
+                    'sceneId': str(self.scene.id),
+                    'sourceId': 'camera-b',
+                    'visible': False,
+                    'zIndex': 1,
+                },
+            ],
+            'assignments': {'0': 'camera-a'},
+        }
+        self.scene.save(update_fields=['sources_config'])
+
+        command = build_set_tile_order_command(self.session, scene=self.scene)
+        self.assertEqual(
+            command.hidden_source_ids,
+            ['guest-hidden', 'camera-b', 'camera-c'],
+        )
+        self.assertNotIn('camera-a', command.hidden_source_ids)
+
+    def test_empty_scene_hides_all_registry_sources_keeps_peers(self):
+        SessionSource.objects.create(
+            session=self.session,
+            source_id='camera-a',
+            type=SourceType.CAMERA,
+            name='Cam A',
+            state=SourceState.ACTIVE,
+        )
+        self.scene.sources_config = {
+            'version': 2,
+            'items': [],
+            'assignments': {'0': 'host-peer'},
+        }
+        self.scene.save(update_fields=['sources_config'])
+
+        command = build_set_tile_order_command(self.session, scene=self.scene)
+        self.assertEqual(command.slot_assignments, {'0': 'host-peer'})
+        self.assertEqual(
+            command.hidden_source_ids,
+            ['guest-hidden', 'camera-a'],
+        )
