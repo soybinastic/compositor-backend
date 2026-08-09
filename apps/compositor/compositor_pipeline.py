@@ -103,6 +103,12 @@ class ParticipantBranch:
     uri_src: Gst.Element | None = None
     audio_volume: Gst.Element | None = None
     playback_paused: bool = False
+    # Explicit Source.muted / volume from API (scene hide is applied on top).
+    user_muted: bool = False
+    user_volume: float | None = None
+    # Tees for compositor→SFU egress of this URI source (same sourceId).
+    uri_video_tee: Gst.Element | None = None
+    uri_audio_tee: Gst.Element | None = None
 
 
 @dataclass
@@ -1149,17 +1155,19 @@ class CompositorPipeline:
             normalized = (action or '').strip().lower()
             src = branch.uri_src
 
-            if volume is not None and branch.audio_volume is not None:
-                try:
-                    branch.audio_volume.set_property('volume', max(0.0, float(volume)))
-                except Exception:
-                    logger.exception('Failed to set URI volume for %s', source_id)
+            if volume is not None:
+                branch.user_volume = max(0.0, float(volume))
+                if branch.audio_volume is not None:
+                    try:
+                        branch.audio_volume.set_property('volume', branch.user_volume)
+                    except Exception:
+                        logger.exception('Failed to set URI volume for %s', source_id)
 
-            if muted is not None and branch.audio_volume is not None:
-                try:
-                    branch.audio_volume.set_property('mute', bool(muted))
-                except Exception:
-                    logger.exception('Failed to set URI mute for %s', source_id)
+            if muted is not None:
+                branch.user_muted = bool(muted)
+
+            # Scene-hidden Sources stay silent even if the host unmutes while off-scene.
+            self._apply_uri_audio_mix_state_unlocked(source_id)
 
             if loop is not None and src is not None:
                 # uridecodebin itself has no loop; noted for follow-up player element.
@@ -1213,7 +1221,7 @@ class CompositorPipeline:
                     )
                 return
 
-            if normalized not in ('pause', 'play', 'seek'):
+            if normalized not in ('', 'pause', 'play', 'seek', 'volume'):
                 logger.warning('Unknown URI playback action %r for %s', action, source_id)
 
     def get_uri_source_stats(self, source_id: str) -> IngestStats | None:
@@ -1221,6 +1229,24 @@ class CompositorPipeline:
         if branch is None or source_id not in self._uri_source_ids:
             return None
         return branch.stats
+
+    def _apply_uri_audio_mix_state_unlocked(self, source_id: str) -> None:
+        """Mute URI soundtrack when scene-hidden or user-muted (same sourceId as video)."""
+        branch = self._participants.get(source_id)
+        if branch is None or branch.audio_volume is None:
+            return
+        if source_id not in self._uri_source_ids:
+            return
+        scene_hidden = source_id in self._hidden_source_ids
+        effective_mute = scene_hidden or bool(branch.user_muted)
+        try:
+            branch.audio_volume.set_property('mute', effective_mute)
+        except Exception:
+            logger.exception('Failed to apply URI mix mute for %s', source_id)
+
+    def _sync_uri_scene_audio_mute_unlocked(self) -> None:
+        for source_id in list(self._uri_source_ids):
+            self._apply_uri_audio_mix_state_unlocked(source_id)
 
     def _start_uri_sfu_egress(self, source_id: str) -> None:
         if source_id in self._sfu_egress:
@@ -1244,6 +1270,30 @@ class CompositorPipeline:
                 source_id=source_id,
             )
             egress.start()
+            branch = self._participants.get(source_id)
+            if (
+                self._pipeline is not None
+                and branch is not None
+                and branch.uri_video_tee is not None
+            ):
+                try:
+                    egress.attach_rtp_send(
+                        self._pipeline,
+                        video_tee=branch.uri_video_tee,
+                        audio_tee=branch.uri_audio_tee,
+                    )
+                except Exception:
+                    logger.exception(
+                        'SFU RTP attach failed for %s; tearing down producers',
+                        source_id,
+                    )
+                    egress.stop()
+                    raise
+            else:
+                logger.warning(
+                    'SFU producers created for %s but URI tees not ready for RTP send',
+                    source_id,
+                )
             self._sfu_egress[source_id] = egress
         except Exception:
             logger.exception('Failed to start SFU egress for URI source %s', source_id)
@@ -1272,6 +1322,8 @@ class CompositorPipeline:
                 self._slot_assignments = None
             self._hidden_source_ids = frozenset(hidden_source_ids or [])
             self._apply_layout_unlocked()
+            # Pre-recorded / URI: same sourceId drives video hide + soundtrack mute.
+            self._sync_uri_scene_audio_mute_unlocked()
 
     def set_layout(self, layout: str, *, graphics_state: dict | None = None) -> None:
         pending = graphics_state if graphics_state is not None else self._graphics._pending_state
@@ -2240,10 +2292,12 @@ class CompositorPipeline:
         src = Gst.ElementFactory.make('uridecodebin', f'uri_src_{source_id}')
         video_convert = Gst.ElementFactory.make('videoconvert', f'uri_v_convert_{source_id}')
         ingest_tail = self._video_mix_backend.build_ingest_tail(source_id)
+        video_tee = Gst.ElementFactory.make('tee', f'uri_v_tee_{source_id}')
         audio_convert = Gst.ElementFactory.make('audioconvert', f'uri_a_convert_{source_id}')
         audio_resample = Gst.ElementFactory.make('audioresample', f'uri_a_resample_{source_id}')
         audio_highpass = _make_voice_highpass_element(f'uri_a_highpass_{source_id}')
         audio_volume = _make_ingest_volume_element(f'uri_a_volume_{source_id}')
+        audio_tee = Gst.ElementFactory.make('tee', f'uri_a_tee_{source_id}')
         audio_queue = Gst.ElementFactory.make('queue', f'uri_a_queue_{source_id}')
 
         if not all(
@@ -2251,16 +2305,20 @@ class CompositorPipeline:
                 src,
                 video_convert,
                 *ingest_tail,
+                video_tee,
                 audio_convert,
                 audio_resample,
                 audio_highpass,
                 audio_volume,
+                audio_tee,
                 audio_queue,
             ]
         ):
             raise RuntimeError(f'Failed to create URI ingest elements for {source_id}')
 
         src.set_property('uri', url)
+        video_tee.set_property('allow-not-linked', True)
+        audio_tee.set_property('allow-not-linked', True)
         video_scale = next(
             (
                 element
@@ -2277,18 +2335,22 @@ class CompositorPipeline:
         elements = [
             src,
             *video_chain,
+            video_tee,
             audio_convert,
             audio_resample,
             audio_highpass,
             audio_volume,
+            audio_tee,
             audio_queue,
         ]
         self._link_sequential(
             video_chain,
             label=f'uri-video-{source_id}',
         )
+        if not ingest_tail[-1].link(video_tee):
+            raise RuntimeError(f'Failed to link URI ingest → video tee for {source_id}')
         self._link_sequential(
-            [audio_convert, audio_resample, audio_highpass, audio_volume, audio_queue],
+            [audio_convert, audio_resample, audio_highpass, audio_volume, audio_tee, audio_queue],
             label=f'uri-audio-{source_id}',
         )
 
@@ -2299,9 +2361,11 @@ class CompositorPipeline:
         if compositor_sink_pad is None:
             raise RuntimeError(f'Failed to request compositor sink pad for {source_id}')
 
-        video_src_pad = ingest_tail[-1].get_static_pad('src')
-        if video_src_pad is None or video_src_pad.link(compositor_sink_pad) != Gst.PadLinkReturn.OK:
-            raise RuntimeError(f'Failed to link URI video branch to compositor for {source_id}')
+        video_tee_mix_pad = video_tee.get_request_pad('src_%u')
+        if video_tee_mix_pad is None:
+            raise RuntimeError(f'Failed to request URI video tee mix pad for {source_id}')
+        if video_tee_mix_pad.link(compositor_sink_pad) != Gst.PadLinkReturn.OK:
+            raise RuntimeError(f'Failed to link URI video tee → compositor for {source_id}')
 
         branch = ParticipantBranch(
             participant_peer_id=source_id,
@@ -2314,8 +2378,11 @@ class CompositorPipeline:
             display_name=display_name,
             uri_src=src,
             audio_volume=audio_volume,
+            uri_video_tee=video_tee,
+            uri_audio_tee=audio_tee,
         )
-        video_src_pad.add_probe(
+        # Probe on the mix path (after tee → compositor).
+        video_tee_mix_pad.add_probe(
             Gst.PadProbeType.BUFFER,
             self._make_video_probe(branch),
             None,
@@ -2362,6 +2429,8 @@ class CompositorPipeline:
                     self._make_audio_probe(branch),
                     None,
                 )
+                # Apply scene-hide mute as soon as the soundtrack pad exists.
+                self._apply_uri_audio_mix_state_unlocked(source_id)
 
         handler_id = src.connect('pad-added', on_pad_added, None)
         branch.signal_handlers.append((src, handler_id))
