@@ -2305,6 +2305,9 @@ class CompositorPipeline:
 
         src = Gst.ElementFactory.make('uridecodebin', f'uri_src_{source_id}')
         video_convert = Gst.ElementFactory.make('videoconvert', f'uri_v_convert_{source_id}')
+        # Downscale in the decode pipeline so live mix + SFU x264 do not chew
+        # full 1080p when cameras are also attached.
+        video_scale_dec = Gst.ElementFactory.make('videoscale', f'uri_v_dec_scale_{source_id}')
         video_caps = Gst.ElementFactory.make('capsfilter', f'uri_v_caps_{source_id}')
         video_dec_queue = Gst.ElementFactory.make('queue', f'uri_v_dec_queue_{source_id}')
         video_appsink = Gst.ElementFactory.make('appsink', f'uri_v_appsink_{source_id}')
@@ -2339,6 +2342,7 @@ class CompositorPipeline:
             [
                 src,
                 video_convert,
+                video_scale_dec,
                 video_caps,
                 video_dec_queue,
                 video_appsink,
@@ -2363,18 +2367,28 @@ class CompositorPipeline:
             raise RuntimeError(f'Failed to create URI ingest elements for {source_id}')
 
         mixer_audio_caps = Gst.Caps.from_string('audio/x-raw,rate=48000,channels=2')
+        uri_video_w = min(int(self.width), 1280)
+        uri_video_h = min(int(self.height), 720)
         src.set_property('uri', url)
-        video_caps.set_property('caps', Gst.Caps.from_string('video/x-raw,format=I420'))
+        video_scale_dec.set_property('add-borders', True)
+        video_caps.set_property(
+            'caps',
+            Gst.Caps.from_string(
+                f'video/x-raw,format=I420,width={uri_video_w},height={uri_video_h}'
+            ),
+        )
         audio_dec_caps.set_property('caps', mixer_audio_caps)
         live_audio_caps.set_property('caps', mixer_audio_caps)
         video_tee.set_property('allow-not-linked', True)
         audio_tee.set_property('allow-not-linked', True)
         self._disable_uri_transform_qos(video_convert)
+        self._disable_uri_transform_qos(video_scale_dec)
         self._disable_uri_transform_qos(audio_convert)
         self._disable_uri_transform_qos(live_audio_convert)
         self._configure_uri_pacing_queue(video_dec_queue)
         self._configure_uri_pacing_queue(audio_dec_queue)
-        self._configure_uri_appsink(video_appsink)
+        # Video: drop when the feeder is behind so decode prefers realtime.
+        self._configure_uri_appsink(video_appsink, drop=True, max_buffers=2)
         self._configure_uri_appsink(audio_appsink)
         self._configure_uri_appsrc(video_appsrc)
         self._configure_uri_appsrc(audio_appsrc)
@@ -2399,16 +2413,27 @@ class CompositorPipeline:
             ingest_queue.get_factory() is not None
             and ingest_queue.get_factory().get_name() == 'queue'
         ):
+            # Short leaky cushion: prefer dropping late VOD frames over stalling.
             ingest_queue.set_property('leaky', 2)
-            ingest_queue.set_property('max-size-time', 2 * Gst.SECOND)
+            ingest_queue.set_property('max-size-time', 500 * Gst.MSECOND)
+            ingest_queue.set_property('max-size-buffers', 0)
+            ingest_queue.set_property('max-size-bytes', 0)
 
         mix_queue = Gst.ElementFactory.make('queue', f'uri_v_mix_queue_{source_id}')
         if mix_queue is None:
             raise RuntimeError(f'Failed to create URI mix queue for {source_id}')
         mix_queue.set_property('leaky', 2)
-        mix_queue.set_property('max-size-time', 2 * Gst.SECOND)
+        mix_queue.set_property('max-size-time', 500 * Gst.MSECOND)
+        mix_queue.set_property('max-size-buffers', 0)
+        mix_queue.set_property('max-size-bytes', 0)
 
-        decode_video_chain = [video_convert, video_caps, video_dec_queue, video_appsink]
+        decode_video_chain = [
+            video_convert,
+            video_scale_dec,
+            video_caps,
+            video_dec_queue,
+            video_appsink,
+        ]
         decode_audio_chain = [
             audio_convert,
             audio_resample,
@@ -2809,16 +2834,21 @@ class CompositorPipeline:
         queue.set_property('max-size-time', 2 * Gst.SECOND)
 
     @staticmethod
-    def _configure_uri_appsink(appsink: Gst.Element) -> None:
+    def _configure_uri_appsink(
+        appsink: Gst.Element,
+        *,
+        drop: bool = False,
+        max_buffers: int = 1,
+    ) -> None:
         appsink.set_property('emit-signals', False)
         appsink.set_property('sync', False)
         appsink.set_property('async', False)
-        # Do not drop: non-leaky decode queue provides backpressure while the
-        # feeder thread sleeps to PTS (URI decode threads only).
+        # Video may drop when the feeder is behind; audio keeps a single
+        # non-drop buffer so pacing stays continuous.
         if appsink.find_property('max-buffers') is not None:
-            appsink.set_property('max-buffers', 1)
+            appsink.set_property('max-buffers', max(1, int(max_buffers)))
         if appsink.find_property('drop') is not None:
-            appsink.set_property('drop', False)
+            appsink.set_property('drop', bool(drop))
         if appsink.find_property('enable-last-sample') is not None:
             appsink.set_property('enable-last-sample', False)
 
@@ -2890,11 +2920,17 @@ class CompositorPipeline:
 
         source_id = branch.participant_peer_id
         pull_timeout = Gst.SECOND // 5
+        # Force-live compositor drops buffers whose PTS is far in the past.
+        # When the video feeder falls behind (camera attach / x264 load), rebase
+        # onto running time instead of pushing late frames that never mix.
+        late_restamp_ns = int(100 * Gst.MSECOND)
+        late_skip_ns = int(250 * Gst.MSECOND)
 
         def _run() -> None:
             offset: int | None = None
             caps_set = False
             logged_start = False
+            catchup_events = 0
             while not stop.is_set():
                 if branch.playback_paused:
                     if stop.wait(0.05):
@@ -2952,8 +2988,33 @@ class CompositorPipeline:
                                 offset,
                             )
                     mapped = int(file_pts) + int(offset)
-                    if not self._wait_for_uri_pts(mapped, stop):
-                        break
+                    lag_ns = int(running) - int(mapped)
+                    if kind == 'video' and lag_ns > late_skip_ns:
+                        # Far behind: drop this frame and rebase timeline.
+                        offset = int(running) - int(file_pts)
+                        catchup_events += 1
+                        if catchup_events == 1 or catchup_events % 50 == 0:
+                            logger.info(
+                                'URI video catch-up skip source=%s lag_ms=%.1f events=%s',
+                                source_id,
+                                lag_ns / 1_000_000.0,
+                                catchup_events,
+                            )
+                        continue
+                    if kind == 'video' and lag_ns > late_restamp_ns:
+                        offset = int(running) - int(file_pts)
+                        mapped = int(running)
+                        catchup_events += 1
+                        if catchup_events == 1 or catchup_events % 50 == 0:
+                            logger.info(
+                                'URI video catch-up restamp source=%s lag_ms=%.1f events=%s',
+                                source_id,
+                                lag_ns / 1_000_000.0,
+                                catchup_events,
+                            )
+                    elif lag_ns < 0:
+                        if not self._wait_for_uri_pts(mapped, stop):
+                            break
 
                 try:
                     # Prefer a shallow copy; PTS rewrite needs a writable buffer.

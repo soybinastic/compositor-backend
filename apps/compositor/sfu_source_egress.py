@@ -79,20 +79,23 @@ def _make_encoder(factory_names: tuple[str, ...], name: str) -> Gst.Element:
 
 def _configure_leak_queue(queue: Gst.Element) -> None:
     queue.set_property('leaky', 2)
-    queue.set_property('max-size-time', 500 * Gst.MSECOND)
-    queue.set_property('max-size-buffers', 0)
+    queue.set_property('max-size-time', 200 * Gst.MSECOND)
+    queue.set_property('max-size-buffers', 2)
     queue.set_property('max-size-bytes', 0)
 
 
 def _configure_x264(venc: Gst.Element) -> None:
     factory_name = venc.get_factory().get_name() if venc.get_factory() else ''
     if factory_name == 'x264enc':
-        venc.set_property('speed-preset', 'veryfast')
+        # ultrafast: URI tee shares the live mix graph; keep preview encode cheap.
+        venc.set_property('speed-preset', 'ultrafast')
         venc.set_property('tune', 'zerolatency')
         venc.set_property('key-int-max', 60)
         venc.set_property('bitrate', _VIDEO_BITRATE_KBPS)
         if venc.find_property('byte-stream') is not None:
             venc.set_property('byte-stream', True)
+        if venc.find_property('threads') is not None:
+            venc.set_property('threads', 2)
     elif factory_name == 'openh264enc':
         venc.set_property('bitrate', _VIDEO_BITRATE_KBPS * 1000)
 
