@@ -2515,9 +2515,23 @@ class CompositorPipeline:
             uri_audio_appsink=audio_appsink,
             uri_audio_appsrc=audio_appsrc,
         )
+        # Re-align URI mix PTS to pipeline running time at the compositor edge.
+        # Feeder timestamps alone drift through scale/tee/mix_queue under load;
+        # force-live compositor then starves this pad while the SFU tee (preview)
+        # still looks fine. continuous=True matches live camera pads.
+        mix_src.add_probe(
+            Gst.PadProbeType.BUFFER,
+            self._make_running_time_offset_probe(continuous=True),
+            None,
+        )
         mix_src.add_probe(
             Gst.PadProbeType.BUFFER,
             self._make_video_probe(branch),
+            None,
+        )
+        audio_src_pad.add_probe(
+            Gst.PadProbeType.BUFFER,
+            self._make_running_time_offset_probe(continuous=False),
             None,
         )
         audio_src_pad.add_probe(
@@ -3072,8 +3086,10 @@ class CompositorPipeline:
         timestamps are already near running time after the first alignment.
         Continuous re-offset on a leaky still pad can jitter the mixer.
 
-        For paced URI/VOD branches, also use continuous=False so the file
-        timeline maps onto live time once and keeps relative frame spacing.
+        URI video mix pads use continuous=True (same as live cameras): one-shot
+        alignment drifts again through queues and force-live compositor drops
+        the pad (program freeze) while the SFU tee preview can still look fine.
+        URI audio uses continuous=False like other mixer audio pads.
         """
         state = {'logged': False, 'applied': False}
 
