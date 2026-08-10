@@ -114,6 +114,8 @@ class SessionIngestManager:
         # seat_id → monotonic time when video producer first went missing
         self._video_missing_since: dict[str, float] = {}
         self._display_names: dict[str, str] = {}
+        # seat_id → monotonic deadline; skip attach retries until then
+        self._attach_backoff_until: dict[str, float] = {}
 
     @classmethod
     def create(
@@ -297,6 +299,8 @@ class SessionIngestManager:
 
         if current is None:
             if audio_id and video_id:
+                if self._attach_in_backoff(peer_id):
+                    return
                 try:
                     participant = self._consumer_service.attach_participant(
                         peer_id,
@@ -307,7 +311,9 @@ class SessionIngestManager:
                     participant.display_name = display_name
                     self._participants[peer_id] = participant
                     self._video_missing_since.pop(peer_id, None)
-                except Exception:
+                    self._clear_attach_backoff(peer_id)
+                except Exception as exc:
+                    self._note_attach_failure(peer_id, exc)
                     logger.exception(
                         'Failed to attach ingest for participant %s',
                         peer_id,
@@ -459,6 +465,8 @@ class SessionIngestManager:
             current = self._participants.get(seat_id)
             seat_name = display_name
             if current is None:
+                if self._attach_in_backoff(seat_id):
+                    continue
                 try:
                     participant = self._consumer_service.attach_video_seat(
                         seat_id,
@@ -469,7 +477,9 @@ class SessionIngestManager:
                         host_owned=True,
                     )
                     self._participants[seat_id] = participant
-                except Exception:
+                    self._clear_attach_backoff(seat_id)
+                except Exception as exc:
+                    self._note_attach_failure(seat_id, exc)
                     logger.exception(
                         'Failed to attach extra video seat %s for peer %s',
                         seat_id,
@@ -502,6 +512,25 @@ class SessionIngestManager:
 
     def _is_compositor_peer(self, peer_id: str) -> bool:
         return peer_id == self.compositor_peer_id or peer_id.startswith('compositor-')
+
+    def _attach_in_backoff(self, seat_id: str) -> bool:
+        until = self._attach_backoff_until.get(seat_id)
+        return until is not None and time.monotonic() < until
+
+    def _note_attach_failure(self, seat_id: str, exc: BaseException) -> None:
+        message = str(exc)
+        # Port exhaustion needs a longer cool-down so we don't burn the pool.
+        delay = 30.0 if 'No free RTP ports' in message else 5.0
+        self._attach_backoff_until[seat_id] = time.monotonic() + delay
+        logger.warning(
+            'Attach backoff %.0fs for seat %s (%s)',
+            delay,
+            seat_id,
+            message.splitlines()[0] if message else type(exc).__name__,
+        )
+
+    def _clear_attach_backoff(self, seat_id: str) -> None:
+        self._attach_backoff_until.pop(seat_id, None)
 
     @staticmethod
     def _seat_owner(seat_id: str, participant: ParticipantIngest) -> str:
@@ -638,7 +667,11 @@ class SessionIngestManager:
                         participant_peer_id=participant.participant_peer_id,
                         audio_producer_id=participant.audio_producer_id or '',
                         video_producer_id=participant.video_producer_id,
-                        audio_port=participant.ports.audio.rtp_port,
+                        audio_port=(
+                            participant.ports.audio.rtp_port
+                            if participant.ports.audio is not None
+                            else 0
+                        ),
                         video_port=participant.ports.video.rtp_port,
                         audio_buffers=stats.audio_buffers if stats else 0,
                         video_buffers=stats.video_buffers if stats else 0,
