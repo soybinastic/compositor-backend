@@ -2330,6 +2330,11 @@ class CompositorPipeline:
         video_caps.set_property('caps', Gst.Caps.from_string('video/x-raw,format=I420'))
         video_tee.set_property('allow-not-linked', True)
         audio_tee.set_property('allow-not-linked', True)
+        # VOD PTS starts near 0 while the live pipeline is already at tens of
+        # seconds. Default BaseTransform QoS then drops every buffer as "late"
+        # (decode still counts; mix/SFU never see frames). Disable on URI only.
+        self._disable_uri_transform_qos(video_convert)
+        self._disable_uri_transform_qos(audio_convert)
         # Extra cushion; clock-sync identity is the real VOD pacer.
         self._configure_uri_pacing_queue(audio_queue)
         video_scale = next(
@@ -2343,6 +2348,7 @@ class CompositorPipeline:
         )
         if video_scale is not None:
             video_scale.set_property('add-borders', True)
+            self._disable_uri_transform_qos(video_scale)
         ingest_queue = ingest_tail[-1]
         if (
             ingest_queue.get_factory() is not None
@@ -2375,6 +2381,10 @@ class CompositorPipeline:
             mix_queue,
             *audio_chain,
         ]
+        # Match RTP ingest: add to pipeline before linking.
+        for element in elements:
+            self._pipeline.add(element)
+
         self._link_sequential(
             video_chain,
             label=f'uri-video-{source_id}',
@@ -2385,9 +2395,6 @@ class CompositorPipeline:
             audio_chain,
             label=f'uri-audio-{source_id}',
         )
-
-        for element in elements:
-            self._pipeline.add(element)
 
         compositor_sink_pad = self._compositor.get_request_pad('sink_%u')
         if compositor_sink_pad is None:
@@ -2416,6 +2423,21 @@ class CompositorPipeline:
             audio_volume=audio_volume,
             uri_video_tee=video_tee,
             uri_audio_tee=audio_tee,
+        )
+        # Live restamp on convert src (not uridecodebin ghost pad): ghost-pad
+        # offset was logged but convert QoS still treated file PTS as late.
+        video_convert_src = video_convert.get_static_pad('src')
+        if video_convert_src is None:
+            raise RuntimeError(f'URI videoconvert has no src pad for {source_id}')
+        video_convert_src.add_probe(
+            Gst.PadProbeType.BUFFER,
+            self._make_count_probe(branch, 'uri_v_convert'),
+            None,
+        )
+        video_convert_src.add_probe(
+            Gst.PadProbeType.BUFFER,
+            self._make_uri_timestamp_align_probe(),
+            None,
         )
         # Mid-chain counts: queue → sync → tee/mix → compositor.
         ingest_queue_src = ingest_tail[-1].get_static_pad('src')
@@ -2463,16 +2485,9 @@ class CompositorPipeline:
                 if pad.link(sink_pad) != Gst.PadLinkReturn.OK:
                     raise RuntimeError(f'Failed to link URI video pad for {source_id}')
                 link_state['video'] = True
-                # Prove decode output and align VOD timestamps to live running time
-                # before convert/caps/scale (one-shot pad offset on first valid PTS).
                 pad.add_probe(
                     Gst.PadProbeType.BUFFER,
                     self._make_uri_decode_count_probe(branch, kind='video'),
-                    None,
-                )
-                pad.add_probe(
-                    Gst.PadProbeType.BUFFER,
-                    self._make_uri_timestamp_align_probe(),
                     None,
                 )
                 logger.info(
@@ -2502,11 +2517,18 @@ class CompositorPipeline:
                     self._make_uri_decode_count_probe(branch, kind='audio'),
                     None,
                 )
-                pad.add_probe(
-                    Gst.PadProbeType.BUFFER,
-                    self._make_uri_timestamp_align_probe(),
-                    None,
-                )
+                audio_convert_src = audio_convert.get_static_pad('src')
+                if audio_convert_src is not None:
+                    audio_convert_src.add_probe(
+                        Gst.PadProbeType.BUFFER,
+                        self._make_count_probe(branch, 'uri_a_convert'),
+                        None,
+                    )
+                    audio_convert_src.add_probe(
+                        Gst.PadProbeType.BUFFER,
+                        self._make_uri_timestamp_align_probe(),
+                        None,
+                    )
                 audio_sync_src = audio_sync.get_static_pad('src')
                 if audio_sync_src is not None:
                     audio_sync_src.add_probe(
@@ -2786,6 +2808,18 @@ class CompositorPipeline:
         queue.set_property('max-size-time', 2 * Gst.SECOND)
 
     @staticmethod
+    def _disable_uri_transform_qos(element: Gst.Element) -> None:
+        """
+        Stop BaseTransform QoS from dropping VOD buffers as "late".
+
+        File PTS near 0 vs a live pipeline clock at tens of seconds causes
+        default qos=true converts/scales to drop every buffer while decode
+        still advances (seen as URI decode counts with zero mix ingest).
+        """
+        if element.find_property('qos') is not None:
+            element.set_property('qos', False)
+
+    @staticmethod
     def _make_uri_clock_sync_identity(name: str) -> Gst.Element:
         """
         Pace VOD buffers to the pipeline clock before mix/SFU tees.
@@ -2826,12 +2860,12 @@ class CompositorPipeline:
 
     def _make_uri_timestamp_align_probe(self):
         """
-        Align VOD buffers to pipeline running time on the uridecodebin pad.
+        Align VOD buffers to pipeline running time (one-shot pad offset).
 
-        One-shot pad offset preserves file-relative frame spacing while mapping
-        the first buffer onto live running time. PTS=NONE cannot be rewritten
-        reliably from a Python pad probe (make_writable copies are discarded),
-        so those buffers are left alone and logged once.
+        Applied on convert src pads (not uridecodebin ghost pads) so sync,
+        mix, and SFU see a live-mapped timeline while preserving file-relative
+        frame spacing. PTS=NONE cannot be rewritten reliably from a Python pad
+        probe, so those buffers are left alone and logged once.
         """
         state = {'logged_offset': False, 'logged_none': False, 'applied': False}
 
