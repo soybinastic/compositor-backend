@@ -2291,6 +2291,9 @@ class CompositorPipeline:
         _ = display_name
         src = Gst.ElementFactory.make('uridecodebin', f'uri_src_{source_id}')
         video_convert = Gst.ElementFactory.make('videoconvert', f'uri_v_convert_{source_id}')
+        # Force a stable system-memory format so scale/upload/tee/SFU negotiate
+        # without stalling on decoder-native layouts.
+        video_caps = Gst.ElementFactory.make('capsfilter', f'uri_v_caps_{source_id}')
         ingest_tail = self._video_mix_backend.build_ingest_tail(source_id)
         video_tee = Gst.ElementFactory.make('tee', f'uri_v_tee_{source_id}')
         audio_convert = Gst.ElementFactory.make('audioconvert', f'uri_a_convert_{source_id}')
@@ -2304,6 +2307,7 @@ class CompositorPipeline:
             [
                 src,
                 video_convert,
+                video_caps,
                 *ingest_tail,
                 video_tee,
                 audio_convert,
@@ -2317,10 +2321,13 @@ class CompositorPipeline:
             raise RuntimeError(f'Failed to create URI ingest elements for {source_id}')
 
         src.set_property('uri', url)
+        video_caps.set_property('caps', Gst.Caps.from_string('video/x-raw,format=I420'))
         video_tee.set_property('allow-not-linked', True)
         audio_tee.set_property('allow-not-linked', True)
-        audio_queue.set_property('leaky', 2)
-        audio_queue.set_property('max-size-time', 2 * Gst.SECOND)
+        # VOD must NOT use leaky ingest queues: uridecodebin otherwise dumps the
+        # whole file in seconds, leaky drops leave only far-future PTS, and the
+        # force-live mixer/SFU see black. Non-leaky queues backpressure-pace VOD.
+        self._configure_uri_pacing_queue(audio_queue)
         video_scale = next(
             (
                 element
@@ -2332,15 +2339,22 @@ class CompositorPipeline:
         )
         if video_scale is not None:
             video_scale.set_property('add-borders', True)
+        ingest_queue = ingest_tail[-1]
+        if (
+            ingest_queue.get_factory() is not None
+            and ingest_queue.get_factory().get_name() == 'queue'
+        ):
+            self._configure_uri_pacing_queue(ingest_queue)
 
         # Isolates force-live compositor from SFU encode backpressure on the tee.
+        # Keep this queue leaky: SFU stalls must not block the mix path.
         mix_queue = Gst.ElementFactory.make('queue', f'uri_v_mix_queue_{source_id}')
         if mix_queue is None:
             raise RuntimeError(f'Failed to create URI mix queue for {source_id}')
         mix_queue.set_property('leaky', 2)
         mix_queue.set_property('max-size-time', 2 * Gst.SECOND)
 
-        video_chain = [video_convert, *ingest_tail]
+        video_chain = [video_convert, video_caps, *ingest_tail]
         elements = [
             src,
             *video_chain,
@@ -2380,18 +2394,6 @@ class CompositorPipeline:
             raise RuntimeError(f'Failed to link URI video tee → mix queue for {source_id}')
         if mix_src.link(compositor_sink_pad) != Gst.PadLinkReturn.OK:
             raise RuntimeError(f'Failed to link URI mix queue → compositor for {source_id}')
-
-        # Same placement as RTP ingest: offset on the leaky ingest queue src so
-        # force-live compositor (and SFU tee) see live running time. continuous=True
-        # keeps VOD catch-up frames from looking "early" and getting held/dropped.
-        video_queue_src = ingest_tail[-1].get_static_pad('src')
-        if video_queue_src is None:
-            raise RuntimeError(f'URI ingest queue has no src pad for {source_id}')
-        video_queue_src.add_probe(
-            Gst.PadProbeType.BUFFER,
-            self._make_running_time_offset_probe(continuous=True),
-            None,
-        )
 
         branch = ParticipantBranch(
             participant_peer_id=source_id,
@@ -2434,6 +2436,18 @@ class CompositorPipeline:
                 if pad.link(sink_pad) != Gst.PadLinkReturn.OK:
                     raise RuntimeError(f'Failed to link URI video pad for {source_id}')
                 link_state['video'] = True
+                # Prove decode output and align VOD timestamps to live running time
+                # before convert/caps/scale (one-shot pad offset on first valid PTS).
+                pad.add_probe(
+                    Gst.PadProbeType.BUFFER,
+                    self._make_uri_decode_count_probe(branch, kind='video'),
+                    None,
+                )
+                pad.add_probe(
+                    Gst.PadProbeType.BUFFER,
+                    self._make_uri_timestamp_align_probe(),
+                    None,
+                )
                 logger.info(
                     'URI video pad linked source=%s caps=%s',
                     source_id,
@@ -2456,10 +2470,14 @@ class CompositorPipeline:
 
                 branch.mixer_sink_pad = mixer_pad
                 link_state['audio'] = True
-                # continuous=True: same VOD-in-live catch-up issue as video.
-                audio_src_pad.add_probe(
+                pad.add_probe(
                     Gst.PadProbeType.BUFFER,
-                    self._make_running_time_offset_probe(continuous=True),
+                    self._make_uri_decode_count_probe(branch, kind='audio'),
+                    None,
+                )
+                pad.add_probe(
+                    Gst.PadProbeType.BUFFER,
+                    self._make_uri_timestamp_align_probe(),
                     None,
                 )
                 audio_src_pad.add_probe(
@@ -2720,6 +2738,94 @@ class CompositorPipeline:
 
         return _probe
 
+    @staticmethod
+    def _configure_uri_pacing_queue(queue: Gst.Element) -> None:
+        """
+        Non-leaky queue so uridecodebin is backpressure-paced to live time.
+
+        Leaky VOD ingest dumps the file in seconds; surviving buffers carry
+        far-future PTS and the force-live mixer/SFU stay black.
+        """
+        queue.set_property('leaky', 0)
+        queue.set_property('max-size-buffers', 0)
+        queue.set_property('max-size-bytes', 0)
+        queue.set_property('max-size-time', 2 * Gst.SECOND)
+
+    @staticmethod
+    def _make_uri_decode_count_probe(branch: ParticipantBranch, *, kind: str):
+        """Log buffers leaving uridecodebin, including PTS=NONE."""
+
+        def _probe(_pad: Gst.Pad, info: Gst.PadProbeInfo, _user_data) -> Gst.PadProbeReturn:
+            key = f'_uri_decode_{kind}'
+            count = getattr(branch.stats, key, 0) + 1
+            setattr(branch.stats, key, count)
+            if CompositorPipeline._should_log_ingest_count(count):
+                buffer = info.get_buffer()
+                pts = None if buffer is None else buffer.pts
+                pts_label = 'none' if pts is None or pts == Gst.CLOCK_TIME_NONE else str(pts)
+                logger.info(
+                    'URI decode %s buffers=%s pts=%s peer=%s',
+                    kind,
+                    count,
+                    pts_label,
+                    branch.participant_peer_id,
+                )
+            return Gst.PadProbeReturn.OK
+
+        return _probe
+
+    def _make_uri_timestamp_align_probe(self):
+        """
+        Align VOD buffers to pipeline running time on the uridecodebin pad.
+
+        One-shot pad offset preserves file-relative frame spacing while mapping
+        the first buffer onto live running time. PTS=NONE cannot be rewritten
+        reliably from a Python pad probe (make_writable copies are discarded),
+        so those buffers are left alone and logged once.
+        """
+        state = {'logged_offset': False, 'logged_none': False, 'applied': False}
+
+        def _probe(pad: Gst.Pad, info: Gst.PadProbeInfo, _user_data) -> Gst.PadProbeReturn:
+            if self._pipeline is None:
+                return Gst.PadProbeReturn.OK
+
+            buffer = info.get_buffer()
+            if buffer is None:
+                return Gst.PadProbeReturn.OK
+
+            if buffer.pts == Gst.CLOCK_TIME_NONE:
+                if not state['logged_none']:
+                    state['logged_none'] = True
+                    logger.warning(
+                        'URI buffer PTS=NONE on %s (cannot rewrite in probe)',
+                        pad.get_path_string(),
+                    )
+                return Gst.PadProbeReturn.OK
+
+            if state['applied']:
+                return Gst.PadProbeReturn.OK
+
+            clock = self._pipeline.get_clock()
+            if clock is None:
+                return Gst.PadProbeReturn.OK
+
+            running_time = clock.get_time() - self._pipeline.get_base_time()
+            if running_time < 0:
+                return Gst.PadProbeReturn.OK
+
+            pad.set_offset(int(running_time) - int(buffer.pts))
+            state['applied'] = True
+            if not state['logged_offset']:
+                state['logged_offset'] = True
+                logger.info(
+                    'URI aligned running-time pad offset=%s on %s',
+                    pad.get_offset(),
+                    pad.get_path_string(),
+                )
+            return Gst.PadProbeReturn.OK
+
+        return _probe
+
     def _make_running_time_offset_probe(self, *, continuous: bool = True):
         """
         Keep buffer PTS aligned to pipeline running time.
@@ -2731,6 +2837,9 @@ class CompositorPipeline:
         For live still graphics (appsrc do-timestamp), pass continuous=False —
         timestamps are already near running time after the first alignment.
         Continuous re-offset on a leaky still pad can jitter the mixer.
+
+        For paced URI/VOD branches, also use continuous=False so the file
+        timeline maps onto live time once and keeps relative frame spacing.
         """
         state = {'logged': False, 'applied': False}
 
