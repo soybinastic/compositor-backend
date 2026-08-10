@@ -2387,7 +2387,7 @@ class CompositorPipeline:
             self._make_video_probe(branch),
             None,
         )
-        link_state = {'audio': False}
+        link_state = {'audio': False, 'video': False}
 
         def on_pad_added(_element: Gst.Element, pad: Gst.Pad, _user_data) -> None:
             caps = pad.get_current_caps()
@@ -2401,12 +2401,25 @@ class CompositorPipeline:
                 return
 
             media_name = structure.get_name()
-            if media_name.startswith('video/'):
+            if media_name.startswith('video/') and not link_state['video']:
                 sink_pad = video_convert.get_static_pad('sink')
                 if sink_pad is None or sink_pad.is_linked():
                     return
                 if pad.link(sink_pad) != Gst.PadLinkReturn.OK:
                     raise RuntimeError(f'Failed to link URI video pad for {source_id}')
+                link_state['video'] = True
+                # Align VOD PTS to live pipeline running time before tee/mix/SFU.
+                # One-shot: file timestamps are linear from ~0 (unlike drifting RTP).
+                pad.add_probe(
+                    Gst.PadProbeType.BUFFER,
+                    self._make_running_time_offset_probe(continuous=False),
+                    None,
+                )
+                logger.info(
+                    'URI video pad linked source=%s caps=%s',
+                    source_id,
+                    media_name,
+                )
             elif media_name.startswith('audio/') and not link_state['audio']:
                 mixer_pad = self._audiomixer.get_request_pad('sink_%u')
                 if mixer_pad is None:
@@ -2426,11 +2439,21 @@ class CompositorPipeline:
                 link_state['audio'] = True
                 audio_src_pad.add_probe(
                     Gst.PadProbeType.BUFFER,
+                    self._make_running_time_offset_probe(continuous=False),
+                    None,
+                )
+                audio_src_pad.add_probe(
+                    Gst.PadProbeType.BUFFER,
                     self._make_audio_probe(branch),
                     None,
                 )
                 # Apply scene-hide mute as soon as the soundtrack pad exists.
                 self._apply_uri_audio_mix_state_unlocked(source_id)
+                logger.info(
+                    'URI audio pad linked source=%s caps=%s',
+                    source_id,
+                    media_name,
+                )
 
         handler_id = src.connect('pad-added', on_pad_added, None)
         branch.signal_handlers.append((src, handler_id))
