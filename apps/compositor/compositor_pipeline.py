@@ -2387,8 +2387,9 @@ class CompositorPipeline:
         self._disable_uri_transform_qos(live_audio_convert)
         self._configure_uri_pacing_queue(video_dec_queue)
         self._configure_uri_pacing_queue(audio_dec_queue)
-        # Video: drop when the feeder is behind so decode prefers realtime.
-        self._configure_uri_appsink(video_appsink, drop=True, max_buffers=2)
+        # Video: do not drop — appsink drop raced decode ahead of the feeder and
+        # produced multi-second PTS jumps (blank preview / frozen program).
+        self._configure_uri_appsink(video_appsink, drop=False, max_buffers=1)
         self._configure_uri_appsink(audio_appsink)
         self._configure_uri_appsrc(video_appsrc)
         self._configure_uri_appsrc(audio_appsrc)
@@ -2921,10 +2922,10 @@ class CompositorPipeline:
         source_id = branch.participant_peer_id
         pull_timeout = Gst.SECOND // 5
         # Force-live compositor drops buffers whose PTS is far in the past.
-        # When the video feeder falls behind (camera attach / x264 load), rebase
-        # onto running time instead of pushing late frames that never mix.
+        # Video: always push (restamp when late). Also clamp far-future PTS so a
+        # decode jump cannot park the feeder in _wait_for_uri_pts for minutes.
         late_restamp_ns = int(100 * Gst.MSECOND)
-        late_skip_ns = int(250 * Gst.MSECOND)
+        early_clamp_ns = int(200 * Gst.MSECOND)
 
         def _run() -> None:
             offset: int | None = None
@@ -2989,19 +2990,11 @@ class CompositorPipeline:
                             )
                     mapped = int(file_pts) + int(offset)
                     lag_ns = int(running) - int(mapped)
-                    if kind == 'video' and lag_ns > late_skip_ns:
-                        # Far behind: drop this frame and rebase timeline.
-                        offset = int(running) - int(file_pts)
-                        catchup_events += 1
-                        if catchup_events == 1 or catchup_events % 50 == 0:
-                            logger.info(
-                                'URI video catch-up skip source=%s lag_ms=%.1f events=%s',
-                                source_id,
-                                lag_ns / 1_000_000.0,
-                                catchup_events,
-                            )
-                        continue
-                    if kind == 'video' and lag_ns > late_restamp_ns:
+                    if kind == 'video' and (
+                        lag_ns > late_restamp_ns or lag_ns < -early_clamp_ns
+                    ):
+                        # Late → compositor would drop; far early → feeder would
+                        # sleep forever. Restamp onto running time and push.
                         offset = int(running) - int(file_pts)
                         mapped = int(running)
                         catchup_events += 1
