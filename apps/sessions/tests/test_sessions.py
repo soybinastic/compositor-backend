@@ -165,3 +165,23 @@ class MediasoupHttpClientTests(TestCase):
             client.delete_room('abc')
 
         self.assertEqual(ctx.exception.status, 404)
+
+    @patch('integrations.mediasoup.client.urllib.request.urlopen')
+    def test_ensure_broadcaster_joined_treats_409_as_success(self, mock_urlopen):
+        import urllib.error
+
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            url='http://localhost:4443/rooms/abc/broadcasters/peer/join',
+            code=409,
+            msg='Conflict',
+            hdrs=None,
+            fp=MagicMock(
+                read=MagicMock(return_value=b'InvalidStateError: Peer already joined')
+            ),
+        )
+
+        client = MediasoupHttpClient(
+            api_url='http://localhost:4443',
+            origin='http://localhost:4443',
+        )
+        self.assertTrue(client.ensure_broadcaster_joined('abc', 'peer'))

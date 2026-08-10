@@ -151,10 +151,10 @@ class SfuSourceEgress:
             return
 
         try:
-            self.client.join_broadcaster(self.room_id, self.compositor_peer_id)
+            self.client.ensure_broadcaster_joined(self.room_id, self.compositor_peer_id)
         except Exception as exc:
             logger.debug(
-                'join_broadcaster before SFU egress source=%s: %s',
+                'ensure_broadcaster_joined before SFU egress source=%s: %s',
                 self.source_id,
                 exc,
             )

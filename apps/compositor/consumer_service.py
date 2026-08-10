@@ -506,11 +506,18 @@ class ConsumerService:
     def get_participant_stats(self, participant_peer_id: str) -> IngestStats | None:
         return self._compositor_pipeline.get_participant_stats(participant_peer_id)
 
+    def mark_joined(self) -> None:
+        """Record that the compositor peer is already joined (e.g. via URI SFU)."""
+        self._joined = True
+
     def _ensure_joined(self) -> None:
         if self._joined:
             return
 
-        self._client.join_broadcaster(self._room_id, self._compositor_peer_id)
+        self._client.ensure_broadcaster_joined(
+            self._room_id,
+            self._compositor_peer_id,
+        )
         self._joined = True
 
 

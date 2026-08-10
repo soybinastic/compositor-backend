@@ -579,6 +579,10 @@ class SessionIngestManager:
             display_name=display_name,
             produce_to_sfu=produce_to_sfu,
         )
+        # URI SFU egress joins the compositor peer; keep ConsumerService in sync
+        # so later camera attaches do not POST /join again and hit 409.
+        if produce_to_sfu:
+            self._consumer_service.mark_joined()
         with self._lock:
             self._uri_sources[source_id] = {
                 'url': url,
