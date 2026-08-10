@@ -2319,6 +2319,8 @@ class CompositorPipeline:
         src.set_property('uri', url)
         video_tee.set_property('allow-not-linked', True)
         audio_tee.set_property('allow-not-linked', True)
+        audio_queue.set_property('leaky', 2)
+        audio_queue.set_property('max-size-time', 2 * Gst.SECOND)
         video_scale = next(
             (
                 element
@@ -2331,11 +2333,19 @@ class CompositorPipeline:
         if video_scale is not None:
             video_scale.set_property('add-borders', True)
 
+        # Isolates force-live compositor from SFU encode backpressure on the tee.
+        mix_queue = Gst.ElementFactory.make('queue', f'uri_v_mix_queue_{source_id}')
+        if mix_queue is None:
+            raise RuntimeError(f'Failed to create URI mix queue for {source_id}')
+        mix_queue.set_property('leaky', 2)
+        mix_queue.set_property('max-size-time', 2 * Gst.SECOND)
+
         video_chain = [video_convert, *ingest_tail]
         elements = [
             src,
             *video_chain,
             video_tee,
+            mix_queue,
             audio_convert,
             audio_resample,
             audio_highpass,
@@ -2362,10 +2372,26 @@ class CompositorPipeline:
             raise RuntimeError(f'Failed to request compositor sink pad for {source_id}')
 
         video_tee_mix_pad = video_tee.get_request_pad('src_%u')
-        if video_tee_mix_pad is None:
-            raise RuntimeError(f'Failed to request URI video tee mix pad for {source_id}')
-        if video_tee_mix_pad.link(compositor_sink_pad) != Gst.PadLinkReturn.OK:
-            raise RuntimeError(f'Failed to link URI video tee → compositor for {source_id}')
+        mix_sink = mix_queue.get_static_pad('sink')
+        mix_src = mix_queue.get_static_pad('src')
+        if video_tee_mix_pad is None or mix_sink is None or mix_src is None:
+            raise RuntimeError(f'Failed to request URI video tee/mix pads for {source_id}')
+        if video_tee_mix_pad.link(mix_sink) != Gst.PadLinkReturn.OK:
+            raise RuntimeError(f'Failed to link URI video tee → mix queue for {source_id}')
+        if mix_src.link(compositor_sink_pad) != Gst.PadLinkReturn.OK:
+            raise RuntimeError(f'Failed to link URI mix queue → compositor for {source_id}')
+
+        # Same placement as RTP ingest: offset on the leaky ingest queue src so
+        # force-live compositor (and SFU tee) see live running time. continuous=True
+        # keeps VOD catch-up frames from looking "early" and getting held/dropped.
+        video_queue_src = ingest_tail[-1].get_static_pad('src')
+        if video_queue_src is None:
+            raise RuntimeError(f'URI ingest queue has no src pad for {source_id}')
+        video_queue_src.add_probe(
+            Gst.PadProbeType.BUFFER,
+            self._make_running_time_offset_probe(continuous=True),
+            None,
+        )
 
         branch = ParticipantBranch(
             participant_peer_id=source_id,
@@ -2381,8 +2407,8 @@ class CompositorPipeline:
             uri_video_tee=video_tee,
             uri_audio_tee=audio_tee,
         )
-        # Probe on the mix path (after tee → compositor).
-        video_tee_mix_pad.add_probe(
+        # Count frames on the mix path (after tee isolation queue).
+        mix_src.add_probe(
             Gst.PadProbeType.BUFFER,
             self._make_video_probe(branch),
             None,
@@ -2408,13 +2434,6 @@ class CompositorPipeline:
                 if pad.link(sink_pad) != Gst.PadLinkReturn.OK:
                     raise RuntimeError(f'Failed to link URI video pad for {source_id}')
                 link_state['video'] = True
-                # Align VOD PTS to live pipeline running time before tee/mix/SFU.
-                # One-shot: file timestamps are linear from ~0 (unlike drifting RTP).
-                pad.add_probe(
-                    Gst.PadProbeType.BUFFER,
-                    self._make_running_time_offset_probe(continuous=False),
-                    None,
-                )
                 logger.info(
                     'URI video pad linked source=%s caps=%s',
                     source_id,
@@ -2437,9 +2456,10 @@ class CompositorPipeline:
 
                 branch.mixer_sink_pad = mixer_pad
                 link_state['audio'] = True
+                # continuous=True: same VOD-in-live catch-up issue as video.
                 audio_src_pad.add_probe(
                     Gst.PadProbeType.BUFFER,
-                    self._make_running_time_offset_probe(continuous=False),
+                    self._make_running_time_offset_probe(continuous=True),
                     None,
                 )
                 audio_src_pad.add_probe(
