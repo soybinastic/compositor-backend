@@ -2295,14 +2295,16 @@ class CompositorPipeline:
         # without stalling on decoder-native layouts.
         video_caps = Gst.ElementFactory.make('capsfilter', f'uri_v_caps_{source_id}')
         ingest_tail = self._video_mix_backend.build_ingest_tail(source_id)
-        # Do not use identity sync=true on the shared force-live pipeline: it
-        # blocks streaming threads, starves camera RTP, and times out layout /
-        # StopStream. Pace with qos=false + live restamp + short queues instead.
+        # Wall-clock pace AFTER live restamp and BEFORE the tee. Leaky mix/SFU
+        # branches always accept, so without this uridecodebin dumps the file.
+        # Keep mid-chain Python probes off this path (GIL + sync starved cameras).
+        video_sync = self._make_uri_clock_sync_identity(f'uri_v_sync_{source_id}')
         video_tee = Gst.ElementFactory.make('tee', f'uri_v_tee_{source_id}')
         audio_convert = Gst.ElementFactory.make('audioconvert', f'uri_a_convert_{source_id}')
         audio_resample = Gst.ElementFactory.make('audioresample', f'uri_a_resample_{source_id}')
         audio_highpass = _make_voice_highpass_element(f'uri_a_highpass_{source_id}')
         audio_volume = _make_ingest_volume_element(f'uri_a_volume_{source_id}')
+        audio_sync = self._make_uri_clock_sync_identity(f'uri_a_sync_{source_id}')
         audio_tee = Gst.ElementFactory.make('tee', f'uri_a_tee_{source_id}')
         audio_queue = Gst.ElementFactory.make('queue', f'uri_a_queue_{source_id}')
 
@@ -2312,11 +2314,13 @@ class CompositorPipeline:
                 video_convert,
                 video_caps,
                 *ingest_tail,
+                video_sync,
                 video_tee,
                 audio_convert,
                 audio_resample,
                 audio_highpass,
                 audio_volume,
+                audio_sync,
                 audio_tee,
                 audio_queue,
             ]
@@ -2360,12 +2364,13 @@ class CompositorPipeline:
         mix_queue.set_property('leaky', 2)
         mix_queue.set_property('max-size-time', 2 * Gst.SECOND)
 
-        video_chain = [video_convert, video_caps, *ingest_tail]
+        video_chain = [video_convert, video_caps, *ingest_tail, video_sync]
         audio_chain = [
             audio_convert,
             audio_resample,
             audio_highpass,
             audio_volume,
+            audio_sync,
             audio_tee,
             audio_queue,
         ]
@@ -2384,8 +2389,8 @@ class CompositorPipeline:
             video_chain,
             label=f'uri-video-{source_id}',
         )
-        if not ingest_tail[-1].link(video_tee):
-            raise RuntimeError(f'Failed to link URI video ingest → tee for {source_id}')
+        if not video_sync.link(video_tee):
+            raise RuntimeError(f'Failed to link URI video sync → tee for {source_id}')
         self._link_sequential(
             audio_chain,
             label=f'uri-audio-{source_id}',
@@ -2746,10 +2751,10 @@ class CompositorPipeline:
     @staticmethod
     def _configure_uri_pacing_queue(queue: Gst.Element) -> None:
         """
-        Short non-leaky cushion for URI ingest.
+        Short non-leaky cushion ahead of URI clock-sync.
 
-        Soft backpressure only — do not use clock-blocking identity sync on the
-        shared live pipeline (that starves cameras and hangs layout commands).
+        Soft backpressure only; wall-clock pacing is done by identity sync
+        after live restamp (no mid-chain Python probes on that path).
         """
         queue.set_property('leaky', 0)
         queue.set_property('max-size-buffers', 0)
@@ -2768,13 +2773,29 @@ class CompositorPipeline:
         if element.find_property('qos') is not None:
             element.set_property('qos', False)
 
+    @staticmethod
+    def _make_uri_clock_sync_identity(name: str) -> Gst.Element:
+        """
+        Pace VOD buffers to the pipeline clock before mix/SFU tees.
+
+        Required because leaky tee branches always accept; a non-leaky queue
+        alone cannot hold uridecodebin to realtime. Relies on upstream
+        pad-offset alignment so buffer running times match live clock.
+        """
+        identity = Gst.ElementFactory.make('identity', name)
+        if identity is None:
+            raise RuntimeError(f'Failed to create URI clock-sync identity ({name})')
+        if identity.find_property('sync') is not None:
+            identity.set_property('sync', True)
+        return identity
+
     def _make_uri_timestamp_align_probe(self):
         """
         Align VOD buffers to pipeline running time (one-shot pad offset).
 
-        Applied on convert src pads (not uridecodebin ghost pads) so mix and
-        SFU see a live-mapped timeline while preserving file-relative frame
-        spacing. PTS=NONE cannot be rewritten reliably from a Python pad
+        Applied on convert src pads (not uridecodebin ghost pads) so sync,
+        mix, and SFU see a live-mapped timeline while preserving file-relative
+        frame spacing. PTS=NONE cannot be rewritten reliably from a Python pad
         probe, so those buffers are left alone and logged once.
         """
         state = {'logged_offset': False, 'logged_none': False, 'applied': False}
