@@ -572,12 +572,14 @@ class SessionIngestManager:
         url: str,
         display_name: str = '',
         produce_to_sfu: bool = True,
+        loop: bool | None = True,
     ) -> None:
         self._compositor_pipeline.add_uri_video_source(
             source_id,
             url=url,
             display_name=display_name,
             produce_to_sfu=produce_to_sfu,
+            loop=loop,
         )
         # URI SFU egress joins the compositor peer; keep ConsumerService in sync
         # so later camera attaches do not POST /join again and hit 409.

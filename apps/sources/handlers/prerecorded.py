@@ -25,6 +25,9 @@ class PreRecordedVideoHandler(SourceHandler):
         display_name = str(
             settings.get('title') or kwargs.get('display_name') or source_id
         )
+        # Default loop on; only disable when settings explicitly set false.
+        loop_raw = settings.get('loop')
+        loop = True if loop_raw is None else bool(loop_raw)
         worker_manager = get_session_worker_manager()
         worker_manager.send_command(
             AddUriVideoSourceCommand(
@@ -33,6 +36,7 @@ class PreRecordedVideoHandler(SourceHandler):
                 url=media_url,
                 display_name=display_name,
                 produce_to_sfu=True,
+                loop=loop,
             )
         )
 

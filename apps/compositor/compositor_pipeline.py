@@ -117,7 +117,9 @@ class ParticipantBranch:
     uri_video_appsrc: Gst.Element | None = None
     uri_audio_appsink: Gst.Element | None = None
     uri_audio_appsrc: Gst.Element | None = None
-    # Set when uridecodebin fires drained; mix pads must not block force-live.
+    # When True, seek decode to 0 on uridecodebin drained; otherwise deactivate mix.
+    uri_loop: bool = True
+    # Set when uridecodebin fires drained and loop is off; mix pads must not block force-live.
     uri_drained: bool = False
 
 
@@ -1106,6 +1108,7 @@ class CompositorPipeline:
         url: str,
         display_name: str = '',
         produce_to_sfu: bool = True,
+        loop: bool | None = True,
     ) -> IngestStats:
         _validate_uri_video_url(url)
         with self._lock:
@@ -1120,16 +1123,18 @@ class CompositorPipeline:
                 url=url,
                 display_name=display_name,
             )
+            branch.uri_loop = True if loop is None else bool(loop)
             self._participants[source_id] = branch
             self._host_owned_source_ids.add(source_id)
             self._uri_source_ids.add(source_id)
             self._apply_layout_unlocked()
             logger.info(
-                'URI video source added for session %s (source=%s url=%s produce_to_sfu=%s)',
+                'URI video source added for session %s (source=%s url=%s produce_to_sfu=%s loop=%s)',
                 self.session_id,
                 source_id,
                 url,
                 produce_to_sfu,
+                branch.uri_loop,
             )
 
         if produce_to_sfu:
@@ -1179,9 +1184,9 @@ class CompositorPipeline:
             # Scene-hidden Sources stay silent even if the host unmutes while off-scene.
             self._apply_uri_audio_mix_state_unlocked(source_id)
 
-            if loop is not None and src is not None:
-                # uridecodebin itself has no loop; noted for follow-up player element.
-                logger.debug('URI loop=%s requested for %s (not yet wired)', loop, source_id)
+            if loop is not None:
+                branch.uri_loop = bool(loop)
+                logger.info('URI loop=%s for source=%s', branch.uri_loop, source_id)
 
             if normalized == 'pause' and src is not None:
                 try:
@@ -1199,32 +1204,10 @@ class CompositorPipeline:
                     logger.exception('Failed to play URI source %s', source_id)
                 return
 
-            if normalized == 'seek' and position_ms is not None and src is not None:
-                try:
-                    # Best-effort seek on the decodebin; may no-op depending on demuxer.
-                    rate = 1.0
-                    start = max(0, int(float(position_ms) * Gst.MSECOND))
-                    seeked = src.seek(
-                        rate,
-                        Gst.Format.TIME,
-                        Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
-                        Gst.SeekType.SET,
-                        start,
-                        Gst.SeekType.NONE,
-                        0,
-                    )
-                    if not seeked and self._pipeline is not None:
-                        self._pipeline.seek(
-                            rate,
-                            Gst.Format.TIME,
-                            Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
-                            Gst.SeekType.SET,
-                            start,
-                            Gst.SeekType.NONE,
-                            0,
-                        )
-                except Exception:
-                    logger.exception(
+            if normalized == 'seek' and position_ms is not None:
+                start = max(0, int(float(position_ms) * Gst.MSECOND))
+                if not self._seek_uri_decode(branch, start):
+                    logger.warning(
                         'URI seek not available/failed for %s (position_ms=%s)',
                         source_id,
                         position_ms,
@@ -1317,7 +1300,53 @@ class CompositorPipeline:
         except Exception:
             logger.exception('Failed to stop SFU egress for URI source %s', source_id)
 
-    def _handle_uri_source_drained(self, source_id: str) -> None:
+    @staticmethod
+    def _seek_uri_decode(branch: ParticipantBranch, position_ns: int) -> bool:
+        """Flush-seek the off-graph URI decode pipeline (never the live mix graph)."""
+        targets: list[Gst.Element] = []
+        if branch.uri_decode_pipeline is not None:
+            targets.append(branch.uri_decode_pipeline)
+        if branch.uri_src is not None:
+            targets.append(branch.uri_src)
+
+        for target in targets:
+            try:
+                if target.seek(
+                    1.0,
+                    Gst.Format.TIME,
+                    Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
+                    Gst.SeekType.SET,
+                    int(position_ns),
+                    Gst.SeekType.NONE,
+                    0,
+                ):
+                    return True
+            except Exception:
+                logger.exception('URI decode seek raised on %s', target.get_name())
+        return False
+
+    def _loop_uri_source_from_start(self, source_id: str, branch: ParticipantBranch) -> None:
+        """Seek VOD decode back to 0 after drained so the tile keeps playing."""
+        logger.info('URI source drained source=%s; looping to start', source_id)
+        if self._seek_uri_decode(branch, 0):
+            return
+        # Demuxers sometimes reject seek immediately after drained; retry once.
+        time.sleep(0.05)
+        with self._lock:
+            current = self._participants.get(source_id)
+            if current is None or source_id not in self._uri_source_ids:
+                return
+            if current is not branch:
+                branch = current
+        if self._seek_uri_decode(branch, 0):
+            return
+        logger.warning(
+            'URI loop seek failed source=%s; falling back to deactivate',
+            source_id,
+        )
+        self._deactivate_uri_source_after_drain(source_id)
+
+    def _deactivate_uri_source_after_drain(self, source_id: str) -> None:
         """
         Deactivate URI mix pads after VOD EOF so force-live compositor/audiomixer
         do not stall the program timeline waiting on a silent pad.
@@ -1382,6 +1411,20 @@ class CompositorPipeline:
                     )
 
             self._apply_layout_unlocked()
+
+    def _handle_uri_source_drained(self, source_id: str) -> None:
+        with self._lock:
+            branch = self._participants.get(source_id)
+            if branch is None or source_id not in self._uri_source_ids:
+                return
+            if branch.uri_drained:
+                return
+            should_loop = bool(branch.uri_loop) and not branch.playback_paused
+
+        if should_loop:
+            self._loop_uri_source_from_start(source_id, branch)
+            return
+        self._deactivate_uri_source_after_drain(source_id)
 
     def set_tile_order(
         self,

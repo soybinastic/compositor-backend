@@ -123,6 +123,7 @@ class AddUriVideoSourceCommand(SessionCommand):
     url: str
     display_name: str = ''
     produce_to_sfu: bool = True
+    loop: bool | None = True
 
     @property
     def command_type(self) -> CommandType:
