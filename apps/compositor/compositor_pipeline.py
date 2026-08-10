@@ -117,6 +117,8 @@ class ParticipantBranch:
     uri_video_appsrc: Gst.Element | None = None
     uri_audio_appsink: Gst.Element | None = None
     uri_audio_appsrc: Gst.Element | None = None
+    # Set when uridecodebin fires drained; mix pads must not block force-live.
+    uri_drained: bool = False
 
 
 @dataclass
@@ -1314,6 +1316,72 @@ class CompositorPipeline:
             egress.stop()
         except Exception:
             logger.exception('Failed to stop SFU egress for URI source %s', source_id)
+
+    def _handle_uri_source_drained(self, source_id: str) -> None:
+        """
+        Deactivate URI mix pads after VOD EOF so force-live compositor/audiomixer
+        do not stall the program timeline waiting on a silent pad.
+        """
+        with self._lock:
+            branch = self._participants.get(source_id)
+            if branch is None or source_id not in self._uri_source_ids:
+                return
+            if branch.uri_drained:
+                return
+            branch.uri_drained = True
+            logger.info(
+                'URI source drained source=%s; deactivating mix pads for live program',
+                source_id,
+            )
+
+        # Stop decode feeders before EOS on appsrc (may join threads).
+        self._stop_uri_pace_feeders(branch)
+        self._stop_uri_sfu_egress(source_id)
+
+        with self._lock:
+            branch = self._participants.get(source_id)
+            if branch is None:
+                return
+
+            for appsrc, kind in (
+                (branch.uri_video_appsrc, 'video'),
+                (branch.uri_audio_appsrc, 'audio'),
+            ):
+                if appsrc is None:
+                    continue
+                try:
+                    appsrc.emit('end-of-stream')
+                except Exception:
+                    logger.exception(
+                        'Failed to EOS URI %s appsrc after drain source=%s',
+                        kind,
+                        source_id,
+                    )
+
+            self._hide_pad(branch.compositor_sink_pad)
+
+            if branch.mixer_sink_pad is not None:
+                try:
+                    if branch.mixer_sink_pad.find_property('mute') is not None:
+                        branch.mixer_sink_pad.set_property('mute', True)
+                    elif branch.mixer_sink_pad.find_property('volume') is not None:
+                        branch.mixer_sink_pad.set_property('volume', 0.0)
+                except Exception:
+                    logger.exception(
+                        'Failed to mute URI mixer pad after drain source=%s',
+                        source_id,
+                    )
+
+            if branch.audio_volume is not None:
+                try:
+                    branch.audio_volume.set_property('mute', True)
+                except Exception:
+                    logger.exception(
+                        'Failed to mute URI volume after drain source=%s',
+                        source_id,
+                    )
+
+            self._apply_layout_unlocked()
 
     def set_tile_order(
         self,
@@ -2582,6 +2650,19 @@ class CompositorPipeline:
         handler_id = src.connect('pad-added', on_pad_added, None)
         branch.signal_handlers.append((src, handler_id))
 
+        def on_drained(_element: Gst.Element, _user_data) -> None:
+            # uridecodebin emits drained on a streaming thread; defer work so we
+            # do not join feeder threads or take the pipeline lock inline.
+            threading.Thread(
+                target=self._handle_uri_source_drained,
+                args=(source_id,),
+                name=f'uri-drain-{source_id}',
+                daemon=True,
+            ).start()
+
+        drained_handler_id = src.connect('drained', on_drained, None)
+        branch.signal_handlers.append((src, drained_handler_id))
+
         for element in live_elements:
             element.sync_state_with_parent()
 
@@ -2727,8 +2808,9 @@ class CompositorPipeline:
 
         for participant_id, branch in self._participants.items():
             tile = tile_map.get(participant_id)
-            if tile is None:
-                # Hide sources not included in this layout (e.g. FULLSCREEN guests).
+            if tile is None or branch.uri_drained:
+                # Hide sources not in this layout, and URI pads after EOF so
+                # force-live compositor does not wait on a silent pad.
                 self._hide_pad(branch.compositor_sink_pad)
                 continue
             self._apply_tile_to_pad(branch, tile)
