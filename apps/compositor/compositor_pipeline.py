@@ -109,13 +109,18 @@ class ParticipantBranch:
     # Tees for compositor→SFU egress of this URI source (same sourceId).
     uri_video_tee: Gst.Element | None = None
     uri_audio_tee: Gst.Element | None = None
-    # Off-graph URI pacing (appsink → feeder thread → appsrc).
+    # Off-graph URI pacing (decode pipeline → feeder → live appsrc).
+    uri_decode_pipeline: Gst.Pipeline | None = None
     uri_pace_stop: threading.Event | None = None
     uri_pace_threads: list[threading.Thread] = field(default_factory=list)
     uri_video_appsink: Gst.Element | None = None
     uri_video_appsrc: Gst.Element | None = None
     uri_audio_appsink: Gst.Element | None = None
     uri_audio_appsrc: Gst.Element | None = None
+    # When True, seek decode to 0 on uridecodebin drained; otherwise deactivate mix.
+    uri_loop: bool = True
+    # Set when uridecodebin fires drained and loop is off; mix pads must not block force-live.
+    uri_drained: bool = False
 
 
 @dataclass
@@ -1103,6 +1108,7 @@ class CompositorPipeline:
         url: str,
         display_name: str = '',
         produce_to_sfu: bool = True,
+        loop: bool | None = True,
     ) -> IngestStats:
         _validate_uri_video_url(url)
         with self._lock:
@@ -1117,16 +1123,18 @@ class CompositorPipeline:
                 url=url,
                 display_name=display_name,
             )
+            branch.uri_loop = True if loop is None else bool(loop)
             self._participants[source_id] = branch
             self._host_owned_source_ids.add(source_id)
             self._uri_source_ids.add(source_id)
             self._apply_layout_unlocked()
             logger.info(
-                'URI video source added for session %s (source=%s url=%s produce_to_sfu=%s)',
+                'URI video source added for session %s (source=%s url=%s produce_to_sfu=%s loop=%s)',
                 self.session_id,
                 source_id,
                 url,
                 produce_to_sfu,
+                branch.uri_loop,
             )
 
         if produce_to_sfu:
@@ -1176,9 +1184,9 @@ class CompositorPipeline:
             # Scene-hidden Sources stay silent even if the host unmutes while off-scene.
             self._apply_uri_audio_mix_state_unlocked(source_id)
 
-            if loop is not None and src is not None:
-                # uridecodebin itself has no loop; noted for follow-up player element.
-                logger.debug('URI loop=%s requested for %s (not yet wired)', loop, source_id)
+            if loop is not None:
+                branch.uri_loop = bool(loop)
+                logger.info('URI loop=%s for source=%s', branch.uri_loop, source_id)
 
             if normalized == 'pause' and src is not None:
                 try:
@@ -1196,32 +1204,10 @@ class CompositorPipeline:
                     logger.exception('Failed to play URI source %s', source_id)
                 return
 
-            if normalized == 'seek' and position_ms is not None and src is not None:
-                try:
-                    # Best-effort seek on the decodebin; may no-op depending on demuxer.
-                    rate = 1.0
-                    start = max(0, int(float(position_ms) * Gst.MSECOND))
-                    seeked = src.seek(
-                        rate,
-                        Gst.Format.TIME,
-                        Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
-                        Gst.SeekType.SET,
-                        start,
-                        Gst.SeekType.NONE,
-                        0,
-                    )
-                    if not seeked and self._pipeline is not None:
-                        self._pipeline.seek(
-                            rate,
-                            Gst.Format.TIME,
-                            Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
-                            Gst.SeekType.SET,
-                            start,
-                            Gst.SeekType.NONE,
-                            0,
-                        )
-                except Exception:
-                    logger.exception(
+            if normalized == 'seek' and position_ms is not None:
+                start = max(0, int(float(position_ms) * Gst.MSECOND))
+                if not self._seek_uri_decode(branch, start):
+                    logger.warning(
                         'URI seek not available/failed for %s (position_ms=%s)',
                         source_id,
                         position_ms,
@@ -1313,6 +1299,132 @@ class CompositorPipeline:
             egress.stop()
         except Exception:
             logger.exception('Failed to stop SFU egress for URI source %s', source_id)
+
+    @staticmethod
+    def _seek_uri_decode(branch: ParticipantBranch, position_ns: int) -> bool:
+        """Flush-seek the off-graph URI decode pipeline (never the live mix graph)."""
+        targets: list[Gst.Element] = []
+        if branch.uri_decode_pipeline is not None:
+            targets.append(branch.uri_decode_pipeline)
+        if branch.uri_src is not None:
+            targets.append(branch.uri_src)
+
+        for target in targets:
+            try:
+                if target.seek(
+                    1.0,
+                    Gst.Format.TIME,
+                    Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
+                    Gst.SeekType.SET,
+                    int(position_ns),
+                    Gst.SeekType.NONE,
+                    0,
+                ):
+                    return True
+            except Exception:
+                logger.exception('URI decode seek raised on %s', target.get_name())
+        return False
+
+    def _loop_uri_source_from_start(self, source_id: str, branch: ParticipantBranch) -> None:
+        """Seek VOD decode back to 0 after drained so the tile keeps playing."""
+        logger.info('URI source drained source=%s; looping to start', source_id)
+        if self._seek_uri_decode(branch, 0):
+            return
+        # Demuxers sometimes reject seek immediately after drained; retry once.
+        time.sleep(0.05)
+        with self._lock:
+            current = self._participants.get(source_id)
+            if current is None or source_id not in self._uri_source_ids:
+                return
+            if current is not branch:
+                branch = current
+        if self._seek_uri_decode(branch, 0):
+            return
+        logger.warning(
+            'URI loop seek failed source=%s; falling back to deactivate',
+            source_id,
+        )
+        self._deactivate_uri_source_after_drain(source_id)
+
+    def _deactivate_uri_source_after_drain(self, source_id: str) -> None:
+        """
+        Deactivate URI mix pads after VOD EOF so force-live compositor/audiomixer
+        do not stall the program timeline waiting on a silent pad.
+        """
+        with self._lock:
+            branch = self._participants.get(source_id)
+            if branch is None or source_id not in self._uri_source_ids:
+                return
+            if branch.uri_drained:
+                return
+            branch.uri_drained = True
+            logger.info(
+                'URI source drained source=%s; deactivating mix pads for live program',
+                source_id,
+            )
+
+        # Stop decode feeders before EOS on appsrc (may join threads).
+        self._stop_uri_pace_feeders(branch)
+        self._stop_uri_sfu_egress(source_id)
+
+        with self._lock:
+            branch = self._participants.get(source_id)
+            if branch is None:
+                return
+
+            for appsrc, kind in (
+                (branch.uri_video_appsrc, 'video'),
+                (branch.uri_audio_appsrc, 'audio'),
+            ):
+                if appsrc is None:
+                    continue
+                try:
+                    appsrc.emit('end-of-stream')
+                except Exception:
+                    logger.exception(
+                        'Failed to EOS URI %s appsrc after drain source=%s',
+                        kind,
+                        source_id,
+                    )
+
+            self._hide_pad(branch.compositor_sink_pad)
+
+            if branch.mixer_sink_pad is not None:
+                try:
+                    if branch.mixer_sink_pad.find_property('mute') is not None:
+                        branch.mixer_sink_pad.set_property('mute', True)
+                    elif branch.mixer_sink_pad.find_property('volume') is not None:
+                        branch.mixer_sink_pad.set_property('volume', 0.0)
+                except Exception:
+                    logger.exception(
+                        'Failed to mute URI mixer pad after drain source=%s',
+                        source_id,
+                    )
+
+            if branch.audio_volume is not None:
+                try:
+                    branch.audio_volume.set_property('mute', True)
+                except Exception:
+                    logger.exception(
+                        'Failed to mute URI volume after drain source=%s',
+                        source_id,
+                    )
+
+            self._apply_layout_unlocked()
+
+    def _handle_uri_source_drained(self, source_id: str) -> None:
+        with self._lock:
+            branch = self._participants.get(source_id)
+            if branch is None or source_id not in self._uri_source_ids:
+                return
+            if branch.uri_drained:
+                return
+            should_loop = bool(branch.uri_loop) and not branch.playback_paused
+
+        if should_loop:
+            self._loop_uri_source_from_start(source_id, branch)
+            return
+        self._deactivate_uri_source_after_drain(source_id)
 
     def set_tile_order(
         self,
@@ -2298,25 +2410,42 @@ class CompositorPipeline:
             raise RuntimeError('Video mix backend is not initialized')
 
         _ = display_name
+        decode_pipeline = Gst.Pipeline.new(f'uri-decode-{source_id}')
+        if decode_pipeline is None:
+            raise RuntimeError(f'Failed to create URI decode pipeline for {source_id}')
+
         src = Gst.ElementFactory.make('uridecodebin', f'uri_src_{source_id}')
         video_convert = Gst.ElementFactory.make('videoconvert', f'uri_v_convert_{source_id}')
-        # Force a stable system-memory format so scale/upload/tee/SFU negotiate
-        # without stalling on decoder-native layouts.
+        # Downscale in the decode pipeline so live mix + SFU x264 do not chew
+        # full 1080p when cameras are also attached.
+        video_scale_dec = Gst.ElementFactory.make('videoscale', f'uri_v_dec_scale_{source_id}')
         video_caps = Gst.ElementFactory.make('capsfilter', f'uri_v_caps_{source_id}')
         video_dec_queue = Gst.ElementFactory.make('queue', f'uri_v_dec_queue_{source_id}')
         video_appsink = Gst.ElementFactory.make('appsink', f'uri_v_appsink_{source_id}')
         video_appsrc = Gst.ElementFactory.make('appsrc', f'uri_v_appsrc_{source_id}')
         ingest_tail = self._video_mix_backend.build_ingest_tail(source_id)
-        # Pace off the live graph: decode → appsink; feeder thread sleeps to PTS;
-        # appsrc → tee/mix. Avoids identity sync on shared force-live threads.
+        # Decode runs in a separate pipeline so VOD backpressure/CPU cannot
+        # stall camera RTP on the force-live mix graph. Feeders pace into appsrc.
         video_tee = Gst.ElementFactory.make('tee', f'uri_v_tee_{source_id}')
         audio_convert = Gst.ElementFactory.make('audioconvert', f'uri_a_convert_{source_id}')
         audio_resample = Gst.ElementFactory.make('audioresample', f'uri_a_resample_{source_id}')
+        # Force mixer-ready rate/channels on decode so the feeder does not push
+        # file-native caps (e.g. F32LE@44100) into the live mix graph.
+        audio_dec_caps = Gst.ElementFactory.make('capsfilter', f'uri_a_dec_caps_{source_id}')
         audio_highpass = _make_voice_highpass_element(f'uri_a_highpass_{source_id}')
         audio_volume = _make_ingest_volume_element(f'uri_a_volume_{source_id}')
         audio_dec_queue = Gst.ElementFactory.make('queue', f'uri_a_dec_queue_{source_id}')
         audio_appsink = Gst.ElementFactory.make('appsink', f'uri_a_appsink_{source_id}')
         audio_appsrc = Gst.ElementFactory.make('appsrc', f'uri_a_appsrc_{source_id}')
+        # Live convert again: appsrc caps alone cannot renegotiate against an
+        # already-locked audiomixer pad / SFU tee branch.
+        live_audio_convert = Gst.ElementFactory.make(
+            'audioconvert', f'uri_a_live_convert_{source_id}'
+        )
+        live_audio_resample = Gst.ElementFactory.make(
+            'audioresample', f'uri_a_live_resample_{source_id}'
+        )
+        live_audio_caps = Gst.ElementFactory.make('capsfilter', f'uri_a_live_caps_{source_id}')
         audio_tee = Gst.ElementFactory.make('tee', f'uri_a_tee_{source_id}')
         audio_queue = Gst.ElementFactory.make('queue', f'uri_a_queue_{source_id}')
 
@@ -2324,6 +2453,7 @@ class CompositorPipeline:
             [
                 src,
                 video_convert,
+                video_scale_dec,
                 video_caps,
                 video_dec_queue,
                 video_appsink,
@@ -2332,35 +2462,52 @@ class CompositorPipeline:
                 video_tee,
                 audio_convert,
                 audio_resample,
+                audio_dec_caps,
                 audio_highpass,
                 audio_volume,
                 audio_dec_queue,
                 audio_appsink,
                 audio_appsrc,
+                live_audio_convert,
+                live_audio_resample,
+                live_audio_caps,
                 audio_tee,
                 audio_queue,
             ]
         ):
             raise RuntimeError(f'Failed to create URI ingest elements for {source_id}')
 
+        mixer_audio_caps = Gst.Caps.from_string('audio/x-raw,rate=48000,channels=2')
+        uri_video_w = min(int(self.width), 1280)
+        uri_video_h = min(int(self.height), 720)
         src.set_property('uri', url)
-        video_caps.set_property('caps', Gst.Caps.from_string('video/x-raw,format=I420'))
+        video_scale_dec.set_property('add-borders', True)
+        video_caps.set_property(
+            'caps',
+            Gst.Caps.from_string(
+                f'video/x-raw,format=I420,width={uri_video_w},height={uri_video_h}'
+            ),
+        )
+        audio_dec_caps.set_property('caps', mixer_audio_caps)
+        live_audio_caps.set_property('caps', mixer_audio_caps)
         video_tee.set_property('allow-not-linked', True)
         audio_tee.set_property('allow-not-linked', True)
-        # VOD PTS starts near 0 while the live pipeline is already at tens of
-        # seconds. Default BaseTransform QoS then drops every buffer as "late"
-        # (decode still counts; mix/SFU never see frames). Disable on URI only.
         self._disable_uri_transform_qos(video_convert)
+        self._disable_uri_transform_qos(video_scale_dec)
         self._disable_uri_transform_qos(audio_convert)
-        # Non-leaky decode queues: when the feeder sleeps, decode blocks here
-        # (URI threads only) instead of dumping/dropping the file.
+        self._disable_uri_transform_qos(live_audio_convert)
         self._configure_uri_pacing_queue(video_dec_queue)
         self._configure_uri_pacing_queue(audio_dec_queue)
-        self._configure_uri_appsink(video_appsink)
+        # Video: do not drop — appsink drop raced decode ahead of the feeder and
+        # produced multi-second PTS jumps (blank preview / frozen program).
+        self._configure_uri_appsink(video_appsink, drop=False, max_buffers=1)
         self._configure_uri_appsink(audio_appsink)
         self._configure_uri_appsrc(video_appsrc)
         self._configure_uri_appsrc(audio_appsrc)
-        self._configure_uri_pacing_queue(audio_queue)
+        # Live audio after appsrc: leaky so mixer stalls do not block the feeder.
+        audio_queue.set_property('leaky', 2)
+        audio_queue.set_property('max-size-time', 2 * Gst.SECOND)
+
         video_scale = next(
             (
                 element
@@ -2378,45 +2525,63 @@ class CompositorPipeline:
             ingest_queue.get_factory() is not None
             and ingest_queue.get_factory().get_name() == 'queue'
         ):
-            # Live side after appsrc: leaky so a stalled SFU/mix cannot block the feeder.
+            # Short leaky cushion: prefer dropping late VOD frames over stalling.
             ingest_queue.set_property('leaky', 2)
-            ingest_queue.set_property('max-size-time', 2 * Gst.SECOND)
+            ingest_queue.set_property('max-size-time', 500 * Gst.MSECOND)
+            ingest_queue.set_property('max-size-buffers', 0)
+            ingest_queue.set_property('max-size-bytes', 0)
 
-        # Isolates force-live compositor from SFU encode backpressure on the tee.
         mix_queue = Gst.ElementFactory.make('queue', f'uri_v_mix_queue_{source_id}')
         if mix_queue is None:
             raise RuntimeError(f'Failed to create URI mix queue for {source_id}')
         mix_queue.set_property('leaky', 2)
-        mix_queue.set_property('max-size-time', 2 * Gst.SECOND)
+        mix_queue.set_property('max-size-time', 500 * Gst.MSECOND)
+        mix_queue.set_property('max-size-buffers', 0)
+        mix_queue.set_property('max-size-bytes', 0)
 
-        decode_video_chain = [video_convert, video_caps, video_dec_queue, video_appsink]
-        live_video_chain = [video_appsrc, *ingest_tail]
+        decode_video_chain = [
+            video_convert,
+            video_scale_dec,
+            video_caps,
+            video_dec_queue,
+            video_appsink,
+        ]
         decode_audio_chain = [
             audio_convert,
             audio_resample,
+            audio_dec_caps,
             audio_highpass,
             audio_volume,
             audio_dec_queue,
             audio_appsink,
         ]
-        live_audio_chain = [audio_appsrc, audio_tee, audio_queue]
-        elements = [
-            src,
-            *decode_video_chain,
+        live_video_chain = [video_appsrc, *ingest_tail]
+        live_audio_chain = [
+            audio_appsrc,
+            live_audio_convert,
+            live_audio_resample,
+            live_audio_caps,
+            audio_tee,
+            audio_queue,
+        ]
+        decode_elements = [src, *decode_video_chain, *decode_audio_chain]
+        live_elements = [
             *live_video_chain,
             video_tee,
             mix_queue,
-            *decode_audio_chain,
             *live_audio_chain,
         ]
-        for element in elements:
+
+        for element in decode_elements:
+            decode_pipeline.add(element)
+        for element in live_elements:
             self._pipeline.add(element)
 
         self._link_sequential(decode_video_chain, label=f'uri-decode-video-{source_id}')
+        self._link_sequential(decode_audio_chain, label=f'uri-decode-audio-{source_id}')
         self._link_sequential(live_video_chain, label=f'uri-live-video-{source_id}')
         if not ingest_tail[-1].link(video_tee):
             raise RuntimeError(f'Failed to link URI live video → tee for {source_id}')
-        self._link_sequential(decode_audio_chain, label=f'uri-decode-audio-{source_id}')
         self._link_sequential(live_audio_chain, label=f'uri-live-audio-{source_id}')
 
         compositor_sink_pad = self._compositor.get_request_pad('sink_%u')
@@ -2433,12 +2598,19 @@ class CompositorPipeline:
         if mix_src.link(compositor_sink_pad) != Gst.PadLinkReturn.OK:
             raise RuntimeError(f'Failed to link URI mix queue → compositor for {source_id}')
 
+        mixer_pad = self._audiomixer.get_request_pad('sink_%u')
+        if mixer_pad is None:
+            raise RuntimeError(f'Failed to request audiomixer sink pad for {source_id}')
+        audio_src_pad = audio_queue.get_static_pad('src')
+        if audio_src_pad is None or audio_src_pad.link(mixer_pad) != Gst.PadLinkReturn.OK:
+            raise RuntimeError(f'Failed to link URI live audio → audiomixer for {source_id}')
+
         pace_stop = threading.Event()
         branch = ParticipantBranch(
             participant_peer_id=source_id,
             compositor_sink_pad=compositor_sink_pad,
-            mixer_sink_pad=None,
-            elements=elements,
+            mixer_sink_pad=mixer_pad,
+            elements=live_elements,
             stats=IngestStats(),
             source_url=url,
             video_scale=video_scale,
@@ -2447,15 +2619,35 @@ class CompositorPipeline:
             audio_volume=audio_volume,
             uri_video_tee=video_tee,
             uri_audio_tee=audio_tee,
+            uri_decode_pipeline=decode_pipeline,
             uri_pace_stop=pace_stop,
             uri_video_appsink=video_appsink,
             uri_video_appsrc=video_appsrc,
             uri_audio_appsink=audio_appsink,
             uri_audio_appsrc=audio_appsrc,
         )
+        # Re-align URI mix PTS to pipeline running time at the compositor edge.
+        # Feeder timestamps alone drift through scale/tee/mix_queue under load;
+        # force-live compositor then starves this pad while the SFU tee (preview)
+        # still looks fine. continuous=True matches live camera pads.
+        mix_src.add_probe(
+            Gst.PadProbeType.BUFFER,
+            self._make_running_time_offset_probe(continuous=True),
+            None,
+        )
         mix_src.add_probe(
             Gst.PadProbeType.BUFFER,
             self._make_video_probe(branch),
+            None,
+        )
+        audio_src_pad.add_probe(
+            Gst.PadProbeType.BUFFER,
+            self._make_running_time_offset_probe(continuous=False),
+            None,
+        )
+        audio_src_pad.add_probe(
+            Gst.PadProbeType.BUFFER,
+            self._make_audio_probe(branch),
             None,
         )
         link_state = {'audio': False, 'video': False}
@@ -2485,27 +2677,12 @@ class CompositorPipeline:
                     media_name,
                 )
             elif media_name.startswith('audio/') and not link_state['audio']:
-                mixer_pad = self._audiomixer.get_request_pad('sink_%u')
-                if mixer_pad is None:
-                    raise RuntimeError(f'Failed to request audiomixer sink pad for {source_id}')
-
                 sink_pad = audio_convert.get_static_pad('sink')
                 if sink_pad is None or sink_pad.is_linked():
                     return
                 if pad.link(sink_pad) != Gst.PadLinkReturn.OK:
                     raise RuntimeError(f'Failed to link URI audio pad for {source_id}')
-
-                audio_src_pad = audio_queue.get_static_pad('src')
-                if audio_src_pad is None or audio_src_pad.link(mixer_pad) != Gst.PadLinkReturn.OK:
-                    raise RuntimeError(f'Failed to link URI audio branch to audiomixer for {source_id}')
-
-                branch.mixer_sink_pad = mixer_pad
                 link_state['audio'] = True
-                audio_src_pad.add_probe(
-                    Gst.PadProbeType.BUFFER,
-                    self._make_audio_probe(branch),
-                    None,
-                )
                 self._apply_uri_audio_mix_state_unlocked(source_id)
                 logger.info(
                     'URI audio pad linked source=%s caps=%s',
@@ -2516,8 +2693,24 @@ class CompositorPipeline:
         handler_id = src.connect('pad-added', on_pad_added, None)
         branch.signal_handlers.append((src, handler_id))
 
-        for element in elements:
+        def on_drained(_element: Gst.Element, _user_data) -> None:
+            # uridecodebin emits drained on a streaming thread; defer work so we
+            # do not join feeder threads or take the pipeline lock inline.
+            threading.Thread(
+                target=self._handle_uri_source_drained,
+                args=(source_id,),
+                name=f'uri-drain-{source_id}',
+                daemon=True,
+            ).start()
+
+        drained_handler_id = src.connect('drained', on_drained, None)
+        branch.signal_handlers.append((src, drained_handler_id))
+
+        for element in live_elements:
             element.sync_state_with_parent()
+
+        if decode_pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+            raise RuntimeError(f'Failed to start URI decode pipeline for {source_id}')
 
         self._start_uri_pace_feeder(
             branch,
@@ -2658,8 +2851,9 @@ class CompositorPipeline:
 
         for participant_id, branch in self._participants.items():
             tile = tile_map.get(participant_id)
-            if tile is None:
-                # Hide sources not included in this layout (e.g. FULLSCREEN guests).
+            if tile is None or branch.uri_drained:
+                # Hide sources not in this layout, and URI pads after EOF so
+                # force-live compositor does not wait on a silent pad.
                 self._hide_pad(branch.compositor_sink_pad)
                 continue
             self._apply_tile_to_pad(branch, tile)
@@ -2780,16 +2974,21 @@ class CompositorPipeline:
         queue.set_property('max-size-time', 2 * Gst.SECOND)
 
     @staticmethod
-    def _configure_uri_appsink(appsink: Gst.Element) -> None:
+    def _configure_uri_appsink(
+        appsink: Gst.Element,
+        *,
+        drop: bool = False,
+        max_buffers: int = 1,
+    ) -> None:
         appsink.set_property('emit-signals', False)
         appsink.set_property('sync', False)
         appsink.set_property('async', False)
-        # Do not drop: non-leaky decode queue provides backpressure while the
-        # feeder thread sleeps to PTS (URI decode threads only).
+        # Video may drop when the feeder is behind; audio keeps a single
+        # non-drop buffer so pacing stays continuous.
         if appsink.find_property('max-buffers') is not None:
-            appsink.set_property('max-buffers', 1)
+            appsink.set_property('max-buffers', max(1, int(max_buffers)))
         if appsink.find_property('drop') is not None:
-            appsink.set_property('drop', False)
+            appsink.set_property('drop', bool(drop))
         if appsink.find_property('enable-last-sample') is not None:
             appsink.set_property('enable-last-sample', False)
 
@@ -2861,11 +3060,17 @@ class CompositorPipeline:
 
         source_id = branch.participant_peer_id
         pull_timeout = Gst.SECOND // 5
+        # Force-live compositor drops buffers whose PTS is far in the past.
+        # Video: always push (restamp when late). Also clamp far-future PTS so a
+        # decode jump cannot park the feeder in _wait_for_uri_pts for minutes.
+        late_restamp_ns = int(100 * Gst.MSECOND)
+        early_clamp_ns = int(200 * Gst.MSECOND)
 
         def _run() -> None:
             offset: int | None = None
             caps_set = False
             logged_start = False
+            catchup_events = 0
             while not stop.is_set():
                 if branch.playback_paused:
                     if stop.wait(0.05):
@@ -2901,12 +3106,15 @@ class CompositorPipeline:
                     continue
 
                 running = self._pipeline_running_time_ns()
-                if running is None:
-                    continue
+                while running is None and not stop.is_set():
+                    if stop.wait(0.02):
+                        break
+                    running = self._pipeline_running_time_ns()
+                if running is None or stop.is_set():
+                    break
 
                 file_pts = buf.pts
                 if file_pts == Gst.CLOCK_TIME_NONE:
-                    # No timeline — push immediately with live PTS.
                     mapped = int(running)
                 else:
                     if offset is None:
@@ -2920,19 +3128,32 @@ class CompositorPipeline:
                                 offset,
                             )
                     mapped = int(file_pts) + int(offset)
-                    if not self._wait_for_uri_pts(mapped, stop):
-                        break
-                    # Re-read clock after wait; skip if we fell far behind.
-                    running_after = self._pipeline_running_time_ns()
-                    if running_after is not None and mapped < running_after - Gst.SECOND:
-                        # More than 1s late — drop to catch up.
-                        continue
+                    lag_ns = int(running) - int(mapped)
+                    if kind == 'video' and (
+                        lag_ns > late_restamp_ns or lag_ns < -early_clamp_ns
+                    ):
+                        # Late → compositor would drop; far early → feeder would
+                        # sleep forever. Restamp onto running time and push.
+                        offset = int(running) - int(file_pts)
+                        mapped = int(running)
+                        catchup_events += 1
+                        if catchup_events == 1 or catchup_events % 50 == 0:
+                            logger.info(
+                                'URI video catch-up restamp source=%s lag_ms=%.1f events=%s',
+                                source_id,
+                                lag_ns / 1_000_000.0,
+                                catchup_events,
+                            )
+                    elif lag_ns < 0:
+                        if not self._wait_for_uri_pts(mapped, stop):
+                            break
 
                 try:
+                    # Prefer a shallow copy; PTS rewrite needs a writable buffer.
                     out = buf.copy()
                     out.pts = int(mapped)
                     if out.dts != Gst.CLOCK_TIME_NONE:
-                        out.dts = int(mapped)
+                        out.dts = Gst.CLOCK_TIME_NONE
                     retval = appsrc.emit('push-buffer', out)
                 except Exception:
                     if not stop.is_set():
@@ -2967,6 +3188,16 @@ class CompositorPipeline:
         for thread in list(branch.uri_pace_threads):
             thread.join(timeout=1.0)
         branch.uri_pace_threads.clear()
+        decode_pipeline = branch.uri_decode_pipeline
+        if decode_pipeline is not None:
+            try:
+                decode_pipeline.set_state(Gst.State.NULL)
+            except Exception:
+                logger.exception(
+                    'Failed to stop URI decode pipeline for %s',
+                    branch.participant_peer_id,
+                )
+            branch.uri_decode_pipeline = None
 
     def _make_running_time_offset_probe(self, *, continuous: bool = True):
         """
@@ -2980,8 +3211,10 @@ class CompositorPipeline:
         timestamps are already near running time after the first alignment.
         Continuous re-offset on a leaky still pad can jitter the mixer.
 
-        For paced URI/VOD branches, also use continuous=False so the file
-        timeline maps onto live time once and keeps relative frame spacing.
+        URI video mix pads use continuous=True (same as live cameras): one-shot
+        alignment drifts again through queues and force-live compositor drops
+        the pad (program freeze) while the SFU tee preview can still look fine.
+        URI audio uses continuous=False like other mixer audio pads.
         """
         state = {'logged': False, 'applied': False}
 

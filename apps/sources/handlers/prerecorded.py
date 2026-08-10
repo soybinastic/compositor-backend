@@ -25,6 +25,9 @@ class PreRecordedVideoHandler(SourceHandler):
         display_name = str(
             settings.get('title') or kwargs.get('display_name') or source_id
         )
+        # Always loop on start. Legacy catalog persisted loop=false when unset,
+        # which deactivated pads on EOF and stalled force-live program. Opt-out
+        # remains available via UpdateUriVideoPlayback(loop=False).
         worker_manager = get_session_worker_manager()
         worker_manager.send_command(
             AddUriVideoSourceCommand(
@@ -33,6 +36,7 @@ class PreRecordedVideoHandler(SourceHandler):
                 url=media_url,
                 display_name=display_name,
                 produce_to_sfu=True,
+                loop=True,
             )
         )
 
