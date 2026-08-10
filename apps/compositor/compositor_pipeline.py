@@ -2315,11 +2315,23 @@ class CompositorPipeline:
         video_tee = Gst.ElementFactory.make('tee', f'uri_v_tee_{source_id}')
         audio_convert = Gst.ElementFactory.make('audioconvert', f'uri_a_convert_{source_id}')
         audio_resample = Gst.ElementFactory.make('audioresample', f'uri_a_resample_{source_id}')
+        # Force mixer-ready rate/channels on decode so the feeder does not push
+        # file-native caps (e.g. F32LE@44100) into the live mix graph.
+        audio_dec_caps = Gst.ElementFactory.make('capsfilter', f'uri_a_dec_caps_{source_id}')
         audio_highpass = _make_voice_highpass_element(f'uri_a_highpass_{source_id}')
         audio_volume = _make_ingest_volume_element(f'uri_a_volume_{source_id}')
         audio_dec_queue = Gst.ElementFactory.make('queue', f'uri_a_dec_queue_{source_id}')
         audio_appsink = Gst.ElementFactory.make('appsink', f'uri_a_appsink_{source_id}')
         audio_appsrc = Gst.ElementFactory.make('appsrc', f'uri_a_appsrc_{source_id}')
+        # Live convert again: appsrc caps alone cannot renegotiate against an
+        # already-locked audiomixer pad / SFU tee branch.
+        live_audio_convert = Gst.ElementFactory.make(
+            'audioconvert', f'uri_a_live_convert_{source_id}'
+        )
+        live_audio_resample = Gst.ElementFactory.make(
+            'audioresample', f'uri_a_live_resample_{source_id}'
+        )
+        live_audio_caps = Gst.ElementFactory.make('capsfilter', f'uri_a_live_caps_{source_id}')
         audio_tee = Gst.ElementFactory.make('tee', f'uri_a_tee_{source_id}')
         audio_queue = Gst.ElementFactory.make('queue', f'uri_a_queue_{source_id}')
 
@@ -2335,23 +2347,31 @@ class CompositorPipeline:
                 video_tee,
                 audio_convert,
                 audio_resample,
+                audio_dec_caps,
                 audio_highpass,
                 audio_volume,
                 audio_dec_queue,
                 audio_appsink,
                 audio_appsrc,
+                live_audio_convert,
+                live_audio_resample,
+                live_audio_caps,
                 audio_tee,
                 audio_queue,
             ]
         ):
             raise RuntimeError(f'Failed to create URI ingest elements for {source_id}')
 
+        mixer_audio_caps = Gst.Caps.from_string('audio/x-raw,rate=48000,channels=2')
         src.set_property('uri', url)
         video_caps.set_property('caps', Gst.Caps.from_string('video/x-raw,format=I420'))
+        audio_dec_caps.set_property('caps', mixer_audio_caps)
+        live_audio_caps.set_property('caps', mixer_audio_caps)
         video_tee.set_property('allow-not-linked', True)
         audio_tee.set_property('allow-not-linked', True)
         self._disable_uri_transform_qos(video_convert)
         self._disable_uri_transform_qos(audio_convert)
+        self._disable_uri_transform_qos(live_audio_convert)
         self._configure_uri_pacing_queue(video_dec_queue)
         self._configure_uri_pacing_queue(audio_dec_queue)
         self._configure_uri_appsink(video_appsink)
@@ -2392,13 +2412,21 @@ class CompositorPipeline:
         decode_audio_chain = [
             audio_convert,
             audio_resample,
+            audio_dec_caps,
             audio_highpass,
             audio_volume,
             audio_dec_queue,
             audio_appsink,
         ]
         live_video_chain = [video_appsrc, *ingest_tail]
-        live_audio_chain = [audio_appsrc, audio_tee, audio_queue]
+        live_audio_chain = [
+            audio_appsrc,
+            live_audio_convert,
+            live_audio_resample,
+            live_audio_caps,
+            audio_tee,
+            audio_queue,
+        ]
         decode_elements = [src, *decode_video_chain, *decode_audio_chain]
         live_elements = [
             *live_video_chain,
