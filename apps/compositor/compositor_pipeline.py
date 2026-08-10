@@ -109,6 +109,13 @@ class ParticipantBranch:
     # Tees for compositor→SFU egress of this URI source (same sourceId).
     uri_video_tee: Gst.Element | None = None
     uri_audio_tee: Gst.Element | None = None
+    # Off-graph URI pacing (appsink → feeder thread → appsrc).
+    uri_pace_stop: threading.Event | None = None
+    uri_pace_threads: list[threading.Thread] = field(default_factory=list)
+    uri_video_appsink: Gst.Element | None = None
+    uri_video_appsrc: Gst.Element | None = None
+    uri_audio_appsink: Gst.Element | None = None
+    uri_audio_appsrc: Gst.Element | None = None
 
 
 @dataclass
@@ -2103,6 +2110,8 @@ class CompositorPipeline:
         if branch is None or self._pipeline is None:
             return
 
+        self._stop_uri_pace_feeders(branch)
+
         compositor_peer = branch.compositor_sink_pad.get_peer()
         if compositor_peer is not None:
             compositor_peer.unlink(branch.compositor_sink_pad)
@@ -2294,17 +2303,20 @@ class CompositorPipeline:
         # Force a stable system-memory format so scale/upload/tee/SFU negotiate
         # without stalling on decoder-native layouts.
         video_caps = Gst.ElementFactory.make('capsfilter', f'uri_v_caps_{source_id}')
+        video_dec_queue = Gst.ElementFactory.make('queue', f'uri_v_dec_queue_{source_id}')
+        video_appsink = Gst.ElementFactory.make('appsink', f'uri_v_appsink_{source_id}')
+        video_appsrc = Gst.ElementFactory.make('appsrc', f'uri_v_appsrc_{source_id}')
         ingest_tail = self._video_mix_backend.build_ingest_tail(source_id)
-        # Wall-clock pace AFTER live restamp and BEFORE the tee. Leaky mix/SFU
-        # branches always accept, so without this uridecodebin dumps the file.
-        # Keep mid-chain Python probes off this path (GIL + sync starved cameras).
-        video_sync = self._make_uri_clock_sync_identity(f'uri_v_sync_{source_id}')
+        # Pace off the live graph: decode → appsink; feeder thread sleeps to PTS;
+        # appsrc → tee/mix. Avoids identity sync on shared force-live threads.
         video_tee = Gst.ElementFactory.make('tee', f'uri_v_tee_{source_id}')
         audio_convert = Gst.ElementFactory.make('audioconvert', f'uri_a_convert_{source_id}')
         audio_resample = Gst.ElementFactory.make('audioresample', f'uri_a_resample_{source_id}')
         audio_highpass = _make_voice_highpass_element(f'uri_a_highpass_{source_id}')
         audio_volume = _make_ingest_volume_element(f'uri_a_volume_{source_id}')
-        audio_sync = self._make_uri_clock_sync_identity(f'uri_a_sync_{source_id}')
+        audio_dec_queue = Gst.ElementFactory.make('queue', f'uri_a_dec_queue_{source_id}')
+        audio_appsink = Gst.ElementFactory.make('appsink', f'uri_a_appsink_{source_id}')
+        audio_appsrc = Gst.ElementFactory.make('appsrc', f'uri_a_appsrc_{source_id}')
         audio_tee = Gst.ElementFactory.make('tee', f'uri_a_tee_{source_id}')
         audio_queue = Gst.ElementFactory.make('queue', f'uri_a_queue_{source_id}')
 
@@ -2313,14 +2325,18 @@ class CompositorPipeline:
                 src,
                 video_convert,
                 video_caps,
+                video_dec_queue,
+                video_appsink,
+                video_appsrc,
                 *ingest_tail,
-                video_sync,
                 video_tee,
                 audio_convert,
                 audio_resample,
                 audio_highpass,
                 audio_volume,
-                audio_sync,
+                audio_dec_queue,
+                audio_appsink,
+                audio_appsrc,
                 audio_tee,
                 audio_queue,
             ]
@@ -2336,6 +2352,14 @@ class CompositorPipeline:
         # (decode still counts; mix/SFU never see frames). Disable on URI only.
         self._disable_uri_transform_qos(video_convert)
         self._disable_uri_transform_qos(audio_convert)
+        # Non-leaky decode queues: when the feeder sleeps, decode blocks here
+        # (URI threads only) instead of dumping/dropping the file.
+        self._configure_uri_pacing_queue(video_dec_queue)
+        self._configure_uri_pacing_queue(audio_dec_queue)
+        self._configure_uri_appsink(video_appsink)
+        self._configure_uri_appsink(audio_appsink)
+        self._configure_uri_appsrc(video_appsrc)
+        self._configure_uri_appsrc(audio_appsrc)
         self._configure_uri_pacing_queue(audio_queue)
         video_scale = next(
             (
@@ -2354,47 +2378,46 @@ class CompositorPipeline:
             ingest_queue.get_factory() is not None
             and ingest_queue.get_factory().get_name() == 'queue'
         ):
-            self._configure_uri_pacing_queue(ingest_queue)
+            # Live side after appsrc: leaky so a stalled SFU/mix cannot block the feeder.
+            ingest_queue.set_property('leaky', 2)
+            ingest_queue.set_property('max-size-time', 2 * Gst.SECOND)
 
         # Isolates force-live compositor from SFU encode backpressure on the tee.
-        # Keep this queue leaky: SFU stalls must not block the mix path.
         mix_queue = Gst.ElementFactory.make('queue', f'uri_v_mix_queue_{source_id}')
         if mix_queue is None:
             raise RuntimeError(f'Failed to create URI mix queue for {source_id}')
         mix_queue.set_property('leaky', 2)
         mix_queue.set_property('max-size-time', 2 * Gst.SECOND)
 
-        video_chain = [video_convert, video_caps, *ingest_tail, video_sync]
-        audio_chain = [
+        decode_video_chain = [video_convert, video_caps, video_dec_queue, video_appsink]
+        live_video_chain = [video_appsrc, *ingest_tail]
+        decode_audio_chain = [
             audio_convert,
             audio_resample,
             audio_highpass,
             audio_volume,
-            audio_sync,
-            audio_tee,
-            audio_queue,
+            audio_dec_queue,
+            audio_appsink,
         ]
+        live_audio_chain = [audio_appsrc, audio_tee, audio_queue]
         elements = [
             src,
-            *video_chain,
+            *decode_video_chain,
+            *live_video_chain,
             video_tee,
             mix_queue,
-            *audio_chain,
+            *decode_audio_chain,
+            *live_audio_chain,
         ]
-        # Match RTP ingest: add to pipeline before linking.
         for element in elements:
             self._pipeline.add(element)
 
-        self._link_sequential(
-            video_chain,
-            label=f'uri-video-{source_id}',
-        )
-        if not video_sync.link(video_tee):
-            raise RuntimeError(f'Failed to link URI video sync → tee for {source_id}')
-        self._link_sequential(
-            audio_chain,
-            label=f'uri-audio-{source_id}',
-        )
+        self._link_sequential(decode_video_chain, label=f'uri-decode-video-{source_id}')
+        self._link_sequential(live_video_chain, label=f'uri-live-video-{source_id}')
+        if not ingest_tail[-1].link(video_tee):
+            raise RuntimeError(f'Failed to link URI live video → tee for {source_id}')
+        self._link_sequential(decode_audio_chain, label=f'uri-decode-audio-{source_id}')
+        self._link_sequential(live_audio_chain, label=f'uri-live-audio-{source_id}')
 
         compositor_sink_pad = self._compositor.get_request_pad('sink_%u')
         if compositor_sink_pad is None:
@@ -2410,6 +2433,7 @@ class CompositorPipeline:
         if mix_src.link(compositor_sink_pad) != Gst.PadLinkReturn.OK:
             raise RuntimeError(f'Failed to link URI mix queue → compositor for {source_id}')
 
+        pace_stop = threading.Event()
         branch = ParticipantBranch(
             participant_peer_id=source_id,
             compositor_sink_pad=compositor_sink_pad,
@@ -2423,18 +2447,12 @@ class CompositorPipeline:
             audio_volume=audio_volume,
             uri_video_tee=video_tee,
             uri_audio_tee=audio_tee,
+            uri_pace_stop=pace_stop,
+            uri_video_appsink=video_appsink,
+            uri_video_appsrc=video_appsrc,
+            uri_audio_appsink=audio_appsink,
+            uri_audio_appsrc=audio_appsrc,
         )
-        # Live restamp on convert src (not uridecodebin ghost pad): ghost-pad
-        # offset was logged but convert QoS still treated file PTS as late.
-        video_convert_src = video_convert.get_static_pad('src')
-        if video_convert_src is None:
-            raise RuntimeError(f'URI videoconvert has no src pad for {source_id}')
-        video_convert_src.add_probe(
-            Gst.PadProbeType.BUFFER,
-            self._make_uri_timestamp_align_probe(),
-            None,
-        )
-        # Keep only mix-path ingest counters (avoid mid-chain GIL churn).
         mix_src.add_probe(
             Gst.PadProbeType.BUFFER,
             self._make_video_probe(branch),
@@ -2483,19 +2501,11 @@ class CompositorPipeline:
 
                 branch.mixer_sink_pad = mixer_pad
                 link_state['audio'] = True
-                audio_convert_src = audio_convert.get_static_pad('src')
-                if audio_convert_src is not None:
-                    audio_convert_src.add_probe(
-                        Gst.PadProbeType.BUFFER,
-                        self._make_uri_timestamp_align_probe(),
-                        None,
-                    )
                 audio_src_pad.add_probe(
                     Gst.PadProbeType.BUFFER,
                     self._make_audio_probe(branch),
                     None,
                 )
-                # Apply scene-hide mute as soon as the soundtrack pad exists.
                 self._apply_uri_audio_mix_state_unlocked(source_id)
                 logger.info(
                     'URI audio pad linked source=%s caps=%s',
@@ -2508,6 +2518,19 @@ class CompositorPipeline:
 
         for element in elements:
             element.sync_state_with_parent()
+
+        self._start_uri_pace_feeder(
+            branch,
+            kind='video',
+            appsink=video_appsink,
+            appsrc=video_appsrc,
+        )
+        self._start_uri_pace_feeder(
+            branch,
+            kind='audio',
+            appsink=audio_appsink,
+            appsrc=audio_appsrc,
+        )
 
         return branch
 
@@ -2750,16 +2773,34 @@ class CompositorPipeline:
 
     @staticmethod
     def _configure_uri_pacing_queue(queue: Gst.Element) -> None:
-        """
-        Short non-leaky cushion ahead of URI clock-sync.
-
-        Soft backpressure only; wall-clock pacing is done by identity sync
-        after live restamp (no mid-chain Python probes on that path).
-        """
+        """Non-leaky cushion for URI decode backpressure and live audio after appsrc."""
         queue.set_property('leaky', 0)
         queue.set_property('max-size-buffers', 0)
         queue.set_property('max-size-bytes', 0)
         queue.set_property('max-size-time', 2 * Gst.SECOND)
+
+    @staticmethod
+    def _configure_uri_appsink(appsink: Gst.Element) -> None:
+        appsink.set_property('emit-signals', False)
+        appsink.set_property('sync', False)
+        appsink.set_property('async', False)
+        # Do not drop: non-leaky decode queue provides backpressure while the
+        # feeder thread sleeps to PTS (URI decode threads only).
+        if appsink.find_property('max-buffers') is not None:
+            appsink.set_property('max-buffers', 1)
+        if appsink.find_property('drop') is not None:
+            appsink.set_property('drop', False)
+        if appsink.find_property('enable-last-sample') is not None:
+            appsink.set_property('enable-last-sample', False)
+
+    @staticmethod
+    def _configure_uri_appsrc(appsrc: Gst.Element) -> None:
+        appsrc.set_property('format', Gst.Format.TIME)
+        appsrc.set_property('is-live', True)
+        appsrc.set_property('do-timestamp', False)
+        appsrc.set_property('block', False)
+        if appsrc.find_property('max-bytes') is not None:
+            appsrc.set_property('max-bytes', 0)
 
     @staticmethod
     def _disable_uri_transform_qos(element: Gst.Element) -> None:
@@ -2773,73 +2814,159 @@ class CompositorPipeline:
         if element.find_property('qos') is not None:
             element.set_property('qos', False)
 
-    @staticmethod
-    def _make_uri_clock_sync_identity(name: str) -> Gst.Element:
-        """
-        Pace VOD buffers to the pipeline clock before mix/SFU tees.
+    def _pipeline_running_time_ns(self) -> int | None:
+        if self._pipeline is None:
+            return None
+        clock = self._pipeline.get_clock()
+        if clock is None:
+            return None
+        running = int(clock.get_time()) - int(self._pipeline.get_base_time())
+        if running < 0:
+            return None
+        return running
 
-        Required because leaky tee branches always accept; a non-leaky queue
-        alone cannot hold uridecodebin to realtime. Relies on upstream
-        pad-offset alignment so buffer running times match live clock.
-        """
-        identity = Gst.ElementFactory.make('identity', name)
-        if identity is None:
-            raise RuntimeError(f'Failed to create URI clock-sync identity ({name})')
-        if identity.find_property('sync') is not None:
-            identity.set_property('sync', True)
-        return identity
+    def _wait_for_uri_pts(
+        self,
+        target_pts: int,
+        stop: threading.Event,
+    ) -> bool:
+        """Sleep until pipeline running time reaches target_pts. False if stopped."""
+        while not stop.is_set():
+            running = self._pipeline_running_time_ns()
+            if running is None:
+                if stop.wait(0.02):
+                    return False
+                continue
+            delay_ns = int(target_pts) - int(running)
+            if delay_ns <= 0:
+                return True
+            # Chunked wait so teardown stays responsive.
+            delay_s = min(delay_ns / float(Gst.SECOND), 0.05)
+            if stop.wait(delay_s):
+                return False
+        return False
 
-    def _make_uri_timestamp_align_probe(self):
-        """
-        Align VOD buffers to pipeline running time (one-shot pad offset).
+    def _start_uri_pace_feeder(
+        self,
+        branch: ParticipantBranch,
+        *,
+        kind: str,
+        appsink: Gst.Element,
+        appsrc: Gst.Element,
+    ) -> None:
+        stop = branch.uri_pace_stop
+        if stop is None:
+            stop = threading.Event()
+            branch.uri_pace_stop = stop
 
-        Applied on convert src pads (not uridecodebin ghost pads) so sync,
-        mix, and SFU see a live-mapped timeline while preserving file-relative
-        frame spacing. PTS=NONE cannot be rewritten reliably from a Python pad
-        probe, so those buffers are left alone and logged once.
-        """
-        state = {'logged_offset': False, 'logged_none': False, 'applied': False}
+        source_id = branch.participant_peer_id
+        pull_timeout = Gst.SECOND // 5
 
-        def _probe(pad: Gst.Pad, info: Gst.PadProbeInfo, _user_data) -> Gst.PadProbeReturn:
-            if self._pipeline is None:
-                return Gst.PadProbeReturn.OK
-
-            buffer = info.get_buffer()
-            if buffer is None:
-                return Gst.PadProbeReturn.OK
-
-            if buffer.pts == Gst.CLOCK_TIME_NONE:
-                if not state['logged_none']:
-                    state['logged_none'] = True
-                    logger.warning(
-                        'URI buffer PTS=NONE on %s (cannot rewrite in probe)',
-                        pad.get_path_string(),
+        def _run() -> None:
+            offset: int | None = None
+            caps_set = False
+            logged_start = False
+            while not stop.is_set():
+                if branch.playback_paused:
+                    if stop.wait(0.05):
+                        break
+                    continue
+                try:
+                    sample = appsink.emit('try-pull-sample', pull_timeout)
+                except Exception:
+                    logger.exception(
+                        'URI %s appsink pull failed source=%s',
+                        kind,
+                        source_id,
                     )
-                return Gst.PadProbeReturn.OK
+                    break
+                if sample is None:
+                    continue
 
-            if state['applied']:
-                return Gst.PadProbeReturn.OK
+                if not caps_set:
+                    caps = sample.get_caps()
+                    if caps is not None and not caps.is_empty():
+                        try:
+                            appsrc.set_property('caps', caps)
+                            caps_set = True
+                        except Exception:
+                            logger.exception(
+                                'URI %s appsrc caps set failed source=%s',
+                                kind,
+                                source_id,
+                            )
 
-            clock = self._pipeline.get_clock()
-            if clock is None:
-                return Gst.PadProbeReturn.OK
+                buf = sample.get_buffer()
+                if buf is None:
+                    continue
 
-            running_time = clock.get_time() - self._pipeline.get_base_time()
-            if running_time < 0:
-                return Gst.PadProbeReturn.OK
+                running = self._pipeline_running_time_ns()
+                if running is None:
+                    continue
 
-            pad.set_offset(int(running_time) - int(buffer.pts))
-            state['applied'] = True
-            if not state['logged_offset']:
-                state['logged_offset'] = True
-                logger.info(
-                    'URI aligned running-time pad offset=%s on %s',
-                    pad.get_offset(),
-                    pad.get_path_string(),
-                )
-            return Gst.PadProbeReturn.OK
+                file_pts = buf.pts
+                if file_pts == Gst.CLOCK_TIME_NONE:
+                    # No timeline — push immediately with live PTS.
+                    mapped = int(running)
+                else:
+                    if offset is None:
+                        offset = int(running) - int(file_pts)
+                        if not logged_start:
+                            logged_start = True
+                            logger.info(
+                                'URI %s pace started source=%s offset=%s',
+                                kind,
+                                source_id,
+                                offset,
+                            )
+                    mapped = int(file_pts) + int(offset)
+                    if not self._wait_for_uri_pts(mapped, stop):
+                        break
+                    # Re-read clock after wait; skip if we fell far behind.
+                    running_after = self._pipeline_running_time_ns()
+                    if running_after is not None and mapped < running_after - Gst.SECOND:
+                        # More than 1s late — drop to catch up.
+                        continue
 
-        return _probe
+                try:
+                    out = buf.copy()
+                    out.pts = int(mapped)
+                    if out.dts != Gst.CLOCK_TIME_NONE:
+                        out.dts = int(mapped)
+                    retval = appsrc.emit('push-buffer', out)
+                except Exception:
+                    if not stop.is_set():
+                        logger.exception(
+                            'URI %s appsrc push failed source=%s',
+                            kind,
+                            source_id,
+                        )
+                    break
+                if retval != Gst.FlowReturn.OK:
+                    if not stop.is_set():
+                        logger.warning(
+                            'URI %s appsrc push-buffer returned %s source=%s',
+                            kind,
+                            retval,
+                            source_id,
+                        )
+                    break
+
+        thread = threading.Thread(
+            target=_run,
+            name=f'uri-pace-{kind}-{source_id}',
+            daemon=True,
+        )
+        branch.uri_pace_threads.append(thread)
+        thread.start()
+
+    @staticmethod
+    def _stop_uri_pace_feeders(branch: ParticipantBranch) -> None:
+        if branch.uri_pace_stop is not None:
+            branch.uri_pace_stop.set()
+        for thread in list(branch.uri_pace_threads):
+            thread.join(timeout=1.0)
+        branch.uri_pace_threads.clear()
 
     def _make_running_time_offset_probe(self, *, continuous: bool = True):
         """
