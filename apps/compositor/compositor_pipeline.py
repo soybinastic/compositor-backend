@@ -1166,13 +1166,15 @@ class CompositorPipeline:
         muted: bool | None = None,
     ) -> None:
         """Best-effort play/pause/seek/volume for a URI decode branch."""
+        normalized = (action or '').strip().lower()
+        seek_position_ns: int | None = None
+
         with self._lock:
             branch = self._participants.get(source_id)
             if branch is None or source_id not in self._uri_source_ids:
                 logger.warning('URI playback update ignored; unknown source %s', source_id)
                 return
 
-            normalized = (action or '').strip().lower()
             src = branch.uri_src
 
             if volume is not None:
@@ -1193,34 +1195,45 @@ class CompositorPipeline:
                 branch.uri_loop = bool(loop)
                 logger.info('URI loop=%s for source=%s', branch.uri_loop, source_id)
 
-            if normalized == 'pause' and src is not None:
-                try:
-                    src.set_state(Gst.State.PAUSED)
-                    branch.playback_paused = True
-                except Exception:
-                    logger.exception('Failed to pause URI source %s', source_id)
+            if normalized == 'pause':
+                target = branch.uri_decode_pipeline or src
+                if target is not None:
+                    try:
+                        target.set_state(Gst.State.PAUSED)
+                        branch.playback_paused = True
+                    except Exception:
+                        logger.exception('Failed to pause URI source %s', source_id)
                 return
 
-            if normalized == 'play' and src is not None:
-                try:
-                    src.set_state(Gst.State.PLAYING)
-                    branch.playback_paused = False
-                except Exception:
-                    logger.exception('Failed to play URI source %s', source_id)
+            if normalized == 'play':
+                target = branch.uri_decode_pipeline or src
+                if target is not None:
+                    try:
+                        target.set_state(Gst.State.PLAYING)
+                        branch.playback_paused = False
+                    except Exception:
+                        logger.exception('Failed to play URI source %s', source_id)
                 return
 
             if normalized == 'seek' and position_ms is not None:
-                start = max(0, int(float(position_ms) * Gst.MSECOND))
-                if not self._seek_uri_decode(branch, start):
-                    logger.warning(
-                        'URI seek not available/failed for %s (position_ms=%s)',
-                        source_id,
-                        position_ms,
-                    )
+                # Flush-seek outside the lock (same as EOF loop path).
+                seek_position_ns = max(0, int(float(position_ms) * Gst.MSECOND))
+            elif normalized not in ('', 'volume'):
+                logger.warning('Unknown URI playback action %r for %s', action, source_id)
                 return
 
-            if normalized not in ('', 'pause', 'play', 'seek', 'volume'):
-                logger.warning('Unknown URI playback action %r for %s', action, source_id)
+        if seek_position_ns is not None:
+            if not self._seek_uri_and_rebind(
+                source_id,
+                seek_position_ns,
+                reason='user',
+                retry=True,
+            ):
+                logger.warning(
+                    'URI seek not available/failed for %s (position_ms=%s)',
+                    source_id,
+                    position_ms,
+                )
 
     def get_uri_source_stats(self, source_id: str) -> IngestStats | None:
         branch = self._participants.get(source_id)
@@ -1330,6 +1343,55 @@ class CompositorPipeline:
                 logger.exception('URI decode seek raised on %s', target.get_name())
         return False
 
+    def _seek_uri_and_rebind(
+        self,
+        source_id: str,
+        position_ns: int,
+        *,
+        reason: str,
+        retry: bool = False,
+        update_loop_monotonic: bool = False,
+    ) -> bool:
+        """
+        Flush-seek URI decode and bump pace epoch so audio/video feeders rebind.
+
+        Used for both host scrub seeks and EOF loop seeks. Caller must not hold
+        ``self._lock`` (GStreamer seek can block).
+        """
+        with self._lock:
+            branch = self._participants.get(source_id)
+            if branch is None or source_id not in self._uri_source_ids:
+                return False
+            branch.uri_seeking = True
+
+        seeked = self._seek_uri_decode(branch, position_ns)
+        if not seeked and retry:
+            time.sleep(0.05)
+            with self._lock:
+                branch = self._participants.get(source_id)
+                if branch is None or source_id not in self._uri_source_ids:
+                    return False
+            seeked = self._seek_uri_decode(branch, position_ns)
+
+        with self._lock:
+            current = self._participants.get(source_id)
+            if current is None:
+                return False
+            current.uri_seeking = False
+            if not seeked:
+                return False
+            current.uri_pace_epoch += 1
+            if update_loop_monotonic:
+                current.uri_last_loop_monotonic = time.monotonic()
+            logger.info(
+                'URI %s seek ok source=%s position_ms=%.1f pace_epoch=%s',
+                reason,
+                source_id,
+                float(position_ns) / float(Gst.MSECOND),
+                current.uri_pace_epoch,
+            )
+            return True
+
     def _loop_uri_source_from_start(self, source_id: str, branch: ParticipantBranch) -> None:
         """Seek VOD decode back to 0 after drained so the tile keeps playing."""
         with self._lock:
@@ -1351,35 +1413,16 @@ class CompositorPipeline:
                     now - branch.uri_last_loop_monotonic,
                 )
                 return
-            branch.uri_seeking = True
 
         logger.info('URI source drained source=%s; looping to start', source_id)
-        seeked = self._seek_uri_decode(branch, 0)
-        if not seeked:
-            # Demuxers sometimes reject seek immediately after drained; retry once.
-            time.sleep(0.05)
-            with self._lock:
-                current = self._participants.get(source_id)
-                if current is None or source_id not in self._uri_source_ids:
-                    return
-                branch = current
-            seeked = self._seek_uri_decode(branch, 0)
-
-        with self._lock:
-            current = self._participants.get(source_id)
-            if current is None:
-                return
-            branch = current
-            branch.uri_seeking = False
-            if seeked:
-                branch.uri_pace_epoch += 1
-                branch.uri_last_loop_monotonic = time.monotonic()
-                logger.info(
-                    'URI loop seek ok source=%s pace_epoch=%s',
-                    source_id,
-                    branch.uri_pace_epoch,
-                )
-                return
+        if self._seek_uri_and_rebind(
+            source_id,
+            0,
+            reason='loop',
+            retry=True,
+            update_loop_monotonic=True,
+        ):
+            return
 
         logger.warning(
             'URI loop seek failed source=%s; falling back to deactivate',
