@@ -121,6 +121,11 @@ class ParticipantBranch:
     uri_loop: bool = True
     # Set when uridecodebin fires drained and loop is off; mix pads must not block force-live.
     uri_drained: bool = False
+    # Bumped on each successful loop seek so pace feeders rebind PTS to live time.
+    uri_pace_epoch: int = 0
+    # Serialize drained→seek so overlapping flushes do not thrash short loops.
+    uri_seeking: bool = False
+    uri_last_loop_monotonic: float = 0.0
 
 
 @dataclass
@@ -1327,19 +1332,55 @@ class CompositorPipeline:
 
     def _loop_uri_source_from_start(self, source_id: str, branch: ParticipantBranch) -> None:
         """Seek VOD decode back to 0 after drained so the tile keeps playing."""
-        logger.info('URI source drained source=%s; looping to start', source_id)
-        if self._seek_uri_decode(branch, 0):
-            return
-        # Demuxers sometimes reject seek immediately after drained; retry once.
-        time.sleep(0.05)
         with self._lock:
             current = self._participants.get(source_id)
             if current is None or source_id not in self._uri_source_ids:
                 return
-            if current is not branch:
+            branch = current
+            if branch.uri_drained or branch.uri_seeking:
+                return
+            # Ignore drained spam for a short window after a successful loop seek.
+            now = time.monotonic()
+            if (
+                branch.uri_last_loop_monotonic > 0
+                and now - branch.uri_last_loop_monotonic < 0.75
+            ):
+                logger.debug(
+                    'URI loop seek debounced source=%s dt=%.3fs',
+                    source_id,
+                    now - branch.uri_last_loop_monotonic,
+                )
+                return
+            branch.uri_seeking = True
+
+        logger.info('URI source drained source=%s; looping to start', source_id)
+        seeked = self._seek_uri_decode(branch, 0)
+        if not seeked:
+            # Demuxers sometimes reject seek immediately after drained; retry once.
+            time.sleep(0.05)
+            with self._lock:
+                current = self._participants.get(source_id)
+                if current is None or source_id not in self._uri_source_ids:
+                    return
                 branch = current
-        if self._seek_uri_decode(branch, 0):
-            return
+            seeked = self._seek_uri_decode(branch, 0)
+
+        with self._lock:
+            current = self._participants.get(source_id)
+            if current is None:
+                return
+            branch = current
+            branch.uri_seeking = False
+            if seeked:
+                branch.uri_pace_epoch += 1
+                branch.uri_last_loop_monotonic = time.monotonic()
+                logger.info(
+                    'URI loop seek ok source=%s pace_epoch=%s',
+                    source_id,
+                    branch.uri_pace_epoch,
+                )
+                return
+
         logger.warning(
             'URI loop seek failed source=%s; falling back to deactivate',
             source_id,
@@ -1358,6 +1399,7 @@ class CompositorPipeline:
             if branch.uri_drained:
                 return
             branch.uri_drained = True
+            branch.uri_seeking = False
             logger.info(
                 'URI source drained source=%s; deactivating mix pads for live program',
                 source_id,
@@ -1417,7 +1459,7 @@ class CompositorPipeline:
             branch = self._participants.get(source_id)
             if branch is None or source_id not in self._uri_source_ids:
                 return
-            if branch.uri_drained:
+            if branch.uri_drained or branch.uri_seeking:
                 return
             should_loop = bool(branch.uri_loop) and not branch.playback_paused
 
@@ -3071,11 +3113,20 @@ class CompositorPipeline:
             caps_set = False
             logged_start = False
             catchup_events = 0
+            seen_epoch = int(branch.uri_pace_epoch)
             while not stop.is_set():
                 if branch.playback_paused:
                     if stop.wait(0.05):
                         break
                     continue
+                # Loop seek resets file PTS to ~0; drop the old offset so both
+                # video and audio rebind to live pipeline running time.
+                epoch = int(branch.uri_pace_epoch)
+                if epoch != seen_epoch:
+                    offset = None
+                    logged_start = False
+                    catchup_events = 0
+                    seen_epoch = epoch
                 try:
                     sample = appsink.emit('try-pull-sample', pull_timeout)
                 except Exception:
@@ -3122,24 +3173,24 @@ class CompositorPipeline:
                         if not logged_start:
                             logged_start = True
                             logger.info(
-                                'URI %s pace started source=%s offset=%s',
+                                'URI %s pace started source=%s offset=%s epoch=%s',
                                 kind,
                                 source_id,
                                 offset,
+                                seen_epoch,
                             )
                     mapped = int(file_pts) + int(offset)
                     lag_ns = int(running) - int(mapped)
-                    if kind == 'video' and (
-                        lag_ns > late_restamp_ns or lag_ns < -early_clamp_ns
-                    ):
-                        # Late → compositor would drop; far early → feeder would
-                        # sleep forever. Restamp onto running time and push.
+                    # Video and audio: restamp when late/early after seek or drift.
+                    # Audio used to push past PTS into force-live audiomixer → silence.
+                    if lag_ns > late_restamp_ns or lag_ns < -early_clamp_ns:
                         offset = int(running) - int(file_pts)
                         mapped = int(running)
                         catchup_events += 1
                         if catchup_events == 1 or catchup_events % 50 == 0:
                             logger.info(
-                                'URI video catch-up restamp source=%s lag_ms=%.1f events=%s',
+                                'URI %s catch-up restamp source=%s lag_ms=%.1f events=%s',
+                                kind,
                                 source_id,
                                 lag_ns / 1_000_000.0,
                                 catchup_events,
