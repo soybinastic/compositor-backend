@@ -123,6 +123,7 @@ def dispatch_command(ingest_manager: SessionIngestManager, command: SessionComma
             host_peer_id=command.host_peer_id,
             slot_assignments=command.slot_assignments,
             hidden_source_ids=command.hidden_source_ids,
+            scene_source_ids=command.scene_source_ids,
         )
         return None
 

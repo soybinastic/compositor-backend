@@ -609,3 +609,182 @@ class SessionIngestManagerTests(TestCase):
         )
         mock_consumer_service.attach_video_seat.assert_not_called()
         self.assertIs(manager._participants['screen-xyz'], av_seat)
+
+    def test_sync_extra_seat_soft_disables_when_screen_stops_but_retained(self):
+        mock_consumer_service = MagicMock(spec=ConsumerService)
+        primary = MagicMock()
+        primary.participant_peer_id = 'host-1'
+        primary.audio_producer_id = 'audio-1'
+        primary.video_producer_id = 'video-main'
+        primary.video_mode = 'rtp'
+        primary.owner_peer_id = 'host-1'
+        primary.source_id = None
+        screen = MagicMock()
+        screen.participant_peer_id = 'screen-xyz'
+        screen.owner_peer_id = 'host-1'
+        screen.source_id = 'screen-xyz'
+        screen.video_producer_id = 'video-screen'
+        screen.audio_producer_id = None
+        screen.video_mode = 'rtp'
+        mock_consumer_service.attach_participant.return_value = primary
+        mock_consumer_service.attach_video_seat.return_value = screen
+        manager = SessionIngestManager(
+            session_id='session-1',
+            room_id='session-1',
+            compositor_peer_id='compositor-session-1',
+            layout='CONTAIN',
+            consumer_service=mock_consumer_service,
+            compositor_pipeline=MagicMock(),
+        )
+        manager.set_tile_order(scene_source_ids=['screen-xyz'])
+
+        manager.sync_producers(
+            [
+                {
+                    'peerId': 'host-1',
+                    'displayName': 'Host',
+                    'producers': [
+                        {'producerId': 'audio-1', 'kind': 'audio', 'source': 'audio'},
+                        {'producerId': 'video-main', 'kind': 'video', 'source': 'video'},
+                        {
+                            'producerId': 'video-screen',
+                            'kind': 'video',
+                            'source': 'screensharing',
+                            'sourceId': 'screen-xyz',
+                        },
+                    ],
+                }
+            ],
+            joined_peers=[{'peerId': 'host-1', 'displayName': 'Host'}],
+        )
+        mock_consumer_service.soft_disable_video.reset_mock()
+        mock_consumer_service.detach_participant.reset_mock()
+
+        # Share ends — screen source still on scene.
+        manager.sync_producers(
+            [
+                {
+                    'peerId': 'host-1',
+                    'displayName': 'Host',
+                    'producers': [
+                        {'producerId': 'audio-1', 'kind': 'audio', 'source': 'audio'},
+                        {'producerId': 'video-main', 'kind': 'video', 'source': 'video'},
+                    ],
+                }
+            ],
+            joined_peers=[{'peerId': 'host-1', 'displayName': 'Host'}],
+        )
+
+        mock_consumer_service.soft_disable_video.assert_called_once()
+        mock_consumer_service.detach_participant.assert_not_called()
+        self.assertIn('screen-xyz', manager._participants)
+
+    def test_sync_extra_seat_prunes_when_not_on_scene(self):
+        mock_consumer_service = MagicMock(spec=ConsumerService)
+        primary = MagicMock()
+        primary.participant_peer_id = 'host-1'
+        primary.audio_producer_id = 'audio-1'
+        primary.video_producer_id = 'video-main'
+        primary.video_mode = 'rtp'
+        primary.owner_peer_id = 'host-1'
+        primary.source_id = None
+        screen = MagicMock()
+        screen.participant_peer_id = 'screen-xyz'
+        screen.owner_peer_id = 'host-1'
+        screen.source_id = 'screen-xyz'
+        screen.video_producer_id = 'video-screen'
+        screen.audio_producer_id = None
+        screen.video_mode = 'rtp'
+        mock_consumer_service.attach_participant.return_value = primary
+        mock_consumer_service.attach_video_seat.return_value = screen
+        manager = SessionIngestManager(
+            session_id='session-1',
+            room_id='session-1',
+            compositor_peer_id='compositor-session-1',
+            layout='CONTAIN',
+            consumer_service=mock_consumer_service,
+            compositor_pipeline=MagicMock(),
+        )
+        manager.set_tile_order(scene_source_ids=['screen-xyz'])
+        manager.sync_producers(
+            [
+                {
+                    'peerId': 'host-1',
+                    'displayName': 'Host',
+                    'producers': [
+                        {'producerId': 'audio-1', 'kind': 'audio', 'source': 'audio'},
+                        {'producerId': 'video-main', 'kind': 'video', 'source': 'video'},
+                        {
+                            'producerId': 'video-screen',
+                            'kind': 'video',
+                            'source': 'screensharing',
+                            'sourceId': 'screen-xyz',
+                        },
+                    ],
+                }
+            ],
+            joined_peers=[{'peerId': 'host-1', 'displayName': 'Host'}],
+        )
+        mock_consumer_service.detach_participant.reset_mock()
+
+        # Detach from scene → prune idle/live extra seat.
+        manager.set_tile_order(scene_source_ids=[])
+
+        mock_consumer_service.detach_participant.assert_called()
+        self.assertNotIn('screen-xyz', manager._participants)
+
+    def test_sync_extra_seat_soft_enables_when_share_resumes(self):
+        mock_consumer_service = MagicMock(spec=ConsumerService)
+        primary = MagicMock()
+        primary.participant_peer_id = 'host-1'
+        primary.audio_producer_id = 'audio-1'
+        primary.video_producer_id = 'video-main'
+        primary.video_mode = 'rtp'
+        primary.owner_peer_id = 'host-1'
+        primary.source_id = None
+        screen = MagicMock()
+        screen.participant_peer_id = 'screen-xyz'
+        screen.owner_peer_id = 'host-1'
+        screen.source_id = 'screen-xyz'
+        screen.video_producer_id = None
+        screen.audio_producer_id = None
+        screen.video_mode = 'placeholder'
+        mock_consumer_service.attach_participant.return_value = primary
+        manager = SessionIngestManager(
+            session_id='session-1',
+            room_id='session-1',
+            compositor_peer_id='compositor-session-1',
+            layout='CONTAIN',
+            consumer_service=mock_consumer_service,
+            compositor_pipeline=MagicMock(),
+        )
+        manager._participants['host-1'] = primary
+        manager._participants['screen-xyz'] = screen
+        manager.set_tile_order(scene_source_ids=['screen-xyz'])
+
+        manager.sync_producers(
+            [
+                {
+                    'peerId': 'host-1',
+                    'displayName': 'Host',
+                    'producers': [
+                        {'producerId': 'audio-1', 'kind': 'audio', 'source': 'audio'},
+                        {'producerId': 'video-main', 'kind': 'video', 'source': 'video'},
+                        {
+                            'producerId': 'video-screen-2',
+                            'kind': 'video',
+                            'source': 'screensharing',
+                            'sourceId': 'screen-xyz',
+                        },
+                    ],
+                }
+            ],
+            joined_peers=[{'peerId': 'host-1', 'displayName': 'Host'}],
+        )
+
+        mock_consumer_service.soft_enable_video.assert_called_once_with(
+            screen,
+            'video-screen-2',
+            display_name='Host',
+        )
+        mock_consumer_service.attach_video_seat.assert_not_called()

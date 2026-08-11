@@ -13,7 +13,10 @@ from django.conf import settings
 from apps.compositor.compositor_pipeline import CompositorPipeline
 from apps.compositor.consumer_service import ConsumerService, ParticipantIngest
 from apps.compositor.ports import PortAllocator
-from apps.compositor.tile_order_sync import apply_tile_order_to_pipeline
+from apps.compositor.tile_order_sync import (
+    apply_tile_order_to_pipeline,
+    build_set_tile_order_command,
+)
 from apps.sessions.models import StudioSession
 from integrations.mediasoup.client import MediasoupHttpClient
 
@@ -122,6 +125,9 @@ class SessionIngestManager:
         self._display_names: dict[str, str] = {}
         # seat_id → monotonic deadline; skip attach retries until then
         self._attach_backoff_until: dict[str, float] = {}
+        # Source ids on the active scene (visible or eye-hidden). None = unknown
+        # (do not prune idle seats until first SetTileOrder).
+        self._scene_retained_source_ids: frozenset[str] | None = None
 
     @classmethod
     def create(
@@ -176,7 +182,7 @@ class SessionIngestManager:
             router_caps=router_caps,
         )
 
-        return cls(
+        manager = cls(
             session_id=str(session.id),
             room_id=room_id,
             compositor_peer_id=compositor_peer_id,
@@ -184,6 +190,15 @@ class SessionIngestManager:
             consumer_service=consumer_service,
             compositor_pipeline=compositor_pipeline,
         )
+        # Seed scene retention from the same tile-order snapshot applied to the pipeline.
+        tile_cmd = build_set_tile_order_command(session)
+        manager.set_tile_order(
+            host_peer_id=tile_cmd.host_peer_id,
+            slot_assignments=tile_cmd.slot_assignments,
+            hidden_source_ids=tile_cmd.hidden_source_ids,
+            scene_source_ids=tile_cmd.scene_source_ids,
+        )
+        return manager
 
     def set_layout(self, layout: str, *, graphics_state: dict | None = None) -> None:
         with self._lock:
@@ -196,7 +211,16 @@ class SessionIngestManager:
         host_peer_id: str | None = None,
         slot_assignments: dict[str, str] | None = None,
         hidden_source_ids: list[str] | None = None,
+        scene_source_ids: list[str] | None = None,
     ) -> None:
+        with self._lock:
+            if scene_source_ids is not None:
+                self._scene_retained_source_ids = frozenset(
+                    sid.strip()
+                    for sid in scene_source_ids
+                    if isinstance(sid, str) and sid.strip()
+                )
+                self._prune_extra_seats_not_on_scene_unlocked()
         self._compositor_pipeline.set_tile_order(
             host_peer_id=host_peer_id,
             slot_assignments=slot_assignments,
@@ -455,7 +479,8 @@ class SessionIngestManager:
                 continue
             desired[video.source_id] = video
 
-        # Detach extra seats for this owner that are no longer published.
+        # Extra seats no longer published: keep idle placeholder while still on
+        # the active scene (Wave C); hard-detach when detached from the scene.
         for seat_id in list(self._participants.keys()):
             participant = self._participants[seat_id]
             if self._seat_owner(seat_id, participant) != peer_id:
@@ -465,9 +490,29 @@ class SessionIngestManager:
                 continue
             if seat_id in desired:
                 continue
-            self._participants.pop(seat_id)
-            self._video_missing_since.pop(seat_id, None)
-            self._consumer_service.detach_participant(participant)
+            if self._should_prune_extra_seat(seat_id):
+                self._participants.pop(seat_id)
+                self._video_missing_since.pop(seat_id, None)
+                self._consumer_service.detach_participant(participant)
+                continue
+            if participant.video_mode == 'placeholder':
+                continue
+            try:
+                label = self._extra_seat_placeholder_label(seat_id, display_name)
+                self._consumer_service.soft_disable_video(
+                    participant,
+                    display_name=label,
+                )
+                # Screen/system audio dies with the share; drop producer id so
+                # restore does not treat stale audio as still attached.
+                participant.audio_producer_id = None
+                self._video_missing_since.pop(seat_id, None)
+            except Exception:
+                logger.exception(
+                    'Failed to soft-disable idle extra seat %s for peer %s',
+                    seat_id,
+                    peer_id,
+                )
 
         for seat_id, video in desired.items():
             current = self._participants.get(seat_id)
@@ -493,6 +538,34 @@ class SessionIngestManager:
                         'Failed to attach extra seat %s for peer %s',
                         seat_id,
                         peer_id,
+                    )
+                continue
+
+            if current.video_mode == 'placeholder':
+                try:
+                    if audio_id:
+                        # Placeholder seats have no live audio branch to reuse.
+                        self._consumer_service.detach_participant(current)
+                        del self._participants[seat_id]
+                        participant = self._attach_extra_seat(
+                            seat_id=seat_id,
+                            peer_id=peer_id,
+                            video_id=video.producer_id,
+                            audio_id=audio_id,
+                            display_name=seat_name,
+                        )
+                        self._participants[seat_id] = participant
+                    else:
+                        self._consumer_service.soft_enable_video(
+                            current,
+                            video.producer_id,
+                            display_name=seat_name,
+                        )
+                    self._video_missing_since.pop(seat_id, None)
+                except Exception:
+                    logger.exception(
+                        'Failed to restore live video for extra seat %s',
+                        seat_id,
                     )
                 continue
 
@@ -527,6 +600,41 @@ class SessionIngestManager:
                     seat_id,
                     peer_id,
                 )
+
+    def _should_prune_extra_seat(self, seat_id: str) -> bool:
+        retained = self._scene_retained_source_ids
+        if retained is None:
+            return False
+        return seat_id not in retained
+
+    def _prune_extra_seats_not_on_scene_unlocked(self) -> None:
+        retained = self._scene_retained_source_ids
+        if retained is None:
+            return
+        for seat_id in list(self._participants.keys()):
+            participant = self._participants[seat_id]
+            source_id = getattr(participant, 'source_id', None)
+            if not isinstance(source_id, str) or not source_id:
+                continue
+            if seat_id in retained:
+                continue
+            self._participants.pop(seat_id)
+            self._video_missing_since.pop(seat_id, None)
+            try:
+                self._consumer_service.detach_participant(participant)
+            except Exception:
+                logger.exception(
+                    'Failed to prune extra seat %s after scene detach',
+                    seat_id,
+                )
+
+    @staticmethod
+    def _extra_seat_placeholder_label(seat_id: str, owner_display_name: str) -> str:
+        if seat_id.startswith('screen'):
+            return 'Screen'
+        if seat_id.startswith('camera'):
+            return 'Camera'
+        return owner_display_name or seat_id
 
     def _attach_extra_seat(
         self,
