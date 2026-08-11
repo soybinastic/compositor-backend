@@ -529,7 +529,7 @@ class SessionIngestManagerTests(TestCase):
         )
 
     def test_extract_av_producers_keeps_all_videos_with_source_id(self):
-        audio_id, videos = SessionIngestManager._extract_av_producers(
+        audio_id, extra_audios, videos = SessionIngestManager._extract_av_producers(
             {
                 'peerId': 'host-1',
                 'producers': [
@@ -541,10 +541,17 @@ class SessionIngestManagerTests(TestCase):
                         'source': 'video',
                         'sourceId': 'camera-1',
                     },
+                    {
+                        'producerId': 'a-screen',
+                        'kind': 'audio',
+                        'source': 'audio',
+                        'sourceId': 'screen-1',
+                    },
                 ],
             }
         )
         self.assertEqual(audio_id, 'a1')
+        self.assertEqual(extra_audios, {'screen-1': 'a-screen'})
         self.assertEqual(len(videos), 2)
         primary, extras = SessionIngestManager._split_primary_and_extra(videos)
         self.assertIsNotNone(primary)
@@ -552,3 +559,53 @@ class SessionIngestManagerTests(TestCase):
         self.assertEqual(primary.producer_id, 'v1')
         self.assertEqual(len(extras), 1)
         self.assertEqual(extras[0].source_id, 'camera-1')
+
+    def test_sync_extra_seat_attaches_av_when_screen_audio_present(self):
+        mock_consumer_service = MagicMock(spec=ConsumerService)
+        av_seat = MagicMock()
+        mock_consumer_service.attach_participant.return_value = av_seat
+        manager = SessionIngestManager(
+            session_id='session-1',
+            room_id='session-1',
+            compositor_peer_id='compositor-session-1',
+            layout='CONTAIN',
+            consumer_service=mock_consumer_service,
+            compositor_pipeline=MagicMock(),
+        )
+
+        manager.sync_producers(
+            [
+                {
+                    'peerId': 'host-1',
+                    'displayName': 'Host',
+                    'producers': [
+                        {'producerId': 'audio-1', 'kind': 'audio', 'source': 'audio'},
+                        {'producerId': 'video-main', 'kind': 'video', 'source': 'video'},
+                        {
+                            'producerId': 'video-screen',
+                            'kind': 'video',
+                            'source': 'screensharing',
+                            'sourceId': 'screen-xyz',
+                        },
+                        {
+                            'producerId': 'audio-screen',
+                            'kind': 'audio',
+                            'source': 'audio',
+                            'sourceId': 'screen-xyz',
+                        },
+                    ],
+                }
+            ],
+            joined_peers=[{'peerId': 'host-1', 'displayName': 'Host'}],
+        )
+
+        mock_consumer_service.attach_participant.assert_any_call(
+            'screen-xyz',
+            'audio-screen',
+            'video-screen',
+            owner_peer_id='host-1',
+            source_id='screen-xyz',
+            host_owned=True,
+        )
+        mock_consumer_service.attach_video_seat.assert_not_called()
+        self.assertIs(manager._participants['screen-xyz'], av_seat)

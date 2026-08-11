@@ -1259,6 +1259,41 @@ class CompositorPipeline:
         for source_id in list(self._uri_source_ids):
             self._apply_uri_audio_mix_state_unlocked(source_id)
 
+    def _sync_host_owned_seat_audio_mute_unlocked(self) -> None:
+        """Mute RTP extra-seat audio (e.g. screen share) when the tile is hidden."""
+        for source_id in list(self._host_owned_source_ids):
+            if source_id in self._uri_source_ids:
+                continue
+            branch = self._participants.get(source_id)
+            if branch is None:
+                continue
+            scene_hidden = source_id in self._hidden_source_ids
+            effective_mute = scene_hidden or bool(branch.user_muted)
+            if branch.audio_volume is not None:
+                try:
+                    branch.audio_volume.set_property('mute', effective_mute)
+                except Exception:
+                    logger.exception(
+                        'Failed to apply host-owned seat mute for %s',
+                        source_id,
+                    )
+                continue
+            if branch.mixer_sink_pad is None:
+                continue
+            try:
+                if branch.mixer_sink_pad.find_property('mute') is not None:
+                    branch.mixer_sink_pad.set_property('mute', effective_mute)
+                elif branch.mixer_sink_pad.find_property('volume') is not None:
+                    branch.mixer_sink_pad.set_property(
+                        'volume',
+                        0.0 if effective_mute else 1.0,
+                    )
+            except Exception:
+                logger.exception(
+                    'Failed to apply mixer-pad mute for host-owned seat %s',
+                    source_id,
+                )
+
     def _start_uri_sfu_egress(self, source_id: str) -> None:
         if source_id in self._sfu_egress:
             return
@@ -1528,6 +1563,8 @@ class CompositorPipeline:
             self._apply_layout_unlocked()
             # Pre-recorded / URI: same sourceId drives video hide + soundtrack mute.
             self._sync_uri_scene_audio_mute_unlocked()
+            # Screen / camera seats with mixer audio: mute when scene-hidden.
+            self._sync_host_owned_seat_audio_mute_unlocked()
 
     def set_layout(self, layout: str, *, graphics_state: dict | None = None) -> None:
         pending = graphics_state if graphics_state is not None else self._graphics._pending_state
@@ -2022,6 +2059,15 @@ class CompositorPipeline:
             signal_handlers=video_chain.signal_handlers + audio_chain.signal_handlers,
             video_scale=video_scale,
             video_mode='rtp',
+            audio_volume=next(
+                (
+                    element
+                    for element in audio_chain.elements
+                    if element.get_factory() is not None
+                    and element.get_factory().get_name() == 'volume'
+                ),
+                None,
+            ),
         )
 
         if video_chain.rtp_probe_pad is not None:

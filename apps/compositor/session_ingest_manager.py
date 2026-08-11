@@ -31,6 +31,12 @@ class VideoProducerRef:
     source_id: str | None = None
 
 
+@dataclass(frozen=True)
+class AudioProducerRef:
+    producer_id: str
+    source_id: str | None = None
+
+
 @dataclass
 class ParticipantIngestStatus:
     participant_peer_id: str
@@ -270,7 +276,7 @@ class SessionIngestManager:
 
             for peer_id in stage_roster:
                 peer_info = producers_by_peer.get(peer_id, {'peerId': peer_id, 'producers': []})
-                audio_id, videos = self._extract_av_producers(peer_info)
+                audio_id, extra_audios, videos = self._extract_av_producers(peer_info)
                 primary_video, extra_videos = self._split_primary_and_extra(videos)
                 display_name = self._display_names.get(peer_id, peer_id)
                 primary_video_id = primary_video.producer_id if primary_video else None
@@ -284,6 +290,7 @@ class SessionIngestManager:
                 self._sync_extra_seats(
                     peer_id=peer_id,
                     extra_videos=extra_videos,
+                    extra_audios=extra_audios,
                     display_name=display_name,
                 )
 
@@ -439,6 +446,7 @@ class SessionIngestManager:
         *,
         peer_id: str,
         extra_videos: list[VideoProducerRef],
+        extra_audios: dict[str, str],
         display_name: str,
     ) -> None:
         desired: dict[str, VideoProducerRef] = {}
@@ -464,51 +472,92 @@ class SessionIngestManager:
         for seat_id, video in desired.items():
             current = self._participants.get(seat_id)
             seat_name = display_name
+            audio_id = extra_audios.get(seat_id)
+
             if current is None:
                 if self._attach_in_backoff(seat_id):
                     continue
                 try:
-                    participant = self._consumer_service.attach_video_seat(
-                        seat_id,
-                        video.producer_id,
-                        owner_peer_id=peer_id,
-                        source_id=seat_id,
+                    participant = self._attach_extra_seat(
+                        seat_id=seat_id,
+                        peer_id=peer_id,
+                        video_id=video.producer_id,
+                        audio_id=audio_id,
                         display_name=seat_name,
-                        host_owned=True,
                     )
                     self._participants[seat_id] = participant
                     self._clear_attach_backoff(seat_id)
                 except Exception as exc:
                     self._note_attach_failure(seat_id, exc)
                     logger.exception(
-                        'Failed to attach extra video seat %s for peer %s',
+                        'Failed to attach extra seat %s for peer %s',
                         seat_id,
                         peer_id,
                     )
                 continue
 
-            if current.video_producer_id == video.producer_id and current.video_mode == 'rtp':
+            video_same = (
+                current.video_producer_id == video.producer_id
+                and current.video_mode == 'rtp'
+            )
+            audio_same = current.audio_producer_id == audio_id
+            # Video-only seats store audio_producer_id as None; treat missing
+            # source audio the same way.
+            if audio_id is None and not current.audio_producer_id:
+                audio_same = True
+
+            if video_same and audio_same:
                 continue
 
-            # Replace when producer id changes (device/scene switch).
+            # Replace when video/audio producer set changes (incl. audio appear/disappear).
             try:
                 self._consumer_service.detach_participant(current)
                 del self._participants[seat_id]
-                participant = self._consumer_service.attach_video_seat(
-                    seat_id,
-                    video.producer_id,
-                    owner_peer_id=peer_id,
-                    source_id=seat_id,
+                participant = self._attach_extra_seat(
+                    seat_id=seat_id,
+                    peer_id=peer_id,
+                    video_id=video.producer_id,
+                    audio_id=audio_id,
                     display_name=seat_name,
-                    host_owned=True,
                 )
                 self._participants[seat_id] = participant
             except Exception:
                 logger.exception(
-                    'Failed to replace extra video seat %s for peer %s',
+                    'Failed to replace extra seat %s for peer %s',
                     seat_id,
                     peer_id,
                 )
+
+    def _attach_extra_seat(
+        self,
+        *,
+        seat_id: str,
+        peer_id: str,
+        video_id: str,
+        audio_id: str | None,
+        display_name: str,
+    ) -> ParticipantIngest:
+        """Attach host-owned extra seat as A/V when source audio exists, else video-only."""
+        if audio_id:
+            participant = self._consumer_service.attach_participant(
+                seat_id,
+                audio_id,
+                video_id,
+                owner_peer_id=peer_id,
+                source_id=seat_id,
+                host_owned=True,
+            )
+            participant.display_name = display_name
+            return participant
+
+        return self._consumer_service.attach_video_seat(
+            seat_id,
+            video_id,
+            owner_peer_id=peer_id,
+            source_id=seat_id,
+            display_name=display_name,
+            host_owned=True,
+        )
 
     def _is_compositor_peer(self, peer_id: str) -> bool:
         return peer_id == self.compositor_peer_id or peer_id.startswith('compositor-')
@@ -740,8 +789,15 @@ class SessionIngestManager:
     @staticmethod
     def _extract_av_producers(
         peer_info: dict[str, Any],
-    ) -> tuple[str | None, list[VideoProducerRef]]:
+    ) -> tuple[str | None, dict[str, str], list[VideoProducerRef]]:
+        """
+        Split producers into primary mic audio, sourceId-tagged audios, and videos.
+
+        Primary mic: kind=audio, source=audio, no sourceId (host/guest seat).
+        Extra audio: kind=audio, source=audio, with sourceId (e.g. screen share).
+        """
         audio_id: str | None = None
+        extra_audios: dict[str, str] = {}
         videos: list[VideoProducerRef] = []
 
         for producer in peer_info.get('producers', []):
@@ -749,7 +805,16 @@ class SessionIngestManager:
             source = producer.get('source')
 
             if kind == 'audio' and source == 'audio':
-                audio_id = producer['producerId']
+                raw_source_id = producer.get('sourceId') or producer.get('source_id')
+                source_id = (
+                    str(raw_source_id).strip()
+                    if isinstance(raw_source_id, str) and raw_source_id.strip()
+                    else None
+                )
+                if source_id:
+                    extra_audios[source_id] = producer['producerId']
+                else:
+                    audio_id = producer['producerId']
             elif kind == 'video' and source in ('video', 'screensharing'):
                 raw_source_id = producer.get('sourceId') or producer.get('source_id')
                 source_id = (
@@ -765,7 +830,7 @@ class SessionIngestManager:
                     )
                 )
 
-        return audio_id, videos
+        return audio_id, extra_audios, videos
 
     @staticmethod
     def _split_primary_and_extra(
