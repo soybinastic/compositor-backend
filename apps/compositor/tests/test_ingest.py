@@ -788,3 +788,63 @@ class SessionIngestManagerTests(TestCase):
             display_name='Host',
         )
         mock_consumer_service.attach_video_seat.assert_not_called()
+
+    def test_set_tile_order_ensures_idle_screen_placeholder(self):
+        mock_consumer_service = MagicMock(spec=ConsumerService)
+        placeholder = MagicMock()
+        placeholder.participant_peer_id = 'screen-xyz'
+        placeholder.source_id = 'screen-xyz'
+        placeholder.video_mode = 'placeholder'
+        mock_consumer_service.attach_placeholder_seat.return_value = placeholder
+        manager = SessionIngestManager(
+            session_id='session-1',
+            room_id='session-1',
+            compositor_peer_id='compositor-session-1',
+            layout='CONTAIN',
+            consumer_service=mock_consumer_service,
+            compositor_pipeline=MagicMock(),
+        )
+
+        manager.set_tile_order(
+            host_peer_id='host-1',
+            scene_source_ids=['screen-xyz', 'camera-abc'],
+        )
+
+        mock_consumer_service.attach_placeholder_seat.assert_called_once_with(
+            'screen-xyz',
+            owner_peer_id='host-1',
+            source_id='screen-xyz',
+            display_name='Screen',
+            host_owned=True,
+        )
+        self.assertIs(manager._participants['screen-xyz'], placeholder)
+        # Camera cold placeholders are not created in this wave.
+        self.assertEqual(mock_consumer_service.attach_placeholder_seat.call_count, 1)
+
+    def test_set_tile_order_recreates_placeholder_after_prune_cycle(self):
+        mock_consumer_service = MagicMock(spec=ConsumerService)
+        screen = MagicMock()
+        screen.participant_peer_id = 'screen-xyz'
+        screen.owner_peer_id = 'host-1'
+        screen.source_id = 'screen-xyz'
+        screen.video_mode = 'placeholder'
+        placeholder = MagicMock()
+        placeholder.participant_peer_id = 'screen-xyz'
+        placeholder.source_id = 'screen-xyz'
+        mock_consumer_service.attach_placeholder_seat.return_value = placeholder
+        manager = SessionIngestManager(
+            session_id='session-1',
+            room_id='session-1',
+            compositor_peer_id='compositor-session-1',
+            layout='CONTAIN',
+            consumer_service=mock_consumer_service,
+            compositor_pipeline=MagicMock(),
+        )
+        manager._participants['screen-xyz'] = screen
+        manager.set_tile_order(host_peer_id='host-1', scene_source_ids=[])
+        mock_consumer_service.detach_participant.assert_called()
+        self.assertNotIn('screen-xyz', manager._participants)
+
+        manager.set_tile_order(host_peer_id='host-1', scene_source_ids=['screen-xyz'])
+        mock_consumer_service.attach_placeholder_seat.assert_called()
+        self.assertIn('screen-xyz', manager._participants)

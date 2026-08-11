@@ -128,6 +128,7 @@ class SessionIngestManager:
         # Source ids on the active scene (visible or eye-hidden). None = unknown
         # (do not prune idle seats until first SetTileOrder).
         self._scene_retained_source_ids: frozenset[str] | None = None
+        self._stage_host_peer_id: str | None = None
 
     @classmethod
     def create(
@@ -214,6 +215,8 @@ class SessionIngestManager:
         scene_source_ids: list[str] | None = None,
     ) -> None:
         with self._lock:
+            if host_peer_id:
+                self._stage_host_peer_id = host_peer_id
             if scene_source_ids is not None:
                 self._scene_retained_source_ids = frozenset(
                     sid.strip()
@@ -221,6 +224,7 @@ class SessionIngestManager:
                     if isinstance(sid, str) and sid.strip()
                 )
                 self._prune_extra_seats_not_on_scene_unlocked()
+                self._ensure_idle_screen_placeholders_unlocked()
         self._compositor_pipeline.set_tile_order(
             host_peer_id=host_peer_id,
             slot_assignments=slot_assignments,
@@ -625,6 +629,41 @@ class SessionIngestManager:
             except Exception:
                 logger.exception(
                     'Failed to prune extra seat %s after scene detach',
+                    seat_id,
+                )
+
+    def _ensure_idle_screen_placeholders_unlocked(self) -> None:
+        """Cold-attach placeholder seats for on-scene screen sources without RTP."""
+        retained = self._scene_retained_source_ids
+        if retained is None:
+            return
+        host_peer_id = self._stage_host_peer_id
+        if not host_peer_id:
+            return
+        for seat_id in retained:
+            if not seat_id.startswith('screen'):
+                continue
+            if seat_id in self._participants:
+                continue
+            if self._attach_in_backoff(seat_id):
+                continue
+            try:
+                participant = self._consumer_service.attach_placeholder_seat(
+                    seat_id,
+                    owner_peer_id=host_peer_id,
+                    source_id=seat_id,
+                    display_name=self._extra_seat_placeholder_label(
+                        seat_id,
+                        self._display_names.get(host_peer_id, host_peer_id),
+                    ),
+                    host_owned=True,
+                )
+                self._participants[seat_id] = participant
+                self._clear_attach_backoff(seat_id)
+            except Exception as exc:
+                self._note_attach_failure(seat_id, exc)
+                logger.exception(
+                    'Failed to attach idle screen placeholder for %s',
                     seat_id,
                 )
 

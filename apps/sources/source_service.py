@@ -131,6 +131,7 @@ class SourceService:
         volume: float | None = None,
         muted: bool | None = None,
         settings: dict[str, Any] | None = None,
+        state: str | None = None,
     ) -> SourceResult:
         row = self._get_row(session_id, source_id)
         update_fields = ['updated_at']
@@ -144,10 +145,18 @@ class SourceService:
             row.muted = bool(muted)
             update_fields.append('muted')
         if settings is not None:
+            # null values clear keys (needed for producerId / audioProducerId on stop).
             merged = dict(row.settings or {})
-            merged.update(settings)
+            for key, value in settings.items():
+                if value is None:
+                    merged.pop(key, None)
+                else:
+                    merged[key] = value
             row.settings = merged
             update_fields.append('settings')
+        if state is not None:
+            row.mark_state(state)
+            update_fields.extend(['state', 'stopped_at'])
         row.save(update_fields=update_fields)
 
         if row.type == SourceType.PRERECORDED and (

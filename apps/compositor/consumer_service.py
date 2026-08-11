@@ -363,6 +363,55 @@ class ConsumerService:
             self._room_id,
         )
 
+    def attach_placeholder_seat(
+        self,
+        seat_id: str,
+        *,
+        owner_peer_id: str,
+        source_id: str,
+        display_name: str = '',
+        host_owned: bool = True,
+    ) -> ParticipantIngest:
+        """
+        Cold idle host-owned seat (no mediasoup consumers yet).
+
+        Reserves video RTP ports so a later soft_enable can bind live share
+        without reallocating the layout pad.
+        """
+        ports = self._port_allocator.allocate_video_seat_ports(seat_id)
+        committed = False
+        try:
+            name = display_name or seat_id
+            self._compositor_pipeline.add_placeholder_participant(
+                seat_id,
+                display_name=name,
+                host_owned=host_owned,
+            )
+            participant = ParticipantIngest(
+                participant_peer_id=seat_id,
+                audio_producer_id=None,
+                video_producer_id=None,
+                ports=ports,
+                audio_consumer_id=None,
+                video_consumer_id=None,
+                video_mode='placeholder',
+                display_name=name,
+                owner_peer_id=owner_peer_id,
+                source_id=source_id,
+            )
+            committed = True
+            logger.info(
+                'Attached idle placeholder seat %s (owner=%s source=%s) in room %s',
+                seat_id,
+                owner_peer_id,
+                source_id,
+                self._room_id,
+            )
+            return participant
+        finally:
+            if not committed:
+                self._port_allocator.release_participant_ports(ports)
+
     def soft_enable_video(
         self,
         participant: ParticipantIngest,

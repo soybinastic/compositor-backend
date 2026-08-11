@@ -47,6 +47,10 @@ class UpdateSourceSerializer(serializers.Serializer):
     settings = serializers.DictField(required=False)
     volume = serializers.FloatField(required=False, min_value=0.0, max_value=1.0)
     muted = serializers.BooleanField(required=False)
+    state = serializers.ChoiceField(
+        choices=['LOADING', 'ACTIVE', 'PAUSED', 'STOPPED'],
+        required=False,
+    )
 
 
 class SourceSerializer(serializers.Serializer):
