@@ -58,10 +58,22 @@ class PortAllocatorTests(TestCase):
     def test_release_and_reuse_ports(self):
         allocator = PortAllocator(min_port=50000, max_port=50010)
         ports = allocator.allocate_participant_ports('peer-a')
+        assert ports.audio is not None
         rtp_port = ports.audio.rtp_port
         allocator.release_participant_ports(ports)
         ports_b = allocator.allocate_participant_ports('peer-b')
+        assert ports_b.audio is not None
         self.assertEqual(ports_b.audio.rtp_port, rtp_port)
+
+    def test_video_seat_allocates_video_only(self):
+        allocator = PortAllocator(min_port=50000, max_port=50007)
+        seat = allocator.allocate_video_seat_ports('camera-1')
+        self.assertIsNone(seat.audio)
+        # Four ports remain for one full A/V participant.
+        full = allocator.allocate_participant_ports('peer-a')
+        self.assertIsNotNone(full.audio)
+        allocator.release_participant_ports(seat)
+        allocator.release_participant_ports(full)
 
 
 class RtpCapabilitiesTests(TestCase):

@@ -104,142 +104,148 @@ class ConsumerService:
         host_owned: bool = False,
     ) -> ParticipantIngest:
         ports = self._port_allocator.allocate_participant_ports(participant_peer_id)
-
-        audio_transport = self._client.create_plain_transport(
-            self._room_id,
-            self._compositor_peer_id,
-            rtcp_mux=False,
-        )
-        video_transport = self._client.create_plain_transport(
-            self._room_id,
-            self._compositor_peer_id,
-            rtcp_mux=False,
-        )
-
-        self._client.connect_plain_transport(
-            self._room_id,
-            self._compositor_peer_id,
-            audio_transport['transportId'],
-            ip=self._rtp_host,
-            port=ports.audio.rtp_port,
-            rtcp_port=ports.audio.rtcp_port,
-            rtcp_mux=False,
-        )
-        self._client.connect_plain_transport(
-            self._room_id,
-            self._compositor_peer_id,
-            video_transport['transportId'],
-            ip=self._rtp_host,
-            port=ports.video.rtp_port,
-            rtcp_port=ports.video.rtcp_port,
-            rtcp_mux=False,
-        )
-
-        self._ensure_joined()
-
-        # Create paused so we can read wire payload types before GStreamer listens,
-        # then resume only after udpsrc caps match consumer rtpParameters.
-        audio_consumer = self._client.create_consumer(
-            self._room_id,
-            self._compositor_peer_id,
-            transport_id=audio_transport['transportId'],
-            producer_id=audio_producer_id,
-            rtp_capabilities=build_audio_rtp_capabilities(self._audio_payload_type),
-            paused=True,
-        )
-        video_consumer = self._client.create_consumer(
-            self._room_id,
-            self._compositor_peer_id,
-            transport_id=video_transport['transportId'],
-            producer_id=video_producer_id,
-            rtp_capabilities=build_video_rtp_capabilities(self._video_payload_type),
-            paused=True,
-        )
-
-        if 'rtpParameters' not in audio_consumer or 'rtpParameters' not in video_consumer:
-            raise RuntimeError(
-                'mediasoup consume response missing rtpParameters '
-                f'(audio keys={list(audio_consumer.keys())}, '
-                f'video keys={list(video_consumer.keys())}). '
-                'Restart mediasoup-backend after rebuilding TypeScript '
-                '(npm run typescript:build && ./start.sh).'
+        committed = False
+        try:
+            audio_transport = self._client.create_plain_transport(
+                self._room_id,
+                self._compositor_peer_id,
+                rtcp_mux=False,
+            )
+            video_transport = self._client.create_plain_transport(
+                self._room_id,
+                self._compositor_peer_id,
+                rtcp_mux=False,
             )
 
-        audio_wire_pt = get_payload_type_from_rtp_parameters(
-            audio_consumer['rtpParameters']
-        )
-        video_wire_pt = get_payload_type_from_rtp_parameters(
-            video_consumer['rtpParameters']
-        )
+            assert ports.audio is not None
+            self._client.connect_plain_transport(
+                self._room_id,
+                self._compositor_peer_id,
+                audio_transport['transportId'],
+                ip=self._rtp_host,
+                port=ports.audio.rtp_port,
+                rtcp_port=ports.audio.rtcp_port,
+                rtcp_mux=False,
+            )
+            self._client.connect_plain_transport(
+                self._room_id,
+                self._compositor_peer_id,
+                video_transport['transportId'],
+                ip=self._rtp_host,
+                port=ports.video.rtp_port,
+                rtcp_port=ports.video.rtcp_port,
+                rtcp_mux=False,
+            )
 
-        logger.info(
-            'Consumer wire payload types for peer %s: audio=%s (router=%s) video=%s (router=%s)',
-            participant_peer_id,
-            audio_wire_pt,
-            self._audio_payload_type,
-            video_wire_pt,
-            self._video_payload_type,
-        )
+            self._ensure_joined()
 
-        self._compositor_pipeline.add_participant(
-            participant_peer_id,
-            audio_port=ports.audio.rtp_port,
-            video_port=ports.video.rtp_port,
-            audio_rtcp_port=ports.audio.rtcp_port,
-            video_rtcp_port=ports.video.rtcp_port,
-            audio_payload_type=audio_wire_pt,
-            video_payload_type=video_wire_pt,
-            audio_mediasoup_transport=_plain_transport_tuple(audio_transport),
-            video_mediasoup_transport=_plain_transport_tuple(video_transport),
-            rtcp_mux=False,
-            host_owned=host_owned,
-        )
+            # Create paused so we can read wire payload types before GStreamer listens,
+            # then resume only after udpsrc caps match consumer rtpParameters.
+            audio_consumer = self._client.create_consumer(
+                self._room_id,
+                self._compositor_peer_id,
+                transport_id=audio_transport['transportId'],
+                producer_id=audio_producer_id,
+                rtp_capabilities=build_audio_rtp_capabilities(self._audio_payload_type),
+                paused=True,
+            )
+            video_consumer = self._client.create_consumer(
+                self._room_id,
+                self._compositor_peer_id,
+                transport_id=video_transport['transportId'],
+                producer_id=video_producer_id,
+                rtp_capabilities=build_video_rtp_capabilities(self._video_payload_type),
+                paused=True,
+            )
 
-        self._client.resume_consumer(
-            self._room_id,
-            self._compositor_peer_id,
-            audio_consumer['consumerId'],
-        )
-        self._client.resume_consumer(
-            self._room_id,
-            self._compositor_peer_id,
-            video_consumer['consumerId'],
-        )
+            if 'rtpParameters' not in audio_consumer or 'rtpParameters' not in video_consumer:
+                raise RuntimeError(
+                    'mediasoup consume response missing rtpParameters '
+                    f'(audio keys={list(audio_consumer.keys())}, '
+                    f'video keys={list(video_consumer.keys())}). '
+                    'Restart mediasoup-backend after rebuilding TypeScript '
+                    '(npm run typescript:build && ./start.sh).'
+                )
 
-        owner = owner_peer_id or participant_peer_id
-        participant = ParticipantIngest(
-            participant_peer_id=participant_peer_id,
-            audio_producer_id=audio_producer_id,
-            video_producer_id=video_producer_id,
-            ports=ports,
-            audio_consumer_id=audio_consumer['consumerId'],
-            video_consumer_id=video_consumer['consumerId'],
-            video_mode='rtp',
-            owner_peer_id=owner,
-            source_id=source_id,
-        )
-        self._schedule_video_keyframe_retries(participant)
+            audio_wire_pt = get_payload_type_from_rtp_parameters(
+                audio_consumer['rtpParameters']
+            )
+            video_wire_pt = get_payload_type_from_rtp_parameters(
+                video_consumer['rtpParameters']
+            )
 
-        logger.info(
-            'Attached ingest for participant %s in room %s '
-            '(audio=%s:%s/%s->%s:%s video=%s:%s/%s->%s:%s producers audio=%s video=%s)',
-            participant_peer_id,
-            self._room_id,
-            self._rtp_host,
-            ports.audio.rtp_port,
-            ports.audio.rtcp_port,
-            audio_transport['ip'],
-            audio_transport.get('rtcpPort', audio_transport['port']),
-            self._rtp_host,
-            ports.video.rtp_port,
-            ports.video.rtcp_port,
-            video_transport['ip'],
-            video_transport.get('rtcpPort', video_transport['port']),
-            audio_producer_id,
-            video_producer_id,
-        )
+            logger.info(
+                'Consumer wire payload types for peer %s: audio=%s (router=%s) video=%s (router=%s)',
+                participant_peer_id,
+                audio_wire_pt,
+                self._audio_payload_type,
+                video_wire_pt,
+                self._video_payload_type,
+            )
 
-        return participant
+            self._compositor_pipeline.add_participant(
+                participant_peer_id,
+                audio_port=ports.audio.rtp_port,
+                video_port=ports.video.rtp_port,
+                audio_rtcp_port=ports.audio.rtcp_port,
+                video_rtcp_port=ports.video.rtcp_port,
+                audio_payload_type=audio_wire_pt,
+                video_payload_type=video_wire_pt,
+                audio_mediasoup_transport=_plain_transport_tuple(audio_transport),
+                video_mediasoup_transport=_plain_transport_tuple(video_transport),
+                rtcp_mux=False,
+                host_owned=host_owned,
+            )
+
+            self._client.resume_consumer(
+                self._room_id,
+                self._compositor_peer_id,
+                audio_consumer['consumerId'],
+            )
+            self._client.resume_consumer(
+                self._room_id,
+                self._compositor_peer_id,
+                video_consumer['consumerId'],
+            )
+
+            owner = owner_peer_id or participant_peer_id
+            participant = ParticipantIngest(
+                participant_peer_id=participant_peer_id,
+                audio_producer_id=audio_producer_id,
+                video_producer_id=video_producer_id,
+                ports=ports,
+                audio_consumer_id=audio_consumer['consumerId'],
+                video_consumer_id=video_consumer['consumerId'],
+                video_mode='rtp',
+                owner_peer_id=owner,
+                source_id=source_id,
+            )
+            self._schedule_video_keyframe_retries(participant)
+
+            logger.info(
+                'Attached ingest for participant %s in room %s '
+                '(audio=%s:%s/%s->%s:%s video=%s:%s/%s->%s:%s producers audio=%s video=%s)',
+                participant_peer_id,
+                self._room_id,
+                self._rtp_host,
+                ports.audio.rtp_port,
+                ports.audio.rtcp_port,
+                audio_transport['ip'],
+                audio_transport.get('rtcpPort', audio_transport['port']),
+                self._rtp_host,
+                ports.video.rtp_port,
+                ports.video.rtcp_port,
+                video_transport['ip'],
+                video_transport.get('rtcpPort', video_transport['port']),
+                audio_producer_id,
+                video_producer_id,
+            )
+
+            committed = True
+            return participant
+        finally:
+            if not committed:
+                self._port_allocator.release_participant_ports(ports)
 
     def attach_video_seat(
         self,
@@ -252,83 +258,88 @@ class ConsumerService:
         host_owned: bool = True,
     ) -> ParticipantIngest:
         """Attach an extra video-only seat (multi-camera / screen Source)."""
-        ports = self._port_allocator.allocate_participant_ports(seat_id)
-
-        video_transport = self._client.create_plain_transport(
-            self._room_id,
-            self._compositor_peer_id,
-            rtcp_mux=False,
-        )
-        self._client.connect_plain_transport(
-            self._room_id,
-            self._compositor_peer_id,
-            video_transport['transportId'],
-            ip=self._rtp_host,
-            port=ports.video.rtp_port,
-            rtcp_port=ports.video.rtcp_port,
-            rtcp_mux=False,
-        )
-
-        self._ensure_joined()
-
-        video_consumer = self._client.create_consumer(
-            self._room_id,
-            self._compositor_peer_id,
-            transport_id=video_transport['transportId'],
-            producer_id=video_producer_id,
-            rtp_capabilities=build_video_rtp_capabilities(self._video_payload_type),
-            paused=True,
-        )
-        if 'rtpParameters' not in video_consumer:
-            raise RuntimeError(
-                'mediasoup consume response missing rtpParameters for video seat '
-                f'(keys={list(video_consumer.keys())})'
+        ports = self._port_allocator.allocate_video_seat_ports(seat_id)
+        committed = False
+        try:
+            video_transport = self._client.create_plain_transport(
+                self._room_id,
+                self._compositor_peer_id,
+                rtcp_mux=False,
+            )
+            self._client.connect_plain_transport(
+                self._room_id,
+                self._compositor_peer_id,
+                video_transport['transportId'],
+                ip=self._rtp_host,
+                port=ports.video.rtp_port,
+                rtcp_port=ports.video.rtcp_port,
+                rtcp_mux=False,
             )
 
-        video_wire_pt = get_payload_type_from_rtp_parameters(
-            video_consumer['rtpParameters']
-        )
+            self._ensure_joined()
 
-        self._compositor_pipeline.add_video_only_participant(
-            seat_id,
-            video_port=ports.video.rtp_port,
-            video_rtcp_port=ports.video.rtcp_port,
-            video_payload_type=video_wire_pt,
-            video_mediasoup_transport=_plain_transport_tuple(video_transport),
-            rtcp_mux=False,
-            host_owned=host_owned,
-            display_name=display_name,
-        )
+            video_consumer = self._client.create_consumer(
+                self._room_id,
+                self._compositor_peer_id,
+                transport_id=video_transport['transportId'],
+                producer_id=video_producer_id,
+                rtp_capabilities=build_video_rtp_capabilities(self._video_payload_type),
+                paused=True,
+            )
+            if 'rtpParameters' not in video_consumer:
+                raise RuntimeError(
+                    'mediasoup consume response missing rtpParameters for video seat '
+                    f'(keys={list(video_consumer.keys())})'
+                )
 
-        self._client.resume_consumer(
-            self._room_id,
-            self._compositor_peer_id,
-            video_consumer['consumerId'],
-        )
+            video_wire_pt = get_payload_type_from_rtp_parameters(
+                video_consumer['rtpParameters']
+            )
 
-        participant = ParticipantIngest(
-            participant_peer_id=seat_id,
-            audio_producer_id=None,
-            video_producer_id=video_producer_id,
-            ports=ports,
-            audio_consumer_id=None,
-            video_consumer_id=video_consumer['consumerId'],
-            video_mode='rtp',
-            display_name=display_name,
-            owner_peer_id=owner_peer_id,
-            source_id=source_id,
-        )
-        self._schedule_video_keyframe_retries(participant)
+            self._compositor_pipeline.add_video_only_participant(
+                seat_id,
+                video_port=ports.video.rtp_port,
+                video_rtcp_port=ports.video.rtcp_port,
+                video_payload_type=video_wire_pt,
+                video_mediasoup_transport=_plain_transport_tuple(video_transport),
+                rtcp_mux=False,
+                host_owned=host_owned,
+                display_name=display_name,
+            )
 
-        logger.info(
-            'Attached video-only seat %s (owner=%s source=%s video=%s) in room %s',
-            seat_id,
-            owner_peer_id,
-            source_id,
-            video_producer_id,
-            self._room_id,
-        )
-        return participant
+            self._client.resume_consumer(
+                self._room_id,
+                self._compositor_peer_id,
+                video_consumer['consumerId'],
+            )
+
+            participant = ParticipantIngest(
+                participant_peer_id=seat_id,
+                audio_producer_id=None,
+                video_producer_id=video_producer_id,
+                ports=ports,
+                audio_consumer_id=None,
+                video_consumer_id=video_consumer['consumerId'],
+                video_mode='rtp',
+                display_name=display_name,
+                owner_peer_id=owner_peer_id,
+                source_id=source_id,
+            )
+            self._schedule_video_keyframe_retries(participant)
+
+            logger.info(
+                'Attached video-only seat %s (owner=%s source=%s video=%s) in room %s',
+                seat_id,
+                owner_peer_id,
+                source_id,
+                video_producer_id,
+                self._room_id,
+            )
+            committed = True
+            return participant
+        finally:
+            if not committed:
+                self._port_allocator.release_participant_ports(ports)
 
     def soft_disable_video(
         self,
@@ -495,11 +506,18 @@ class ConsumerService:
     def get_participant_stats(self, participant_peer_id: str) -> IngestStats | None:
         return self._compositor_pipeline.get_participant_stats(participant_peer_id)
 
+    def mark_joined(self) -> None:
+        """Record that the compositor peer is already joined (e.g. via URI SFU)."""
+        self._joined = True
+
     def _ensure_joined(self) -> None:
         if self._joined:
             return
 
-        self._client.join_broadcaster(self._room_id, self._compositor_peer_id)
+        self._client.ensure_broadcaster_joined(
+            self._room_id,
+            self._compositor_peer_id,
+        )
         self._joined = True
 
 

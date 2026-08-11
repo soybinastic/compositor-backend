@@ -97,6 +97,15 @@ class SourceService:
                     session_id=str(session_id),
                     display_name=display_name,
                 )
+                if source_type == SourceType.PRERECORDED and hasattr(
+                    handler, 'apply_playback'
+                ):
+                    handler.apply_playback(
+                        source_id,
+                        session_id=str(session_id),
+                        volume=row.volume,
+                        muted=row.muted,
+                    )
                 row.mark_state(SourceState.ACTIVE)
                 row.save(update_fields=['state', 'stopped_at', 'updated_at'])
             except NotImplementedError as exc:

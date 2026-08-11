@@ -78,6 +78,7 @@ def dispatch_command(ingest_manager: SessionIngestManager, command: SessionComma
             url=command.url,
             display_name=command.display_name,
             produce_to_sfu=command.produce_to_sfu,
+            loop=True if command.loop is None else bool(command.loop),
         )
         return None
 

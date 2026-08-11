@@ -18,15 +18,16 @@ class PortPair:
 @dataclass(frozen=True)
 class ParticipantPorts:
     participant_peer_id: str
-    audio: PortPair
     video: PortPair
+    # None for video-only seats (extra camera / screen).
+    audio: PortPair | None = None
 
 
 class PortAllocator:
     """
     Allocates non-overlapping RTP/RTCP port pairs per participant.
 
-    Each participant needs two pairs: audio (rtp+rtcp) and video (rtp+rtcp).
+    Full A/V seats need two pairs (audio + video). Video-only seats need one.
     """
 
     def __init__(
@@ -51,9 +52,22 @@ class PortAllocator:
                 video=video,
             )
 
+    def allocate_video_seat_ports(self, participant_peer_id: str) -> ParticipantPorts:
+        """Reserve only a video RTP/RTCP pair for multi-camera / screen seats."""
+        with self._lock:
+            video = self._allocate_pair()
+            return ParticipantPorts(
+                participant_peer_id=participant_peer_id,
+                audio=None,
+                video=video,
+            )
+
     def release_participant_ports(self, ports: ParticipantPorts) -> None:
         with self._lock:
-            for pair in (ports.audio, ports.video):
+            pairs = [ports.video]
+            if ports.audio is not None:
+                pairs.append(ports.audio)
+            for pair in pairs:
                 self._allocated.discard(pair.rtp_port)
                 self._allocated.discard(pair.rtcp_port)
                 self._free_pairs.append(pair)
