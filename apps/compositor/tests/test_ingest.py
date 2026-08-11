@@ -733,7 +733,7 @@ class SessionIngestManagerTests(TestCase):
         mock_consumer_service.detach_participant.assert_called()
         self.assertNotIn('screen-xyz', manager._participants)
 
-    def test_sync_extra_seat_soft_enables_when_share_resumes(self):
+    def test_sync_extra_seat_full_reattaches_screen_when_share_resumes(self):
         mock_consumer_service = MagicMock(spec=ConsumerService)
         primary = MagicMock()
         primary.participant_peer_id = 'host-1'
@@ -749,7 +749,12 @@ class SessionIngestManagerTests(TestCase):
         screen.video_producer_id = None
         screen.audio_producer_id = None
         screen.video_mode = 'placeholder'
+        live_screen = MagicMock()
+        live_screen.participant_peer_id = 'screen-xyz'
+        live_screen.source_id = 'screen-xyz'
+        live_screen.video_mode = 'rtp'
         mock_consumer_service.attach_participant.return_value = primary
+        mock_consumer_service.attach_video_seat.return_value = live_screen
         manager = SessionIngestManager(
             session_id='session-1',
             room_id='session-1',
@@ -782,13 +787,62 @@ class SessionIngestManagerTests(TestCase):
             joined_peers=[{'peerId': 'host-1', 'displayName': 'Host'}],
         )
 
-        mock_consumer_service.soft_enable_video.assert_called_once_with(
-            screen,
+        mock_consumer_service.soft_enable_video.assert_not_called()
+        mock_consumer_service.detach_participant.assert_called_with(screen)
+        mock_consumer_service.attach_video_seat.assert_called_once_with(
+            'screen-xyz',
             'video-screen-2',
+            owner_peer_id='host-1',
+            source_id='screen-xyz',
             display_name='Host',
+            host_owned=True,
         )
-        mock_consumer_service.attach_video_seat.assert_not_called()
+        self.assertIs(manager._participants['screen-xyz'], live_screen)
 
+    def test_sync_skips_extra_seat_not_on_active_scene(self):
+        mock_consumer_service = MagicMock(spec=ConsumerService)
+        primary = MagicMock()
+        primary.participant_peer_id = 'host-1'
+        primary.audio_producer_id = 'audio-1'
+        primary.video_producer_id = 'video-main'
+        primary.video_mode = 'rtp'
+        primary.owner_peer_id = 'host-1'
+        primary.source_id = None
+        mock_consumer_service.attach_participant.return_value = primary
+        manager = SessionIngestManager(
+            session_id='session-1',
+            room_id='session-1',
+            compositor_peer_id='compositor-session-1',
+            layout='CONTAIN',
+            consumer_service=mock_consumer_service,
+            compositor_pipeline=MagicMock(),
+        )
+        manager._participants['host-1'] = primary
+        # Scene has screen only — detached camera must not be re-promoted.
+        manager.set_tile_order(scene_source_ids=['screen-xyz'])
+
+        manager.sync_producers(
+            [
+                {
+                    'peerId': 'host-1',
+                    'displayName': 'Host',
+                    'producers': [
+                        {'producerId': 'audio-1', 'kind': 'audio', 'source': 'audio'},
+                        {'producerId': 'video-main', 'kind': 'video', 'source': 'video'},
+                        {
+                            'producerId': 'video-cam-extra',
+                            'kind': 'video',
+                            'source': 'video',
+                            'sourceId': 'camera-extra',
+                        },
+                    ],
+                }
+            ],
+            joined_peers=[{'peerId': 'host-1', 'displayName': 'Host'}],
+        )
+
+        mock_consumer_service.attach_video_seat.assert_not_called()
+        self.assertNotIn('camera-extra', manager._participants)
     def test_set_tile_order_ensures_idle_screen_placeholder(self):
         mock_consumer_service = MagicMock(spec=ConsumerService)
         placeholder = MagicMock()

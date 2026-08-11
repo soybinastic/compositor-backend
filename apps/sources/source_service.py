@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -27,6 +28,8 @@ from apps.sources.handlers import (
     get_source_handler_factory,
 )
 from apps.sources.models import SessionSource, SourceState, SourceType
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -330,6 +333,9 @@ class SourceService:
         scene.save(update_fields=['sources_config', 'updated_at'])
 
         # Push scene visibility / assignments into the live mixer.
+        # Config is already saved — do not fail the request if the worker is down
+        # or SetTileOrder times out (command may still be queued). Log so preview
+        # vs program drift is diagnosable.
         try:
             from apps.compositor.tile_order_sync import send_tile_order_command
 
@@ -337,7 +343,10 @@ class SourceService:
             if session is not None:
                 send_tile_order_command(session, scene=scene)
         except Exception:
-            pass
+            logger.exception(
+                'Failed to push tile order after scene items update (scene=%s)',
+                getattr(scene, 'id', None),
+            )
 
         return config
 
