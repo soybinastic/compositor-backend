@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from apps.compositor.commands import (
     AddRtmpSourceCommand,
+    AddUriVideoSourceCommand,
     ChangeLayoutCommand,
     GetStatusCommand,
     RemoveRtmpSourceCommand,
+    RemoveUriVideoSourceCommand,
     SetTileOrderCommand,
     SessionCommand,
     StartCountdownCommand,
@@ -17,6 +19,7 @@ from apps.compositor.commands import (
     StopStreamCommand,
     SyncProducersCommand,
     UpdateGraphicsCommand,
+    UpdateUriVideoPlaybackCommand,
 )
 from apps.compositor.session_ingest_manager import SessionIngestManager
 
@@ -69,6 +72,31 @@ def dispatch_command(ingest_manager: SessionIngestManager, command: SessionComma
         ingest_manager.remove_rtmp_source(command.source_id)
         return None
 
+    if isinstance(command, AddUriVideoSourceCommand):
+        ingest_manager.add_uri_video_source(
+            source_id=command.source_id,
+            url=command.url,
+            display_name=command.display_name,
+            produce_to_sfu=command.produce_to_sfu,
+            loop=True if command.loop is None else bool(command.loop),
+        )
+        return None
+
+    if isinstance(command, RemoveUriVideoSourceCommand):
+        ingest_manager.remove_uri_video_source(command.source_id)
+        return None
+
+    if isinstance(command, UpdateUriVideoPlaybackCommand):
+        ingest_manager.update_uri_video_playback(
+            source_id=command.source_id,
+            action=command.action,
+            position_ms=command.position_ms,
+            loop=command.loop,
+            volume=command.volume,
+            muted=command.muted,
+        )
+        return None
+
     if isinstance(command, SyncProducersCommand):
         ingest_manager.sync_producers(
             command.peer_producers_infos,
@@ -95,6 +123,7 @@ def dispatch_command(ingest_manager: SessionIngestManager, command: SessionComma
             host_peer_id=command.host_peer_id,
             slot_assignments=command.slot_assignments,
             hidden_source_ids=command.hidden_source_ids,
+            scene_source_ids=command.scene_source_ids,
         )
         return None
 

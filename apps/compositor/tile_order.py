@@ -177,6 +177,79 @@ def sanitize_hidden_source_ids(raw: list | None) -> list[str]:
     return result
 
 
+def attached_source_ids_from_scene_items(items: list | None) -> list[str]:
+    """Source ids present on a scene (visible or hidden SceneItems)."""
+    if not items:
+        return []
+    attached: list[str] = []
+    seen: set[str] = set()
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        source_id = raw.get('sourceId') or raw.get('source_id')
+        if not isinstance(source_id, str):
+            continue
+        source_id = source_id.strip()
+        if not source_id or source_id in seen:
+            continue
+        seen.add(source_id)
+        attached.append(source_id)
+    return attached
+
+
+def hidden_source_ids_from_scene_items(items: list | None) -> list[str]:
+    """Source ids with SceneItem.visible == false (program out must hide these)."""
+    if not items:
+        return []
+    hidden: list[str] = []
+    seen: set[str] = set()
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        if raw.get('visible', True) is not False:
+            continue
+        source_id = raw.get('sourceId') or raw.get('source_id')
+        if not isinstance(source_id, str):
+            continue
+        source_id = source_id.strip()
+        if not source_id or source_id in seen:
+            continue
+        seen.add(source_id)
+        hidden.append(source_id)
+    return hidden
+
+
+def hidden_session_sources_not_on_scene(
+    session_source_ids: list[str] | None,
+    items: list | None,
+) -> list[str]:
+    """
+    Session-registry Source ids that are not attached to the active scene.
+
+    Still-producing Sources from another scene must stay off program out when
+    the active scene does not list them (produce may continue; mix hides them).
+    """
+    attached = set(attached_source_ids_from_scene_items(items))
+    return [
+        source_id
+        for source_id in sanitize_hidden_source_ids(session_source_ids)
+        if source_id not in attached
+    ]
+
+
+def merge_hidden_source_ids(*groups: list[str] | None) -> list[str]:
+    """Union of hidden id lists, stable order (first occurrence wins)."""
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for source_id in sanitize_hidden_source_ids(group):
+            if source_id in seen:
+                continue
+            seen.add(source_id)
+            merged.append(source_id)
+    return merged
+
+
 def merge_tile_order_config(
     incoming: dict | None,
     existing: dict | None = None,
@@ -201,6 +274,52 @@ def merge_tile_order_config(
     return merged
 
 
+def sync_items_z_index_from_assignments(
+    items: list | None,
+    assignments: dict | None,
+) -> list:
+    """
+    Re-pack SceneItem zIndex to follow slot assignment order.
+
+    Source ids present only in assignments (e.g. peer seats) are ignored.
+    Items missing from assignments keep relative order at the end.
+    """
+    if not items:
+        return []
+    normalized_items = [item for item in items if isinstance(item, dict)]
+    if not normalized_items:
+        return []
+
+    by_source: dict[str, dict] = {}
+    for item in normalized_items:
+        source_id = item.get('sourceId') or item.get('source_id')
+        if isinstance(source_id, str) and source_id.strip() and source_id not in by_source:
+            by_source[source_id] = item
+
+    ordered: list[dict] = []
+    used: set[str] = set()
+    for _slot, source_id in sorted(
+        normalize_slot_assignments(assignments).items(),
+        key=lambda pair: pair[0],
+    ):
+        item = by_source.get(source_id)
+        if item is None or source_id in used:
+            continue
+        ordered.append(item)
+        used.add(source_id)
+
+    for item in normalized_items:
+        source_id = item.get('sourceId') or item.get('source_id')
+        if not isinstance(source_id, str) or source_id in used:
+            continue
+        ordered.append(item)
+        used.add(source_id)
+
+    for index, item in enumerate(ordered):
+        item['zIndex'] = index
+    return ordered
+
+
 def merge_sources_config(
     incoming: dict | None,
     existing: dict | None = None,
@@ -212,18 +331,61 @@ def merge_sources_config(
         merged.update(existing)
         if 'assignments' not in merged:
             merged['assignments'] = {}
+        if 'items' not in merged:
+            merged['items'] = []
     if not incoming:
         return merged
     if 'version' in incoming and isinstance(incoming['version'], int):
         merged['version'] = incoming['version']
     if 'sources' in incoming and isinstance(incoming['sources'], list):
         merged['sources'] = incoming['sources']
+    items_replaced = False
+    if 'items' in incoming and isinstance(incoming['items'], list):
+        merged['items'] = incoming['items']
+        items_replaced = True
+        if merged.get('version', 1) < 2:
+            merged['version'] = 2
+        # When items are provided without explicit assignments, derive slots.
+        if 'assignments' not in incoming:
+            merged['assignments'] = assignments_from_scene_items(incoming['items'])
     if 'assignments' in incoming:
         raw_assignments = incoming.get('assignments')
         if raw_assignments == {}:
             merged['assignments'] = {}
+        elif items_replaced:
+            # Full scene-items rewrite: replace slots so detached sources cannot linger.
+            merged['assignments'] = sanitize_assignments_for_storage(raw_assignments)
         else:
             combined = sanitize_assignments_for_storage(merged.get('assignments'))
             combined.update(sanitize_assignments_for_storage(raw_assignments))
             merged['assignments'] = combined
+            # People-panel / assignments-only PATCH: keep Sources list order in sync.
+            merged['items'] = sync_items_z_index_from_assignments(
+                merged.get('items'),
+                merged['assignments'],
+            )
+            if merged.get('version', 1) < 2:
+                merged['version'] = 2
     return merged
+
+
+def assignments_from_scene_items(items: list | None) -> dict[str, str]:
+    """Build slot assignments from visible SceneItems ordered by zIndex."""
+    if not items:
+        return {}
+    ordered: list[dict] = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        if raw.get('visible', True) is False:
+            continue
+        source_id = raw.get('sourceId') or raw.get('source_id')
+        if not source_id:
+            continue
+        try:
+            z_index = int(raw.get('zIndex', raw.get('z_index', 0)))
+        except (TypeError, ValueError):
+            z_index = 0
+        ordered.append({'sourceId': str(source_id), 'zIndex': z_index})
+    ordered.sort(key=lambda item: item['zIndex'])
+    return {str(index): item['sourceId'] for index, item in enumerate(ordered)}

@@ -99,6 +99,22 @@ class MediasoupHttpClient:
         """Join a BroadcasterPeer after PlainTransports are configured."""
         self._request('POST', f'/rooms/{room_id}/broadcasters/{peer_id}/join')
 
+    def ensure_broadcaster_joined(self, room_id: str, peer_id: str) -> bool:
+        """
+        Join the broadcaster peer if needed.
+
+        Returns True if a join was performed (or confirmed). Treats mediasoup
+        409 "Peer already joined" as success so URI SFU egress and camera
+        ingest can share the same compositor peer without racing.
+        """
+        try:
+            self.join_broadcaster(room_id, peer_id)
+            return True
+        except MediasoupApiError as exc:
+            if exc.status == 409 and 'already joined' in (exc.message or '').lower():
+                return True
+            raise
+
     def create_plain_transport(
         self,
         room_id: str,
@@ -143,6 +159,32 @@ class MediasoupHttpClient:
             f'/rooms/{room_id}/broadcasters/{peer_id}/transports/{transport_id}/connect',
             body,
         )
+
+    def create_producer(
+        self,
+        room_id: str,
+        peer_id: str,
+        *,
+        transport_id: str,
+        kind: str,
+        rtp_parameters: dict[str, Any],
+        app_data: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Create a mediasoup Producer on a BroadcasterPeer PlainTransport."""
+        result = self._request(
+            'POST',
+            f'/rooms/{room_id}/broadcasters/{peer_id}/producers',
+            {
+                'transportId': transport_id,
+                'kind': kind,
+                'rtpParameters': rtp_parameters,
+                'appData': app_data,
+            },
+        )
+        return result if isinstance(result, dict) else {}
+
+    # Alias used by SFU egress helpers.
+    produce = create_producer
 
     def create_consumer(
         self,

@@ -5,11 +5,13 @@ from django.test import TestCase
 
 from apps.compositor.commands import (
     AddRtmpSourceCommand,
+    AddUriVideoSourceCommand,
     ChangeLayoutCommand,
     CommandResult,
     CommandType,
     GetStatusCommand,
     RemoveRtmpSourceCommand,
+    RemoveUriVideoSourceCommand,
     SetTileOrderCommand,
     StartRecordingCommand,
     StartCountdownCommand,
@@ -19,6 +21,7 @@ from apps.compositor.commands import (
     StopStreamCommand,
     SyncProducersCommand,
     UpdateGraphicsCommand,
+    UpdateUriVideoPlaybackCommand,
 )
 from apps.compositor.session_ingest_manager import SessionIngestStatus
 from apps.compositor.worker_manager.command_codec import (
@@ -84,11 +87,13 @@ class CommandCodecTests(TestCase):
             host_peer_id='host-a',
             slot_assignments={'0': 'host-a', '1': 'guest-b'},
             hidden_source_ids=['guest-hidden'],
+            scene_source_ids=['screen-1', 'camera-2'],
         )
         restored = decode_command(encode_command(command))
         self.assertEqual(restored.host_peer_id, 'host-a')
         self.assertEqual(restored.slot_assignments, {'0': 'host-a', '1': 'guest-b'})
         self.assertEqual(restored.hidden_source_ids, ['guest-hidden'])
+        self.assertEqual(restored.scene_source_ids, ['screen-1', 'camera-2'])
 
     def test_session_ingest_status_roundtrip(self):
         status = SessionIngestStatus(
@@ -177,6 +182,29 @@ def _sample_command(command_type: CommandType):
         )
     if command_type == CommandType.REMOVE_RTMP_SOURCE:
         return RemoveRtmpSourceCommand(session_id=session_id, source_id='src-1')
+    if command_type == CommandType.ADD_URI_VIDEO_SOURCE:
+        return AddUriVideoSourceCommand(
+            session_id=session_id,
+            source_id='prerecorded-1',
+            url='https://example.com/clip.mp4',
+            display_name='Clip',
+            produce_to_sfu=True,
+        )
+    if command_type == CommandType.REMOVE_URI_VIDEO_SOURCE:
+        return RemoveUriVideoSourceCommand(
+            session_id=session_id,
+            source_id='prerecorded-1',
+        )
+    if command_type == CommandType.UPDATE_URI_VIDEO_PLAYBACK:
+        return UpdateUriVideoPlaybackCommand(
+            session_id=session_id,
+            source_id='prerecorded-1',
+            action='seek',
+            position_ms=1500.0,
+            loop=True,
+            volume=0.8,
+            muted=False,
+        )
     if command_type == CommandType.SYNC_PRODUCERS:
         return SyncProducersCommand(session_id=session_id, peer_producers_infos=[])
     if command_type == CommandType.START_COUNTDOWN:

@@ -8,11 +8,13 @@ from typing import Any
 
 from apps.compositor.commands import (
     AddRtmpSourceCommand,
+    AddUriVideoSourceCommand,
     ChangeLayoutCommand,
     CommandResult,
     CommandType,
     GetStatusCommand,
     RemoveRtmpSourceCommand,
+    RemoveUriVideoSourceCommand,
     SetTileOrderCommand,
     SessionCommand,
     StartCountdownCommand,
@@ -23,11 +25,13 @@ from apps.compositor.commands import (
     StopStreamCommand,
     SyncProducersCommand,
     UpdateGraphicsCommand,
+    UpdateUriVideoPlaybackCommand,
 )
 from apps.compositor.session_ingest_manager import (
     ParticipantIngestStatus,
     RtmpSourceIngestStatus,
     SessionIngestStatus,
+    UriSourceIngestStatus,
 )
 
 _COMMAND_TYPES: dict[CommandType, type[SessionCommand]] = {
@@ -39,6 +43,9 @@ _COMMAND_TYPES: dict[CommandType, type[SessionCommand]] = {
     CommandType.STOP_STREAM: StopStreamCommand,
     CommandType.ADD_RTMP_SOURCE: AddRtmpSourceCommand,
     CommandType.REMOVE_RTMP_SOURCE: RemoveRtmpSourceCommand,
+    CommandType.ADD_URI_VIDEO_SOURCE: AddUriVideoSourceCommand,
+    CommandType.REMOVE_URI_VIDEO_SOURCE: RemoveUriVideoSourceCommand,
+    CommandType.UPDATE_URI_VIDEO_PLAYBACK: UpdateUriVideoPlaybackCommand,
     CommandType.GET_STATUS: GetStatusCommand,
     CommandType.SYNC_PRODUCERS: SyncProducersCommand,
     CommandType.START_COUNTDOWN: StartCountdownCommand,
@@ -108,6 +115,10 @@ def decode_session_ingest_status(payload: dict[str, Any]) -> SessionIngestStatus
         RtmpSourceIngestStatus(**item)
         for item in payload.get('rtmp_sources', [])
     ]
+    uri_sources = [
+        UriSourceIngestStatus(**item)
+        for item in payload.get('uri_sources', [])
+    ]
     return SessionIngestStatus(
         session_id=payload['session_id'],
         room_id=payload['room_id'],
@@ -128,6 +139,7 @@ def decode_session_ingest_status(payload: dict[str, Any]) -> SessionIngestStatus
         requested_video_backend=payload['requested_video_backend'],
         participants=participants,
         rtmp_sources=rtmp_sources,
+        uri_sources=uri_sources,
     )
 
 

@@ -2,8 +2,12 @@ from django.test import TestCase
 
 from apps.compositor.tile_order import (
     GRID_MAX_VISIBLE,
+    attached_source_ids_from_scene_items,
     default_source_order,
+    hidden_session_sources_not_on_scene,
+    hidden_source_ids_from_scene_items,
     layout_max_visible,
+    merge_hidden_source_ids,
     normalize_slot_assignments,
     resolve_effective_assignments,
     resolve_source_order,
@@ -164,3 +168,53 @@ class SessionTileOrderModelTests(TestCase):
         self.assertEqual(session.tile_order_config['assignments'], {})
         self.assertEqual(session.hidden_source_ids, [])
         self.assertIsNone(session.host_peer_id)
+
+
+class SceneItemHiddenIdsTests(TestCase):
+    def test_hidden_from_invisible_items(self):
+        items = [
+            {'sourceId': 'camera-a', 'visible': True, 'zIndex': 0},
+            {'sourceId': 'camera-b', 'visible': False, 'zIndex': 1},
+            {'sourceId': 'camera-c', 'visible': False, 'zIndex': 2},
+        ]
+        self.assertEqual(
+            hidden_source_ids_from_scene_items(items),
+            ['camera-b', 'camera-c'],
+        )
+
+    def test_attached_includes_hidden_items(self):
+        items = [
+            {'sourceId': 'camera-a', 'visible': True, 'zIndex': 0},
+            {'sourceId': 'camera-b', 'visible': False, 'zIndex': 1},
+        ]
+        self.assertEqual(
+            attached_source_ids_from_scene_items(items),
+            ['camera-a', 'camera-b'],
+        )
+
+    def test_not_on_scene_sources_are_hidden(self):
+        items = [
+            {'sourceId': 'camera-a', 'visible': True, 'zIndex': 0},
+        ]
+        self.assertEqual(
+            hidden_session_sources_not_on_scene(
+                ['camera-a', 'camera-b', 'prerecorded-1'],
+                items,
+            ),
+            ['camera-b', 'prerecorded-1'],
+        )
+
+    def test_empty_scene_hides_all_session_sources(self):
+        self.assertEqual(
+            hidden_session_sources_not_on_scene(
+                ['camera-a', 'camera-b'],
+                [],
+            ),
+            ['camera-a', 'camera-b'],
+        )
+
+    def test_merge_session_and_scene_hidden(self):
+        self.assertEqual(
+            merge_hidden_source_ids(['guest-1'], ['camera-b', 'guest-1']),
+            ['guest-1', 'camera-b'],
+        )
