@@ -87,11 +87,13 @@ class CommandCodecTests(TestCase):
             host_peer_id='host-a',
             slot_assignments={'0': 'host-a', '1': 'guest-b'},
             hidden_source_ids=['guest-hidden'],
+            scene_source_ids=['screen-1', 'camera-2'],
         )
         restored = decode_command(encode_command(command))
         self.assertEqual(restored.host_peer_id, 'host-a')
         self.assertEqual(restored.slot_assignments, {'0': 'host-a', '1': 'guest-b'})
         self.assertEqual(restored.hidden_source_ids, ['guest-hidden'])
+        self.assertEqual(restored.scene_source_ids, ['screen-1', 'camera-2'])
 
     def test_session_ingest_status_roundtrip(self):
         status = SessionIngestStatus(

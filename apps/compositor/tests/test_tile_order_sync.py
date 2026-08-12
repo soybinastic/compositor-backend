@@ -99,6 +99,7 @@ class BuildSetTileOrderCommandTests(TestCase):
             command.hidden_source_ids,
             ['guest-hidden', 'camera-b'],
         )
+        self.assertEqual(command.scene_source_ids, ['camera-a'])
 
     def test_hides_invisible_attached_and_unattached_sources(self):
         SessionSource.objects.create(

@@ -5,6 +5,7 @@ from __future__ import annotations
 from apps.compositor.commands import SetTileOrderCommand
 from apps.compositor.compositor_pipeline import CompositorPipeline
 from apps.compositor.tile_order import (
+    attached_source_ids_from_scene_items,
     hidden_session_sources_not_on_scene,
     hidden_source_ids_from_scene_items,
     merge_hidden_source_ids,
@@ -67,12 +68,14 @@ def build_set_tile_order_command(
         scene_hidden,
         not_on_scene,
     )
+    scene_source_ids = attached_source_ids_from_scene_items(items)
 
     return SetTileOrderCommand(
         session_id=str(session.id),
         host_peer_id=session.host_peer_id,
         slot_assignments=slot_assignments,
         hidden_source_ids=effective_hidden,
+        scene_source_ids=scene_source_ids,
     )
 
 

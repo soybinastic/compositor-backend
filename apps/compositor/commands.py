@@ -192,6 +192,9 @@ class SetTileOrderCommand(SessionCommand):
     host_peer_id: str | None = None
     slot_assignments: dict[str, str] | None = None
     hidden_source_ids: list[str] = field(default_factory=list)
+    # Source ids attached to the active scene (visible or eye-hidden). None =
+    # unknown (do not prune). Empty list = prune all host-owned extra seats.
+    scene_source_ids: list[str] | None = None
 
     @property
     def command_type(self) -> CommandType:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -27,6 +28,8 @@ from apps.sources.handlers import (
     get_source_handler_factory,
 )
 from apps.sources.models import SessionSource, SourceState, SourceType
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -131,6 +134,7 @@ class SourceService:
         volume: float | None = None,
         muted: bool | None = None,
         settings: dict[str, Any] | None = None,
+        state: str | None = None,
     ) -> SourceResult:
         row = self._get_row(session_id, source_id)
         update_fields = ['updated_at']
@@ -144,10 +148,18 @@ class SourceService:
             row.muted = bool(muted)
             update_fields.append('muted')
         if settings is not None:
+            # null values clear keys (needed for producerId / audioProducerId on stop).
             merged = dict(row.settings or {})
-            merged.update(settings)
+            for key, value in settings.items():
+                if value is None:
+                    merged.pop(key, None)
+                else:
+                    merged[key] = value
             row.settings = merged
             update_fields.append('settings')
+        if state is not None:
+            row.mark_state(state)
+            update_fields.extend(['state', 'stopped_at'])
         row.save(update_fields=update_fields)
 
         if row.type == SourceType.PRERECORDED and (
@@ -321,6 +333,9 @@ class SourceService:
         scene.save(update_fields=['sources_config', 'updated_at'])
 
         # Push scene visibility / assignments into the live mixer.
+        # Config is already saved — do not fail the request if the worker is down
+        # or SetTileOrder times out (command may still be queued). Log so preview
+        # vs program drift is diagnosable.
         try:
             from apps.compositor.tile_order_sync import send_tile_order_command
 
@@ -328,7 +343,10 @@ class SourceService:
             if session is not None:
                 send_tile_order_command(session, scene=scene)
         except Exception:
-            pass
+            logger.exception(
+                'Failed to push tile order after scene items update (scene=%s)',
+                getattr(scene, 'id', None),
+            )
 
         return config
 

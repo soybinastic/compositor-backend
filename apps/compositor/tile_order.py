@@ -274,6 +274,52 @@ def merge_tile_order_config(
     return merged
 
 
+def sync_items_z_index_from_assignments(
+    items: list | None,
+    assignments: dict | None,
+) -> list:
+    """
+    Re-pack SceneItem zIndex to follow slot assignment order.
+
+    Source ids present only in assignments (e.g. peer seats) are ignored.
+    Items missing from assignments keep relative order at the end.
+    """
+    if not items:
+        return []
+    normalized_items = [item for item in items if isinstance(item, dict)]
+    if not normalized_items:
+        return []
+
+    by_source: dict[str, dict] = {}
+    for item in normalized_items:
+        source_id = item.get('sourceId') or item.get('source_id')
+        if isinstance(source_id, str) and source_id.strip() and source_id not in by_source:
+            by_source[source_id] = item
+
+    ordered: list[dict] = []
+    used: set[str] = set()
+    for _slot, source_id in sorted(
+        normalize_slot_assignments(assignments).items(),
+        key=lambda pair: pair[0],
+    ):
+        item = by_source.get(source_id)
+        if item is None or source_id in used:
+            continue
+        ordered.append(item)
+        used.add(source_id)
+
+    for item in normalized_items:
+        source_id = item.get('sourceId') or item.get('source_id')
+        if not isinstance(source_id, str) or source_id in used:
+            continue
+        ordered.append(item)
+        used.add(source_id)
+
+    for index, item in enumerate(ordered):
+        item['zIndex'] = index
+    return ordered
+
+
 def merge_sources_config(
     incoming: dict | None,
     existing: dict | None = None,
@@ -293,8 +339,10 @@ def merge_sources_config(
         merged['version'] = incoming['version']
     if 'sources' in incoming and isinstance(incoming['sources'], list):
         merged['sources'] = incoming['sources']
+    items_replaced = False
     if 'items' in incoming and isinstance(incoming['items'], list):
         merged['items'] = incoming['items']
+        items_replaced = True
         if merged.get('version', 1) < 2:
             merged['version'] = 2
         # When items are provided without explicit assignments, derive slots.
@@ -304,10 +352,20 @@ def merge_sources_config(
         raw_assignments = incoming.get('assignments')
         if raw_assignments == {}:
             merged['assignments'] = {}
+        elif items_replaced:
+            # Full scene-items rewrite: replace slots so detached sources cannot linger.
+            merged['assignments'] = sanitize_assignments_for_storage(raw_assignments)
         else:
             combined = sanitize_assignments_for_storage(merged.get('assignments'))
             combined.update(sanitize_assignments_for_storage(raw_assignments))
             merged['assignments'] = combined
+            # People-panel / assignments-only PATCH: keep Sources list order in sync.
+            merged['items'] = sync_items_z_index_from_assignments(
+                merged.get('items'),
+                merged['assignments'],
+            )
+            if merged.get('version', 1) < 2:
+                merged['version'] = 2
     return merged
 
 

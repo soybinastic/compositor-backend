@@ -31,17 +31,22 @@ class SetTileOrderPipelineTests(SimpleTestCase):
 
         with patch.object(pipeline, '_apply_layout_unlocked') as apply_layout:
             with patch.object(pipeline, '_sync_uri_scene_audio_mute_unlocked') as sync_audio:
-                pipeline.set_tile_order(
-                    host_peer_id='host',
-                    slot_assignments={'0': 'host'},
-                    hidden_source_ids=['guest'],
-                )
+                with patch.object(
+                    pipeline,
+                    '_sync_host_owned_seat_audio_mute_unlocked',
+                ) as sync_host_owned:
+                    pipeline.set_tile_order(
+                        host_peer_id='host',
+                        slot_assignments={'0': 'host'},
+                        hidden_source_ids=['guest'],
+                    )
 
         self.assertEqual(pipeline._host_peer_id, 'host')
         self.assertEqual(pipeline._slot_assignments, {0: 'host'})
         self.assertEqual(pipeline._hidden_source_ids, frozenset({'guest'}))
         apply_layout.assert_called_once()
         sync_audio.assert_called_once()
+        sync_host_owned.assert_called_once()
 
     def test_ordered_source_ids_puts_host_first_by_default(self):
         pipeline = self._pipeline_stub()
@@ -170,3 +175,60 @@ class UriSceneAudioMuteTests(SimpleTestCase):
         self.assertFalse(pipeline._participants['prerecorded-1'].user_muted)
         # Still scene-hidden → stay muted on the mix.
         volume.set_property.assert_any_call('mute', True)
+
+
+class HostOwnedSeatAudioMuteTests(SimpleTestCase):
+    def _screen_pipeline(
+        self, *, source_id: str = 'screen-1'
+    ) -> tuple[CompositorPipeline, MagicMock]:
+        pipeline = CompositorPipeline.__new__(CompositorPipeline)
+        pipeline._lock = threading.Lock()
+        pipeline._hidden_source_ids = frozenset()
+        pipeline._uri_source_ids = set()
+        pipeline._host_owned_source_ids = {source_id}
+        volume = MagicMock()
+        branch = ParticipantBranch(
+            participant_peer_id=source_id,
+            compositor_sink_pad=MagicMock(),
+            mixer_sink_pad=MagicMock(),
+            stats=IngestStats(),
+            audio_volume=volume,
+            user_muted=False,
+        )
+        pipeline._participants = {source_id: branch}
+        return pipeline, volume
+
+    def test_hidden_screen_seat_is_muted(self):
+        pipeline, volume = self._screen_pipeline()
+        pipeline._hidden_source_ids = frozenset({'screen-1'})
+
+        pipeline._sync_host_owned_seat_audio_mute_unlocked()
+
+        volume.set_property.assert_called_with('mute', True)
+
+    def test_visible_screen_seat_is_unmuted(self):
+        pipeline, volume = self._screen_pipeline()
+        pipeline._hidden_source_ids = frozenset()
+
+        pipeline._sync_host_owned_seat_audio_mute_unlocked()
+
+        volume.set_property.assert_called_with('mute', False)
+
+    def test_set_tile_order_mutes_hidden_screen_seat(self):
+        pipeline, volume = self._screen_pipeline()
+        pipeline._layout = 'CONTAIN'
+        pipeline._host_peer_id = 'host'
+        pipeline._slot_assignments = None
+        pipeline._layout_manager = MagicMock()
+        pipeline._compositor = MagicMock()
+        pipeline._graphics = MagicMock()
+        pipeline._graphics.background_active = False
+        pipeline._participants['host'] = MagicMock(compositor_sink_pad=MagicMock())
+
+        with patch.object(pipeline, '_apply_layout_unlocked'):
+            pipeline.set_tile_order(
+                host_peer_id='host',
+                hidden_source_ids=['screen-1'],
+            )
+
+        volume.set_property.assert_called_with('mute', True)

@@ -754,6 +754,36 @@ class CompositorPipeline:
             self._apply_layout_unlocked()
             return branch.stats
 
+    def add_placeholder_participant(
+        self,
+        participant_peer_id: str,
+        *,
+        display_name: str = '',
+        host_owned: bool = True,
+    ) -> IngestStats:
+        """
+        Cold idle seat: compositor pad + placeholder plate, no RTP consumers yet.
+
+        Used for screen sources that are on the active scene but not currently
+        sharing (Wave C after scene switch / never-shared).
+        """
+        with self._lock:
+            if self._pipeline is None or self._video_mix_backend is None:
+                raise RuntimeError('Compositor pipeline is not started')
+
+            if participant_peer_id in self._participants:
+                return self._participants[participant_peer_id].stats
+
+            branch = self._build_placeholder_only_participant_branch(
+                participant_peer_id=participant_peer_id,
+                display_name=display_name,
+            )
+            self._participants[participant_peer_id] = branch
+            if host_owned:
+                self._host_owned_source_ids.add(participant_peer_id)
+            self._apply_layout_unlocked()
+            return branch.stats
+
     def remove_participant(self, participant_peer_id: str) -> None:
         with self._lock:
             self._remove_participant_unlocked(participant_peer_id)
@@ -1259,6 +1289,41 @@ class CompositorPipeline:
         for source_id in list(self._uri_source_ids):
             self._apply_uri_audio_mix_state_unlocked(source_id)
 
+    def _sync_host_owned_seat_audio_mute_unlocked(self) -> None:
+        """Mute RTP extra-seat audio (e.g. screen share) when the tile is hidden."""
+        for source_id in list(self._host_owned_source_ids):
+            if source_id in self._uri_source_ids:
+                continue
+            branch = self._participants.get(source_id)
+            if branch is None:
+                continue
+            scene_hidden = source_id in self._hidden_source_ids
+            effective_mute = scene_hidden or bool(branch.user_muted)
+            if branch.audio_volume is not None:
+                try:
+                    branch.audio_volume.set_property('mute', effective_mute)
+                except Exception:
+                    logger.exception(
+                        'Failed to apply host-owned seat mute for %s',
+                        source_id,
+                    )
+                continue
+            if branch.mixer_sink_pad is None:
+                continue
+            try:
+                if branch.mixer_sink_pad.find_property('mute') is not None:
+                    branch.mixer_sink_pad.set_property('mute', effective_mute)
+                elif branch.mixer_sink_pad.find_property('volume') is not None:
+                    branch.mixer_sink_pad.set_property(
+                        'volume',
+                        0.0 if effective_mute else 1.0,
+                    )
+            except Exception:
+                logger.exception(
+                    'Failed to apply mixer-pad mute for host-owned seat %s',
+                    source_id,
+                )
+
     def _start_uri_sfu_egress(self, source_id: str) -> None:
         if source_id in self._sfu_egress:
             return
@@ -1528,6 +1593,8 @@ class CompositorPipeline:
             self._apply_layout_unlocked()
             # Pre-recorded / URI: same sourceId drives video hide + soundtrack mute.
             self._sync_uri_scene_audio_mute_unlocked()
+            # Screen / camera seats with mixer audio: mute when scene-hidden.
+            self._sync_host_owned_seat_audio_mute_unlocked()
 
     def set_layout(self, layout: str, *, graphics_state: dict | None = None) -> None:
         pending = graphics_state if graphics_state is not None else self._graphics._pending_state
@@ -2022,6 +2089,15 @@ class CompositorPipeline:
             signal_handlers=video_chain.signal_handlers + audio_chain.signal_handlers,
             video_scale=video_scale,
             video_mode='rtp',
+            audio_volume=next(
+                (
+                    element
+                    for element in audio_chain.elements
+                    if element.get_factory() is not None
+                    and element.get_factory().get_name() == 'volume'
+                ),
+                None,
+            ),
         )
 
         if video_chain.rtp_probe_pad is not None:
@@ -2910,6 +2986,90 @@ class CompositorPipeline:
 
         for element in reversed(all_elements):
             element.sync_state_with_parent()
+
+        return branch
+
+    def _build_placeholder_only_participant_branch(
+        self,
+        *,
+        participant_peer_id: str,
+        display_name: str = '',
+    ) -> ParticipantBranch:
+        """Video-only seat that starts as an initials/monitor placeholder (no RTP)."""
+        assert self._pipeline is not None
+        assert self._compositor is not None
+        assert self._video_mix_backend is not None
+
+        label = display_name or participant_peer_id
+        ingest_tail = self._video_mix_backend.build_ingest_tail(
+            f'ph_{participant_peer_id}'
+        )
+        placeholder_elements, output, keep_alive = build_participant_placeholder_chain(
+            peer_id=participant_peer_id,
+            display_name=label,
+            width=self.width,
+            height=self.height,
+            fps=self.fps,
+            ingest_tail=ingest_tail,
+        )
+
+        for element in placeholder_elements:
+            self._pipeline.add(element)
+        self._link_sequential(
+            placeholder_elements,
+            label=f'placeholder-{participant_peer_id}',
+        )
+
+        compositor_sink_pad = self._compositor.get_request_pad('sink_%u')
+        if compositor_sink_pad is None:
+            for element in placeholder_elements:
+                element.set_state(Gst.State.NULL)
+                self._pipeline.remove(element)
+            raise RuntimeError(
+                f'Failed to request compositor sink pad for {participant_peer_id}'
+            )
+
+        src_pad = output.get_static_pad('src')
+        if src_pad is None or src_pad.link(compositor_sink_pad) != Gst.PadLinkReturn.OK:
+            self._compositor.release_request_pad(compositor_sink_pad)
+            for element in placeholder_elements:
+                element.set_state(Gst.State.NULL)
+                self._pipeline.remove(element)
+            raise RuntimeError(
+                f'Failed to link placeholder to compositor for {participant_peer_id}'
+            )
+
+        video_scale = next(
+            (
+                element
+                for element in placeholder_elements
+                if element.get_factory() is not None
+                and element.get_factory().get_name() == 'videoscale'
+            ),
+            None,
+        )
+        branch = ParticipantBranch(
+            participant_peer_id=participant_peer_id,
+            compositor_sink_pad=compositor_sink_pad,
+            mixer_sink_pad=None,
+            elements=list(placeholder_elements),
+            video_elements=list(placeholder_elements),
+            audio_elements=[],
+            stats=IngestStats(),
+            signal_handlers=[],
+            video_scale=video_scale,
+            video_mode='placeholder',
+            display_name=label,
+            placeholder_keep_alive=keep_alive,
+        )
+
+        for element in reversed(placeholder_elements):
+            if not element.sync_state_with_parent():
+                logger.warning(
+                    'Placeholder element %s failed to sync for peer %s',
+                    element.get_name(),
+                    participant_peer_id,
+                )
 
         return branch
 
