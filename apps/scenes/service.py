@@ -365,7 +365,18 @@ class SceneService:
         session: StudioSession,
         scene: StudioScene,
     ) -> None:
-        send_tile_order_command(session, scene=scene)
+        try:
+            send_tile_order_command(session, scene=scene)
+        except LookupError as exc:
+            logger.warning(
+                'Tile order sync failed for session %s scene %s: %s',
+                session.id,
+                scene.id,
+                exc,
+            )
+            raise ValueError(
+                f'Failed to sync tile order to program output: {exc}'
+            ) from exc
         self._send_layout_command(session, scene.layout, scene.graphics_config)
 
     def _send_layout_command(

@@ -518,7 +518,13 @@ class SessionIngestManager:
                     peer_id,
                 )
 
+        # After the first SetTileOrder, do not re-promote extras that are still
+        # publishing but no longer on the active scene (preview already dropped them).
+        retained = self._scene_retained_source_ids
+
         for seat_id, video in desired.items():
+            if retained is not None and seat_id not in retained:
+                continue
             current = self._participants.get(seat_id)
             seat_name = display_name
             audio_id = extra_audios.get(seat_id)
@@ -547,7 +553,11 @@ class SessionIngestManager:
 
             if current.video_mode == 'placeholder':
                 try:
-                    if audio_id:
+                    # Screen seats: always full reattach. Video-only soft_enable from a
+                    # cold placeholder can leave program output black while preview (local
+                    # WebRTC) looks fine.
+                    needs_full_reattach = bool(audio_id) or seat_id.startswith('screen')
+                    if needs_full_reattach:
                         # Placeholder seats have no live audio branch to reuse.
                         self._consumer_service.detach_participant(current)
                         del self._participants[seat_id]
